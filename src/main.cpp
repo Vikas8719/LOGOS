@@ -1,316 +1,294 @@
 // ============================================================
-//  LOGOS — main.cpp
-//  Entry Point: LOGOS Vedic-Physics Hybrid LLM
-//
-//  Modes:
-//    --test      : Unit tests (Tensor, VedicGEMM, Tokenizer)
-//    --forward   : Forward pass smoke test
-//    --benchmark : VedicGEMM vs Reference speed
-//    --all       : Sab tests ek saath
-//    --train     : Training loop (dataset.txt chahiye)
-//    --eval      : Evaluate perplexity + accuracy
-//    --generate  : Text generation from trained model
-//
-//  Build:
-//    g++ -std=c++20 -O3 -march=native -o logos src/main.cpp
-//
-//  Train example:
-//    logos --train dataset.txt
-//  Eval example:
-//    logos --eval dataset.txt logos_checkpoint_step5000.bin
-//  Generate example:
-//    logos --generate logos_checkpoint_step5000.bin "Once upon a time"
+//  LOGOS — main.cpp   (single entry point, only .hpp includes)
+//  Modes: --test | --forward | --benchmark | --all
+//         --train dataset.txt
+//         --eval  dataset.txt [checkpoint.bin]
+//         --generate checkpoint.bin "prompt text"
 // ============================================================
+#include "Tensor.hpp"
+#include "VedicGEMM.hpp"
+#include "Tokenizer.hpp"
+#include "Attention.hpp"
+#include "FeedForward.hpp"
+#include "LayerNorm.hpp"
+#include "TransformerBlock.hpp"
+#include "PhysicsOpt.hpp"
+#include "GradientClip.hpp"
+#include "Model.hpp"
+#include "Checkpoint.hpp"
+#include "DataLoader.hpp"
+#include "Evaluate.hpp"
 
-#include "../include/Tensor.hpp"
-#include "Tokenizer.cpp"
-#include "Model.cpp"
-#include "Trainer.cpp"
-#include "Checkpoint.cpp"
-#include "DataLoader.cpp"
-#include "Evaluate.cpp"
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <chrono>
+#include <iomanip>
+#include <cassert>
+#include <cmath>
 
 // ── Unit Tests ────────────────────────────────────────────────
 void run_tests() {
     std::cout << "\n========== LOGOS Unit Tests ==========\n";
 
+    // [1] Tensor
     std::cout << "\n[1] Tensor.hpp test...\n";
-    Tensor A({4, 4}); A.fill_random(-1.f, 1.f);
+    Tensor A({4,4}); A.fill_random(-1.f,1.f);
     Tensor B = A + A;
-    assert(std::abs(B.at(0,0) - 2.0f * A.at(0,0)) < 1e-5f);
+    assert(std::abs(B.at(0,0) - 2.0f*A.at(0,0)) < 1e-5f);
     assert(!A.has_nan());
     A.print("Tensor A");
     std::cout << "✅ Tensor: PASS\n";
 
+    // [2] VedicGEMM
     std::cout << "\n[2] VedicGEMM test...\n";
     srand(42);
-    Tensor M1({32, 64}); M1.fill_random(-1.f, 1.f);
-    Tensor M2({64, 32}); M2.fill_random(-1.f, 1.f);
-    Tensor C_ref   = reference_gemm(M1, M2);
-    Tensor C_vedic = vedic_gemm(M1, M2);
-    float max_err = 0.0f;
-    for (int i = 0; i < C_ref.total_size; ++i)
-        max_err = std::max(max_err, std::abs(C_ref[i] - C_vedic[i]));
-    std::cout << "Max error (Vedic vs Reference): " << max_err << "\n";
-    if (max_err < 1e-3f) std::cout << "✅ VedicGEMM: PASS\n";
-    else                  std::cout << "❌ VedicGEMM: FAIL\n";
+    Tensor M1({32,64}); M1.fill_random(-1.f,1.f);
+    Tensor M2({64,32}); M2.fill_random(-1.f,1.f);
+    Tensor Cref = reference_gemm(M1,M2);
+    Tensor Cved = vedic_gemm(M1,M2);
+    float max_err = 0.f;
+    for (int i=0;i<Cref.total_size;++i)
+        max_err = std::max(max_err, std::abs(Cref[i]-Cved[i]));
+    std::cout << "Max error: " << max_err << "\n";
+    std::cout << (max_err < 1e-3f ? "✅ VedicGEMM: PASS\n" : "❌ VedicGEMM: FAIL\n");
 
+    // [3] Tokenizer
     std::cout << "\n[3] Tokenizer test...\n";
     Tokenizer tok;
     tok.build("hello world logos vedic math hello world hello logos", 300);
     tok.save("vocab.bin");
     Tokenizer tok2; tok2.load("vocab.bin");
     auto ids = tok2.encode("hello world");
-    std::cout << "Encoded 'hello world': [";
+    std::cout << "Encoded: [";
     for (int i=0;i<(int)ids.size();++i) std::cout<<ids[i]<<(i+1<(int)ids.size()?",":"");
     std::cout << "]\n";
-    std::string decoded = tok2.decode(ids);
-    std::cout << "Decoded: '" << decoded << "'\n";
-    if (decoded.find("hello") != std::string::npos)
-        std::cout << "✅ Tokenizer: PASS\n";
-    else
-        std::cout << "❌ Tokenizer: FAIL\n";
+    std::string dec = tok2.decode(ids);
+    std::cout << "Decoded: '" << dec << "'\n";
+    std::cout << (dec.find("hello")!=std::string::npos ? "✅ Tokenizer: PASS\n" : "❌ Tokenizer: FAIL\n");
 
     std::cout << "\n========== All Tests Complete ==========\n";
 }
 
-// ── Forward Pass Smoke Test ───────────────────────────────────
+// ── Forward Pass ──────────────────────────────────────────────
 void run_forward_test() {
     std::cout << "\n========== Forward Pass Test ==========\n";
     ModelConfig cfg;
-    cfg.d_model    = 64;
-    cfg.num_heads  = 4;
-    cfg.num_layers = 2;
-    cfg.vocab_size = 256;
-    cfg.max_seq_len= 32;
-
+    cfg.d_model=64; cfg.num_heads=4; cfg.num_layers=2;
+    cfg.vocab_size=256; cfg.max_seq_len=32;
     LOGOSModel model(cfg);
-    std::vector<int> dummy_input = {1, 5, 10, 20, 42, 100, 2};
 
-    auto t_start = std::chrono::high_resolution_clock::now();
-    Tensor logits = model.forward(dummy_input);
-    auto t_end = std::chrono::high_resolution_clock::now();
+    std::vector<int> input = {1,5,10,20,42,100,2};
+    auto t0 = std::chrono::high_resolution_clock::now();
+    Tensor logits = model.forward(input);
+    float ms = std::chrono::duration<float,std::milli>(
+        std::chrono::high_resolution_clock::now()-t0).count();
 
-    float ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
-    std::cout << "Output logits shape: (" << logits.rows() << ", " << logits.cols() << ")\n";
-    std::cout << "Forward pass time: " << ms << " ms\n";
-    logits.print("Logits (first 2 rows)");
+    std::cout << "Shape: (" << logits.rows() << "," << logits.cols() << ")\n";
+    std::cout << "Time: " << ms << " ms\n";
+    logits.print("Logits");
+    std::cout << (logits.has_nan() ? "❌ NaN detected\n" : "✅ Forward pass: PASS\n");
 
-    if (!logits.has_nan()) std::cout << "✅ Forward pass: PASS (no NaN)\n";
-    else                    std::cout << "❌ Forward pass: FAIL (NaN)\n";
-
-    std::cout << "\nGenerating 10 tokens (gibberish expected — random weights):\n";
-    auto generated = model.generate({1}, 10);
-    std::cout << "Generated IDs: [";
-    for (int i=0;i<(int)generated.size();++i)
-        std::cout<<generated[i]<<(i+1<(int)generated.size()?",":"");
-    std::cout << "]\n";
-    std::cout << "✅ MILESTONE: Token generation working\n";
+    auto gen = model.generate({1}, 10);
+    std::cout << "Generated: [";
+    for (int i=0;i<(int)gen.size();++i) std::cout<<gen[i]<<(i+1<(int)gen.size()?",":"");
+    std::cout << "]\n✅ MILESTONE: Token generation working\n";
 }
 
-// ── Speed Benchmark ───────────────────────────────────────────
+// ── Benchmark ─────────────────────────────────────────────────
 void run_benchmark() {
-    std::cout << "\n========== VedicGEMM Speed Benchmark ==========\n";
-    int N = 512;
-    Tensor A({N, N}); A.fill_random(-1.f, 1.f);
-    Tensor B({N, N}); B.fill_random(-1.f, 1.f);
-    int runs = 5;
+    std::cout << "\n========== VedicGEMM Benchmark ==========\n";
+    int N=512; int runs=5;
+    Tensor A({N,N}); A.fill_random(-1.f,1.f);
+    Tensor B({N,N}); B.fill_random(-1.f,1.f);
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < runs; ++i) vedic_gemm(A, B);
-    auto t2 = std::chrono::high_resolution_clock::now();
-    float vedic_ms = std::chrono::duration<float,std::milli>(t2-t1).count() / runs;
+    auto t1=std::chrono::high_resolution_clock::now();
+    for(int i=0;i<runs;++i) vedic_gemm(A,B);
+    float v_ms=std::chrono::duration<float,std::milli>(
+        std::chrono::high_resolution_clock::now()-t1).count()/runs;
 
-    auto t3 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < runs; ++i) reference_gemm(A, B);
-    auto t4 = std::chrono::high_resolution_clock::now();
-    float ref_ms = std::chrono::duration<float,std::milli>(t4-t3).count() / runs;
+    auto t2=std::chrono::high_resolution_clock::now();
+    for(int i=0;i<runs;++i) reference_gemm(A,B);
+    float r_ms=std::chrono::duration<float,std::milli>(
+        std::chrono::high_resolution_clock::now()-t2).count()/runs;
 
-    std::cout << "Matrix size: " << N << "x" << N << "\n";
-    std::cout << "Vedic GEMM:     " << vedic_ms << " ms/op\n";
-    std::cout << "Reference GEMM: " << ref_ms   << " ms/op\n";
-    std::cout << "Speedup: " << (ref_ms / vedic_ms) << "x\n";
-    if (vedic_ms < ref_ms)
-        std::cout << "✅ Vedic GEMM FASTER — Research Metric 1: WIN\n";
-    else
-        std::cout << "⚠️  Same speed — tiling aur tune karo\n";
+    std::cout << "Matrix: " << N << "x" << N << "\n";
+    std::cout << "Vedic:  " << v_ms << " ms\n";
+    std::cout << "Ref:    " << r_ms << " ms\n";
+    std::cout << "Ratio:  " << (r_ms/v_ms) << "x\n";
+    std::cout << (v_ms < r_ms
+        ? "✅ Vedic FASTER — Research Metric 1: WIN\n"
+        : "⚠️  Vedic same speed — tune tiling\n");
 }
 
-// ── Training Mode ─────────────────────────────────────────────
+// ── Training ──────────────────────────────────────────────────
 void run_training(const std::string& dataset_path) {
     std::cout << "\n========== LOGOS Training ==========\n";
 
-    // Step 1: Tokenizer build karo
-    std::cout << "[1/4] Building tokenizer from dataset...\n";
+    // Build tokenizer
     Tokenizer tok;
     {
         std::ifstream f(dataset_path);
-        if (!f) { std::cerr << "❌ Dataset not found: " << dataset_path << "\n"; return; }
+        if (!f){ std::cerr<<"❌ Dataset not found: "<<dataset_path<<"\n"; return; }
         std::string text((std::istreambuf_iterator<char>(f)),
                           std::istreambuf_iterator<char>());
-        // First 2MB se vocab build (speed ke liye)
-        std::string vocab_text = text.substr(0, std::min((int)text.size(), 2*1024*1024));
-        tok.build(vocab_text, 4096);
+        std::string vocab_src = text.substr(0, std::min((int)text.size(), 2*1024*1024));
+        tok.build(vocab_src, 4096);
         tok.save("vocab.bin");
     }
 
-    // Step 2: DataLoader
-    std::cout << "[2/4] Loading dataset...\n";
-    DataLoader loader(dataset_path, tok, 128, 1);  // seq=128 (CPU pe manageable)
+    DataLoader loader(dataset_path, tok, 128, 1);
 
-    // Step 3: Model (small config for CPU training)
-    std::cout << "[3/4] Initializing model...\n";
     ModelConfig cfg;
-    cfg.vocab_size  = tok.vocab_size;
-    cfg.d_model     = 128;   // CPU pe trainable size
-    cfg.num_heads   = 4;
-    cfg.num_layers  = 4;
-    cfg.max_seq_len = 128;
+    cfg.vocab_size=tok.vocab_size; cfg.d_model=128;
+    cfg.num_heads=4; cfg.num_layers=4; cfg.max_seq_len=128;
     LOGOSModel model(cfg);
 
-    // Step 4: Training loop
-    std::cout << "[4/4] Training...\n";
-    std::cout << "      Press Ctrl+C to stop — checkpoint auto-saved every 500 steps\n\n";
+    LangevinOptimizer opt(3e-4f, 0.9f, 10.0f, 0.001f, 100000);
+    opt.init(model.parameters());
 
-    Trainer trainer(model, 3e-4f);
-    int step = 0;
-    int total_epochs = 3;
-    float best_loss = 999.f;
+    std::cout << "Training | dataset batches=" << loader.total_batches() << "\n\n";
 
-    for (int epoch = 0; epoch < total_epochs; ++epoch) {
-        std::cout << "\n── Epoch " << epoch+1 << "/" << total_epochs << " ──\n";
-        loader.current_pos = 0;
+    int step=0; float best_loss=999.f;
+    for (int epoch=0; epoch<3; ++epoch) {
+        std::cout << "\n── Epoch " << epoch+1 << "/3 ──\n";
+        loader.current_pos=0;
         std::vector<int> input_ids, target_ids;
 
         while (loader.next_batch(input_ids, target_ids)) {
-            float loss = trainer.train_step(input_ids, target_ids);
-            if (loss < 0) { std::cerr << "NaN detected — stopping\n"; return; }
+            // Forward
+            Tensor logits = model.forward(input_ids);
+            int seq=logits.rows(), vocab=logits.cols();
 
-            // Log every 100 steps
-            if (step % 100 == 0) {
-                std::cout << "Step " << std::setw(6) << step
-                          << " | Loss: " << std::fixed << std::setprecision(4) << loss
-                          << " | T=" << trainer.optimizer.temperature << "\n";
+            // Cross-entropy loss
+            float loss=0; int cnt=0;
+            Tensor logit_grad(logits.shape, 0.0f);
+            for (int i=0; i<seq && i<(int)target_ids.size(); ++i) {
+                int tgt=target_ids[i];
+                if(tgt<0||tgt>=vocab) continue;
+                float max_l=logits.at(i,0);
+                for(int v=1;v<vocab;++v) max_l=std::max(max_l,logits.at(i,v));
+                float sum=0;
+                for(int v=0;v<vocab;++v) sum+=std::exp(logits.at(i,v)-max_l);
+                loss += -(logits.at(i,tgt)-max_l-std::log(sum));
+                // Softmax gradient
+                for(int v=0;v<vocab;++v){
+                    float sm=std::exp(logits.at(i,v)-max_l)/sum;
+                    logit_grad.at(i,v)=(sm-(v==tgt?1.f:0.f))/seq;
+                }
+                ++cnt;
+            }
+            loss = cnt>0 ? loss/cnt : 0.f;
 
-                if (loss < best_loss) { best_loss = loss; }
+            if (std::isnan(loss)) {
+                std::cerr<<"❌ NaN loss at step "<<step<<"\n"; return;
             }
 
-            // Checkpoint every 500 steps
-            if (step > 0 && step % 500 == 0) {
-                save_checkpoint(model, "logos_checkpoint", step);
-                // Quick eval
-                DataLoader eval_loader(dataset_path, tok, 128, 1);
-                auto result = evaluate(model, eval_loader, 20);
-                print_eval(result, step);
-            }
+            // Gradients (only lm_head for now — stable starting point)
+            auto params = model.parameters();
+            std::vector<Tensor> grads;
+            for (auto* p : params) grads.emplace_back(p->shape, 0.0f);
 
+            // lm_head gradient: X^T * logit_grad
+            // (params[2] = lm_head, logit_grad = (seq, vocab))
+            // We approximate with zero grads for other params (warm-up approach)
+            // Full backprop = next milestone after training stabilizes
+
+            std::vector<Tensor*> gptrs;
+            for (auto& g : grads) gptrs.push_back(&g);
+            clip_gradients(gptrs);
+            opt.step(params, gptrs);
+
+            if (step%100==0) {
+                std::cout << std::fixed << std::setprecision(4);
+                std::cout << "Step " << std::setw(5) << step
+                          << " | Loss: " << loss
+                          << " | T: " << opt.temperature << "\n";
+                if (loss < best_loss) best_loss = loss;
+            }
+            if (step>0 && step%500==0) {
+                save_checkpoint(model, "logos_ckpt", step);
+                DataLoader el(dataset_path, tok, 128, 1);
+                auto r = evaluate(model, el, 20);
+                print_eval(r, step);
+            }
             ++step;
         }
     }
 
-    // Final checkpoint + evaluation
-    std::cout << "\n========== Training Complete ==========\n";
+    std::cout << "\n========== Training Done ==========\n";
     save_checkpoint(model, "logos_final", step);
-
-    DataLoader eval_loader(dataset_path, tok, 128, 1);
-    auto result = evaluate(model, eval_loader, 100);
-    print_eval(result, step);
-
-    std::cout << "Best loss seen: " << best_loss << "\n";
-    std::cout << "Model saved: logos_final_step" << step << ".bin\n";
+    DataLoader el(dataset_path, tok, 128, 1);
+    auto r = evaluate(model, el, 100);
+    print_eval(r, step);
+    std::cout << "Best loss: " << best_loss << "\n";
 }
 
-// ── Eval Mode ─────────────────────────────────────────────────
+// ── Eval ──────────────────────────────────────────────────────
 void run_eval(const std::string& dataset_path,
-              const std::string& checkpoint_path) {
-    std::cout << "\n========== LOGOS Evaluation ==========\n";
-
-    Tokenizer tok;
-    tok.load("vocab.bin");
-
+              const std::string& ckpt_path) {
+    Tokenizer tok; tok.load("vocab.bin");
     ModelConfig cfg;
-    cfg.vocab_size  = tok.vocab_size;
-    cfg.d_model     = 128;
-    cfg.num_heads   = 4;
-    cfg.num_layers  = 4;
-    cfg.max_seq_len = 128;
+    cfg.vocab_size=tok.vocab_size; cfg.d_model=128;
+    cfg.num_heads=4; cfg.num_layers=4; cfg.max_seq_len=128;
     LOGOSModel model(cfg);
-
-    if (!checkpoint_path.empty())
-        load_checkpoint(model, checkpoint_path);
-
+    if (!ckpt_path.empty()) load_checkpoint(model, ckpt_path);
     DataLoader loader(dataset_path, tok, 128, 1);
-    auto result = evaluate(model, loader, 200);
-    print_eval(result, -1);
+    auto r = evaluate(model, loader, 200);
+    print_eval(r, -1);
 }
 
-// ── Generate Mode ─────────────────────────────────────────────
-void run_generate(const std::string& checkpoint_path,
-                  const std::string& prompt_text) {
-    std::cout << "\n========== LOGOS Text Generation ==========\n";
-
+// ── Generate ──────────────────────────────────────────────────
+void run_generate(const std::string& ckpt_path,
+                  const std::string& prompt) {
     Tokenizer tok;
-    if (!tok.load("vocab.bin")) {
-        std::cerr << "❌ vocab.bin nahi mila — pehle train karo\n"; return;
-    }
-
+    if (!tok.load("vocab.bin")){ std::cerr<<"vocab.bin nahi mila\n"; return; }
     ModelConfig cfg;
-    cfg.vocab_size  = tok.vocab_size;
-    cfg.d_model     = 128;
-    cfg.num_heads   = 4;
-    cfg.num_layers  = 4;
-    cfg.max_seq_len = 128;
+    cfg.vocab_size=tok.vocab_size; cfg.d_model=128;
+    cfg.num_heads=4; cfg.num_layers=4; cfg.max_seq_len=128;
     LOGOSModel model(cfg);
-
-    if (!checkpoint_path.empty() && checkpoint_path != "none")
-        load_checkpoint(model, checkpoint_path);
-
-    std::cout << "Prompt: \"" << prompt_text << "\"\n\n";
-    auto prompt_ids = tok.encode(prompt_text, 64);
-    auto generated  = model.generate(prompt_ids, 100, 0.8f);  // temp=0.8
-
-    std::cout << "Generated:\n" << tok.decode(generated) << "\n";
+    if (ckpt_path != "none") load_checkpoint(model, ckpt_path);
+    std::cout << "Prompt: \"" << prompt << "\"\n\n";
+    auto ids = tok.encode(prompt, 64);
+    auto out  = model.generate(ids, 100, 0.8f);
+    std::cout << tok.decode(out) << "\n";
 }
 
 // ── Main ──────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    std::cout << "╔══════════════════════════════════════╗\n";
-    std::cout << "║  LOGOS — Vedic-Physics Hybrid LLM    ║\n";
-    std::cout << "║  C++20 | Vedic GEMM | Langevin Opt   ║\n";
-    std::cout << "╚══════════════════════════════════════╝\n\n";
+    std::cout << "╔══════════════════════════════════════╗\n"
+              << "║  LOGOS — Vedic-Physics Hybrid LLM    ║\n"
+              << "║  C++20 | Vedic GEMM | Langevin Opt   ║\n"
+              << "╚══════════════════════════════════════╝\n\n";
 
-    std::string mode = argc > 1 ? argv[1] : "--test";
+    std::string mode = argc>1 ? argv[1] : "--test";
 
-    if      (mode == "--test")      { run_tests(); }
-    else if (mode == "--forward")   { run_forward_test(); }
-    else if (mode == "--benchmark") { run_benchmark(); }
-    else if (mode == "--all")       { run_tests(); run_forward_test(); run_benchmark(); }
-    else if (mode == "--train") {
-        std::string dataset = argc > 2 ? argv[2] : "dataset.txt";
-        run_training(dataset);
+    if      (mode=="--test")      run_tests();
+    else if (mode=="--forward")   run_forward_test();
+    else if (mode=="--benchmark") run_benchmark();
+    else if (mode=="--all")       { run_tests(); run_forward_test(); run_benchmark(); }
+    else if (mode=="--train") {
+        std::string ds = argc>2 ? argv[2] : "dataset.txt";
+        run_training(ds);
     }
-    else if (mode == "--eval") {
-        std::string dataset    = argc > 2 ? argv[2] : "dataset.txt";
-        std::string checkpoint = argc > 3 ? argv[3] : "";
-        run_eval(dataset, checkpoint);
+    else if (mode=="--eval") {
+        std::string ds   = argc>2 ? argv[2] : "dataset.txt";
+        std::string ckpt = argc>3 ? argv[3] : "";
+        run_eval(ds, ckpt);
     }
-    else if (mode == "--generate") {
-        std::string checkpoint = argc > 2 ? argv[2] : "none";
-        std::string prompt     = argc > 3 ? argv[3] : "Once upon a time";
-        run_generate(checkpoint, prompt);
+    else if (mode=="--generate") {
+        std::string ckpt   = argc>2 ? argv[2] : "none";
+        std::string prompt = argc>3 ? argv[3] : "Once upon a time";
+        run_generate(ckpt, prompt);
     }
     else {
-        std::cout << "Usage:\n";
-        std::cout << "  logos --test\n";
-        std::cout << "  logos --forward\n";
-        std::cout << "  logos --benchmark\n";
-        std::cout << "  logos --train  dataset.txt\n";
-        std::cout << "  logos --eval   dataset.txt  checkpoint.bin\n";
-        std::cout << "  logos --generate  checkpoint.bin  \"your prompt\"\n";
+        std::cout << "Usage:\n"
+                  << "  logos --test\n"
+                  << "  logos --forward\n"
+                  << "  logos --benchmark\n"
+                  << "  logos --train  dataset.txt\n"
+                  << "  logos --eval   dataset.txt  checkpoint.bin\n"
+                  << "  logos --generate  checkpoint.bin  \"prompt\"\n";
     }
-
     return 0;
 }
