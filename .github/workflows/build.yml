@@ -136,7 +136,7 @@ jobs:
 
   # ── macOS Build ──────────────────────────────────────────────
   build-macos:
-    name: macOS Build & Test
+    name: macOS Build & Test (ARM64)
     runs-on: macos-14
 
     steps:
@@ -146,7 +146,9 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+            -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
+        # NOTE: no -march flag — Apple M1 (ARM64) pe x86-64 nahi chalta
+        # -O3 alone enough hai, compiler apne arch ke liye optimize karega
 
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
@@ -154,10 +156,16 @@ jobs:
       - name: Unit Tests
         run: ./build/logos --test
 
+      - name: Forward Pass
+        run: ./build/logos --forward
+
+      - name: Benchmark
+        run: ./build/logos --benchmark
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: logos-macos-x86_64
+          name: logos-macos-arm64
           path: build/logos
           retention-days: 7
 
