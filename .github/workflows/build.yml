@@ -94,7 +94,7 @@ jobs:
   # ── macOS Build (Clang 14) ───────────────────────────────────
   build-macos:
     name: macOS (Clang 14 · C++20)
-    runs-on: macos-13
+    runs-on: macos-14
 
     steps:
       - name: Checkout code
