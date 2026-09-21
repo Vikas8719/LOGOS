@@ -10,7 +10,13 @@ include_directories(include)
 # ── SINGLE executable — only main.cpp compiled
 #    All modules are header-only (.hpp) — no multiple definitions possible
 add_executable(logos src/main.cpp)
-target_compile_options(logos PRIVATE -O3 -march=x86-64)
+
+# Platform-aware flags — macOS ARM64 pe -march=x86-64 nahi chalta
+if(APPLE)
+  target_compile_options(logos PRIVATE -O3)
+else()
+  target_compile_options(logos PRIVATE -O3 -march=x86-64)
+endif()
 
 install(TARGETS logos DESTINATION bin)
 
