@@ -1,0 +1,139 @@
+name: LOGOS CI — Build & Test
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # ── Linux Build (GCC 12, C++20) ─────────────────────────────
+  build-linux:
+    name: Linux (GCC 12 · C++20 · -O3)
+    runs-on: ubuntu-22.04          # Free GitHub runner — no cost
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install GCC 12 & CMake
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build
+          sudo update-alternatives \
+            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Configure (Release)
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+        # NOTE: -march=x86-64 (generic) CI pe use hoga, local pe -march=native
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run unit tests
+        run: ./build/logos --test
+
+      - name: Run forward pass test
+        run: ./build/logos --forward
+
+      - name: Run GEMM benchmark
+        run: ./build/logos --benchmark
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-linux-x86_64
+          path: build/logos
+          retention-days: 7
+
+  # ── Windows Build (MSVC / MinGW) ────────────────────────────
+  build-windows:
+    name: Windows (MinGW-w64 · C++20)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW (no extra install — runner has it)
+        run: |
+          # MinGW already on windows-latest runner
+          gcc --version
+          cmake --version
+
+      - name: Configure (Release)
+        run: |
+          cmake -B build `
+            -G "MinGW Makefiles" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Run unit tests
+        run: .\build\logos.exe --test
+
+      - name: Run forward pass
+        run: .\build\logos.exe --forward
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-windows-x86_64
+          path: build/logos.exe
+          retention-days: 7
+
+  # ── macOS Build (Clang 14) ───────────────────────────────────
+  build-macos:
+    name: macOS (Clang 14 · C++20)
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Clang version
+        run: clang++ --version
+
+      - name: Configure (Release)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+
+      - name: Build
+        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Run unit tests
+        run: ./build/logos --test
+
+      - name: Run forward pass
+        run: ./build/logos --forward
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-macos-x86_64
+          path: build/logos
+          retention-days: 7
+
+  # ── Summary ──────────────────────────────────────────────────
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-22.04
+    needs: [build-linux, build-windows, build-macos]
+    if: always()
+    steps:
+      - name: Print result
+        run: |
+          echo "Linux  : ${{ needs.build-linux.result }}"
+          echo "Windows: ${{ needs.build-windows.result }}"
+          echo "macOS  : ${{ needs.build-macos.result }}"

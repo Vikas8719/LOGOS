@@ -1,0 +1,47 @@
+# Build output
+build/
+out/
+*.o
+*.obj
+*.exe
+logos
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+_CPack_Packages/
+*.cmake
+!CMakeLists.txt
+
+# Compiler artifacts
+*.d
+*.pch
+*.gch
+
+# Trained model files (large — don't push to git)
+*.bin
+!vocab.bin
+
+# IDE
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+
+# Profiler output
+*.gcda
+*.gcno
+gmon.out
+callgrind.out.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI progress (local only)
+_ai_progress.json
