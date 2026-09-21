@@ -11,8 +11,12 @@
 //               with SIMD-friendly inner loop (compiler auto-vectorizes)
 // ============================================================
 
+#ifndef LOGOS_VEDIC_GEMM_CPP
+#define LOGOS_VEDIC_GEMM_CPP
+
 #include "../include/Tensor.hpp"
 #include <cstring>
+#include <string>
 #include <stdexcept>
 
 // Block size for cache-tiling (L1 cache ~32KB, floats = 4B)
@@ -120,4 +124,6 @@ int main() {
         std::cout << "❌ VedicGEMM FAIL — check implementation\n";
     return 0;
 }
+#endif
+
 #endif

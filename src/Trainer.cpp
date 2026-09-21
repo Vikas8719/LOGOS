@@ -6,6 +6,9 @@
 //  For Phase 4 training, numerical gradients (finite differences)
 //  used for correctness, then switch to analytical backprop.
 // ============================================================
+#ifndef LOGOS_TRAINER_CPP
+#define LOGOS_TRAINER_CPP
+
 #include "../include/Tensor.hpp"
 #include "Model.cpp"
 #include "PhysicsOpt.cpp"
@@ -159,3 +162,5 @@ public:
         return loss;
     }
 };
+
+#endif

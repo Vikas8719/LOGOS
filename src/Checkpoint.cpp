@@ -3,6 +3,9 @@
 //  Model Save/Load — Har 1000 steps pe save karo
 //  Format: Binary (.bin) — fast, small
 // ============================================================
+#ifndef LOGOS_CHECKPOINT_CPP
+#define LOGOS_CHECKPOINT_CPP
+
 #include "../include/Tensor.hpp"
 #include "Model.cpp"
 #include <fstream>
@@ -75,6 +78,7 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
             read_tensor(head.W_V);
             read_tensor(head.W_O);
         }
+
         read_tensor(block.mha.W_proj);
         read_tensor(block.ffn.W1);
         read_tensor(block.ffn.b1);
@@ -94,3 +98,5 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     std::cout << "✅ Checkpoint loaded: " << path << "\n";
     return true;
 }
+
+#endif
