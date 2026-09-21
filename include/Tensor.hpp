@@ -6,6 +6,7 @@
 #include <iostream>
 #include <numeric>
 #include <cmath>
+#include <algorithm>   // FIX: max_element, min_element, fill
 
 // ============================================================
 //  LOGOS — Tensor.hpp
