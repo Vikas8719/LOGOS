@@ -3,6 +3,9 @@
 //  Layer Normalization (Standard Stats — Modern Math)
 //  Formula: y = γ × (x - μ) / (σ + ε) + β
 // ============================================================
+#ifndef LOGOS_LAYER_NORM_CPP
+#define LOGOS_LAYER_NORM_CPP
+
 #include "../include/Tensor.hpp"
 #include <cmath>
 
@@ -45,3 +48,5 @@ struct LayerNorm {
 
     std::vector<Tensor*> parameters() { return {&gamma, &beta}; }
 };
+
+#endif

@@ -11,6 +11,9 @@
 //  Attention weights   → Boltzmann softmax
 // ============================================================
 
+#ifndef LOGOS_ATTENTION_CPP
+#define LOGOS_ATTENTION_CPP
+
 #include "../include/Tensor.hpp"
 #include "VedicGEMM.cpp"
 #include <cmath>
@@ -151,3 +154,5 @@ struct MultiHeadAttention {
         return params;
     }
 };
+
+#endif

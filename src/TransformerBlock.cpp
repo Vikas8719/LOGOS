@@ -5,6 +5,9 @@
 //  Flow: X → [LN1] → [MHA] → (+X) → [LN2] → [FFN] → (+X)
 //  Residual connections: gradient flow stable rehta hai
 // ============================================================
+#ifndef LOGOS_TRANSFORMER_BLOCK_CPP
+#define LOGOS_TRANSFORMER_BLOCK_CPP
+
 #include "../include/Tensor.hpp"
 #include "Attention.cpp"
 #include "FeedForward.cpp"
@@ -44,6 +47,7 @@ struct TransformerBlock {
         auto append = [&](std::vector<Tensor*> p){
             params.insert(params.end(), p.begin(), p.end());
         };
+
         append(mha.parameters());
         append(ffn.parameters());
         append(ln1.parameters());
@@ -51,3 +55,5 @@ struct TransformerBlock {
         return params;
     }
 };
+
+#endif

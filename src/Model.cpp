@@ -15,6 +15,9 @@
 //    LM Head: 256 × 4096            = ~1.0M
 //    Total: ~7-10M ✅
 // ============================================================
+#ifndef LOGOS_MODEL_CPP
+#define LOGOS_MODEL_CPP
+
 #include "../include/Tensor.hpp"
 #include "TransformerBlock.cpp"
 #include "VedicGEMM.cpp"
@@ -156,6 +159,7 @@ public:
             f.write(reinterpret_cast<const char*>(&n), sizeof(int));
             f.write(reinterpret_cast<const char*>(t.data.data()), n * sizeof(float));
         };
+
         write_tensor(embedding);
         write_tensor(pos_embedding);
         write_tensor(lm_head);
@@ -173,3 +177,5 @@ public:
         return params;
     }
 };
+
+#endif

@@ -14,6 +14,9 @@
 //  vs Adam: Langevin adds principled thermal noise for
 //  exploration — smoother loss curves in theory
 // ============================================================
+#ifndef LOGOS_PHYSICS_OPT_CPP
+#define LOGOS_PHYSICS_OPT_CPP
+
 #include "../include/Tensor.hpp"
 #include <cmath>
 #include <vector>
@@ -60,7 +63,8 @@ public:
     void anneal_temperature() {
         float ratio = static_cast<float>(current_step) / total_steps;
         // Cosine schedule: smooth decay
-        float cos_val = 0.5f * (1.0f + std::cos(M_PI * ratio));
+        constexpr float pi = 3.14159265358979323846f;
+        float cos_val = 0.5f * (1.0f + std::cos(pi * ratio));
         temperature = temp_end + (temp_start - temp_end) * cos_val;
     }
 
@@ -110,3 +114,5 @@ public:
                   << " lr=" << learning_rate << "\n";
     }
 };
+
+#endif

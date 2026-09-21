@@ -5,6 +5,9 @@
 //  Both matrix mults → Vedic GEMM
 //  Hidden dim = 4 × d_model (standard transformer ratio)
 // ============================================================
+#ifndef LOGOS_FEED_FORWARD_CPP
+#define LOGOS_FEED_FORWARD_CPP
+
 #include "../include/Tensor.hpp"
 #include "VedicGEMM.cpp"
 #include <cmath>
@@ -46,3 +49,5 @@ struct FeedForward {
 
     std::vector<Tensor*> parameters() { return {&W1, &b1, &W2, &b2}; }
 };
+
+#endif

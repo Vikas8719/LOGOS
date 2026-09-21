@@ -4,6 +4,9 @@
 //  Max norm clipping: if ||grad|| > threshold, scale karo
 //  Threshold: 1.0 (standard for transformers)
 // ============================================================
+#ifndef LOGOS_GRADIENT_CLIP_CPP
+#define LOGOS_GRADIENT_CLIP_CPP
+
 #include "../include/Tensor.hpp"
 #include <cmath>
 #include <vector>
@@ -25,4 +28,7 @@ void clip_gradients(std::vector<Tensor*>& grads, float max_norm = 1.0f) {
         // Uncomment for debug: 
         // std::cout << "✂️  Gradient clipped: norm=" << total_norm << " → " << max_norm << "\n";
     }
+
 }
+
+#endif
