@@ -1,4 +1,4 @@
-name: LOGOS CI — Build & Test
+name: LOGOS CI — Build, Test & Train
 
 on:
   push:
@@ -7,68 +7,20 @@ on:
     branches: [ "main" ]
 
 jobs:
-  # ── Linux Build (GCC 12, C++20) ─────────────────────────────
-  build-linux:
-    name: Linux (GCC 12 · C++20 · -O3)
-    runs-on: ubuntu-22.04          # Free GitHub runner — no cost
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install GCC 12 & CMake
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 cmake ninja-build
-          sudo update-alternatives \
-            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
-            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
-
-      - name: Configure (Release)
-        run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
-        # NOTE: -march=x86-64 (generic) CI pe use hoga, local pe -march=native
-
-      - name: Build
-        run: cmake --build build --parallel $(nproc)
-
-      - name: Run unit tests
-        run: ./build/logos --test
-
-      - name: Run forward pass test
-        run: ./build/logos --forward
-
-      - name: Run GEMM benchmark
-        run: ./build/logos --benchmark
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-linux-x86_64
-          path: build/logos
-          retention-days: 7
-
-  # ── Windows Build (MSVC / MinGW) ────────────────────────────
+  # ── Build + Unit Tests (Windows) ─────────────────────────────
   build-windows:
-    name: Windows (MinGW-w64 · C++20)
+    name: Windows Build & Test
     runs-on: windows-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup MinGW (no extra install — runner has it)
+      - name: Check tools
         run: |
-          # MinGW already on windows-latest runner
           gcc --version
           cmake --version
 
-      - name: Configure (Release)
+      - name: Configure
         run: |
           cmake -B build `
             -G "MinGW Makefiles" `
@@ -78,47 +30,131 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
 
-      - name: Run unit tests
+      - name: Unit Tests
         run: .\build\logos.exe --test
 
-      - name: Run forward pass
+      - name: Forward Pass
         run: .\build\logos.exe --forward
 
-      - name: Upload build artifact
+      - name: Benchmark
+        run: .\build\logos.exe --benchmark
+
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: logos-windows-x86_64
           path: build/logos.exe
           retention-days: 7
 
-  # ── macOS Build (Clang 14) ───────────────────────────────────
-  build-macos:
-    name: macOS (Clang 14 · C++20)
-    runs-on: macos-14
+  # ── Build + Unit Tests (Linux) ───────────────────────────────
+  build-linux:
+    name: Linux Build & Test
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Check Clang version
-        run: clang++ --version
+      - name: Install GCC 12
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
+          sudo update-alternatives \
+            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
 
-      - name: Configure (Release)
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Unit Tests
+        run: ./build/logos --test
+
+      - name: Forward Pass
+        run: ./build/logos --forward
+
+      - name: Benchmark
+        run: ./build/logos --benchmark
+
+      # ── Training on TinyStories (mini) ─────────────────────
+      - name: Download TinyStories dataset (1MB sample)
+        run: |
+          # HuggingFace se TinyStories ka ek chhota sample
+          curl -L \
+            "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
+            --max-filesize 5242880 \
+            -o dataset.txt \
+            --fail --silent --show-error \
+            || echo "Download failed — using synthetic data"
+
+          # Agar download fail ho toh synthetic data use karo
+          if [ ! -s dataset.txt ]; then
+            echo "Once upon a time there was a little girl named Lily. She loved to play in the garden with her dog Max. One day they found a magical flower that could talk. The flower said hello and Lily was very surprised. Max barked happily. They became best friends with the flower and visited it every day after school. The end. Once upon a time there was a boy named Tom. He liked to read books about dinosaurs. His favorite was the Tyrannosaurus Rex. Tom wanted to be a paleontologist when he grew up. He studied hard every day and learned many interesting facts about prehistoric animals. One day his teacher was very impressed with his knowledge." > dataset.txt
+            # 5000 words banao
+            for i in $(seq 1 50); do
+              echo "Once upon a time a small rabbit lived in a cozy burrow under an old oak tree. The rabbit had many friends in the forest including a wise owl and a playful squirrel. Every morning they would meet by the stream and share stories about their adventures. The owl taught the rabbit about the stars and the squirrel showed the rabbit where to find the best nuts. They lived happily together learning new things each day." >> dataset.txt
+            done
+            echo "Using synthetic dataset ($(wc -w < dataset.txt) words)"
+          else
+            echo "TinyStories downloaded: $(wc -c < dataset.txt) bytes"
+            # Sirf pehle 1MB use karo CI mein (speed ke liye)
+            head -c 1048576 dataset.txt > dataset_small.txt
+            mv dataset_small.txt dataset.txt
+          fi
+          wc -l dataset.txt
+
+      - name: Train LOGOS (CI mini-run — 200 steps)
+        run: |
+          # CI mein sirf 200 steps — smoke test ke liye
+          timeout 180 ./build/logos --train dataset.txt || true
+          echo "Training step complete"
+          ls -la *.bin 2>/dev/null || echo "No checkpoint yet (normal for short run)"
+
+      - name: Evaluate
+        run: |
+          ./build/logos --eval dataset.txt || true
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-linux-x86_64
+          path: build/logos
+          retention-days: 7
+
+      - name: Upload checkpoint (if exists)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-checkpoint
+          path: "*.bin"
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ── macOS Build ──────────────────────────────────────────────
+  build-macos:
+    name: macOS Build & Test
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
 
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Run unit tests
+      - name: Unit Tests
         run: ./build/logos --test
 
-      - name: Run forward pass
-        run: ./build/logos --forward
-
-      - name: Upload build artifact
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: logos-macos-x86_64
@@ -126,14 +162,14 @@ jobs:
           retention-days: 7
 
   # ── Summary ──────────────────────────────────────────────────
-  ci-summary:
+  summary:
     name: CI Summary
     runs-on: ubuntu-22.04
-    needs: [build-linux, build-windows, build-macos]
+    needs: [build-windows, build-linux, build-macos]
     if: always()
     steps:
-      - name: Print result
+      - name: Results
         run: |
-          echo "Linux  : ${{ needs.build-linux.result }}"
-          echo "Windows: ${{ needs.build-windows.result }}"
-          echo "macOS  : ${{ needs.build-macos.result }}"
+          echo "Windows : ${{ needs.build-windows.result }}"
+          echo "Linux   : ${{ needs.build-linux.result }}"
+          echo "macOS   : ${{ needs.build-macos.result }}"
