@@ -235,6 +235,7 @@ ModelGPU::ModelGPU(const ModelConfig& cfg_) : cfg(cfg_) {
 }
 
 ModelGPU::~ModelGPU() {
+    gpu_free(last_hidden);
     gpu_free(gpu_embedding);
     gpu_free(gpu_pos_embedding);
     gpu_free(gpu_lm_head);
@@ -277,6 +278,63 @@ void ModelGPU::load_from_cpu(const LOGOSModel& cpu_model) {
         h2d(gblk.b2, cblk.ffn.b2.data.data(), cblk.ffn.b2.total_size);
     }
     std::cout << "✅ Weights loaded CPU → GPU\n";
+}
+
+std::vector<GPUTensor*> ModelGPU::all_parameters() {
+    std::vector<GPUTensor*> params = {
+        &gpu_embedding, &gpu_pos_embedding, &gpu_lm_head
+    };
+    for (auto& block : gpu_blocks) {
+        for (int h = 0; h < cfg.num_heads; ++h) {
+            params.push_back(&block.W_Q[h]);
+            params.push_back(&block.W_K[h]);
+            params.push_back(&block.W_V[h]);
+            params.push_back(&block.W_O[h]);
+        }
+        params.push_back(&block.W_proj);
+        params.push_back(&block.W1);
+        params.push_back(&block.b1);
+        params.push_back(&block.W2);
+        params.push_back(&block.b2);
+        params.push_back(&block.ln1_gamma);
+        params.push_back(&block.ln1_beta);
+        params.push_back(&block.ln2_gamma);
+        params.push_back(&block.ln2_beta);
+    }
+    return params;
+}
+
+std::vector<GPUTensor*> ModelGPU::alloc_grad_buffers() const {
+    std::vector<GPUTensor*> gradients;
+    auto add_gradient = [&gradients](const GPUTensor& parameter) {
+        auto* gradient = new GPUTensor(gpu_alloc(parameter.rows, parameter.cols));
+        CUDA_CHECK(cudaMemset(gradient->data, 0, gradient->size * sizeof(float)));
+        gradients.push_back(gradient);
+    };
+    for (auto* parameter : const_cast<ModelGPU*>(this)->all_parameters())
+        add_gradient(*parameter);
+    return gradients;
+}
+
+void ModelGPU::sync_to_cpu(LOGOSModel& cpu_model) const {
+    d2h(cpu_model.embedding.data.data(), gpu_embedding, gpu_embedding.size);
+    d2h(cpu_model.pos_embedding.data.data(), gpu_pos_embedding, gpu_pos_embedding.size);
+    d2h(cpu_model.lm_head.data.data(), gpu_lm_head, gpu_lm_head.size);
+    for (int l = 0; l < cfg.num_layers; ++l) {
+        const auto& gblk = gpu_blocks[l];
+        auto& cblk = cpu_model.layers[l];
+        for (int h = 0; h < cfg.num_heads; ++h) {
+            d2h(cblk.mha.heads[h].W_Q.data.data(), gblk.W_Q[h], gblk.W_Q[h].size);
+            d2h(cblk.mha.heads[h].W_K.data.data(), gblk.W_K[h], gblk.W_K[h].size);
+            d2h(cblk.mha.heads[h].W_V.data.data(), gblk.W_V[h], gblk.W_V[h].size);
+            d2h(cblk.mha.heads[h].W_O.data.data(), gblk.W_O[h], gblk.W_O[h].size);
+        }
+        d2h(cblk.mha.W_proj.data.data(), gblk.W_proj, gblk.W_proj.size);
+        d2h(cblk.ffn.W1.data.data(), gblk.W1, gblk.W1.size);
+        d2h(cblk.ffn.b1.data.data(), gblk.b1, gblk.b1.size);
+        d2h(cblk.ffn.W2.data.data(), gblk.W2, gblk.W2.size);
+        d2h(cblk.ffn.b2.data.data(), gblk.b2, gblk.b2.size);
+    }
 }
 
 // Forward pass — all on GPU
@@ -400,10 +458,12 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids) {
         gpu_free(ffn_out);
     }
 
+    gpu_free(last_hidden);
+    last_hidden = X;
+
     // LM Head: logits = X × lm_head
     GPUTensor logits = gpu_alloc(seq, V);
     cuda_vedic_gemm(X, gpu_lm_head, logits);
-    gpu_free(X);
 
     return logits;   // stays on GPU
 }

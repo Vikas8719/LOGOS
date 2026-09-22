@@ -5,6 +5,7 @@
 #include "Tensor.hpp"
 #include "VedicGEMM.hpp"
 #include "TransformerBlock.hpp"
+#include "Tokenizer.hpp"
 #include <vector>
 #include <fstream>
 #include <iostream>
