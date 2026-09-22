@@ -464,27 +464,39 @@ void run_training(const std::string& dataset_path) {
             //               [3..] = per-layer weights (mha+ffn+ln1+ln2)
 
             // ── Backprop: lm_head ──────────────────────────────
-            // logits = X_final @ lm_head
-            // dW_lm  = X_final^T @ dLogits
-            // dX_final = dLogits @ lm_head^T
-            // Then backprop through final_ln to get dXcur
+            // logits = X_final @ lm_head  (X_final = final_ln(Xcur))
+            // grads[2]=lm_head, grads[3]=final_ln_γ, grads[4]=final_ln_β
             Tensor dX_final({seq, d}, 0.0f);
             for(int di=0;di<d;++di)
                 for(int v=0;v<vocab;++v)
                     for(int si=0;si<seq;++si)
-                        grads[2].at(di,v)+=X_final.at(si,di)*dLogits.at(si,v);
+                        grads[2].at(di,v) += X_final.at(si,di) * dLogits.at(si,v);
             for(int si=0;si<seq;++si)
                 for(int di=0;di<d;++di)
                     for(int v=0;v<vocab;++v)
-                        dX_final.at(si,di)+=dLogits.at(si,v)*model.lm_head.at(di,v);
-            // Backprop through final LayerNorm
+                        dX_final.at(si,di) += dLogits.at(si,v) * model.lm_head.at(di,v);
+
+            // final_ln gamma/beta grads (indices 3,4)
+            for(int si=0;si<seq;++si){
+                float mn=0,vr=0;
+                for(int j=0;j<d;++j) mn+=Xcur.at(si,j); mn/=d;
+                for(int j=0;j<d;++j){float vv=Xcur.at(si,j)-mn; vr+=vv*vv;} vr/=d;
+                float inv_std=1.0f/std::sqrt(vr+1e-5f);
+                for(int di=0;di<d;++di){
+                    float xh=(Xcur.at(si,di)-mn)*inv_std;
+                    grads[3].at(0,di) += dX_final.at(si,di)*xh;  // dγ
+                    grads[4].at(0,di) += dX_final.at(si,di);      // dβ
+                }
+            }
+
+            // Backprop through final LayerNorm → dXcur
             Tensor dXcur = layernorm_backward(Xcur, dX_final);
 
             // ── Backprop: TransformerBlocks (reverse order) ────
-            // Each block: params offset starts at 3, then per-layer
-            // Per block params: [W1,b1,W2,b2 | attn_weights... | ln1_g,ln1_b | ln2_g,ln2_b]
+            // params order: [0]=emb [1]=pos_emb [2]=lm_head [3]=final_ln_γ [4]=final_ln_β
+            //               [5..] = per-layer weights
             int n_layers = (int)model.layers.size();
-            int offset = 3; // start after embedding,pos_emb,lm_head
+            int offset = 5; // start after embedding,pos_emb,lm_head,final_ln(γ,β)
 
             // Compute per-layer param counts
             std::vector<int> layer_param_counts(n_layers);
