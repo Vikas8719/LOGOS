@@ -92,6 +92,26 @@ __global__ void ce_loss_kernel(
     }
 }
 
+// ── GPU Transpose Kernel ──────────────────────────────────────
+// Transpose matrix A (rows×cols) → AT (cols×rows)
+// Uses shared memory tile for coalesced access
+__global__ void gpu_transpose_kernel(
+    const float* __restrict__ A,   // input  (rows × cols)
+    float*       __restrict__ AT,  // output (cols × rows)
+    int rows, int cols)
+{
+    __shared__ float tile[16][17]; // +1 to avoid bank conflicts
+    int row_in = blockIdx.y * 16 + threadIdx.y;
+    int col_in = blockIdx.x * 16 + threadIdx.x;
+    if (row_in < rows && col_in < cols)
+        tile[threadIdx.y][threadIdx.x] = A[row_in * cols + col_in];
+    __syncthreads();
+    int row_out = blockIdx.x * 16 + threadIdx.y;
+    int col_out = blockIdx.y * 16 + threadIdx.x;
+    if (row_out < cols && col_out < rows)
+        AT[row_out * rows + col_out] = tile[threadIdx.x][threadIdx.y];
+}
+
 // ── Langevin Optimizer Kernel ─────────────────────────────────
 // W += -(1-friction)*v - lr*grad + noise
 // v  = (1-friction)*v - lr*grad + noise  (momentum update)
@@ -107,12 +127,16 @@ __global__ void langevin_step_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
 
-    // Simple LCG random for thermal noise
-    unsigned int rng = seed + idx * 1664525u + 1013904223u;
-    rng = rng * 1664525u + 1013904223u;
-    // Box-Muller approximation (fast)
-    float u = (float)(rng & 0x7FFFFFFF) / (float)0x7FFFFFFF;
-    float noise = noise_scale * (u * 2.0f - 1.0f) * 1.7320508f; // ~N(0,1) approx
+    // FIX 3 (Uniform != Gaussian): Sahi Box-Muller transform se Gaussian noise
+    // Pehle: u*2-1 uniform tha [-1,1] — Gaussian nahi, Langevin ke liye galat distribution
+    // Ab: Do independent LCG values se proper Box-Muller → actual N(0,1) Gaussian
+    unsigned int rng1 = seed + idx * 1664525u + 1013904223u;
+    rng1 = rng1 * 1664525u + 1013904223u;
+    unsigned int rng2 = rng1 * 1664525u + 1013904223u;
+    // Box-Muller: u1 ∈ (0,1], u2 ∈ [0,1) → N(0,1)
+    float u1 = fmaxf((float)(rng1 & 0x7FFFFFFF) / (float)0x7FFFFFFF, 1e-6f); // guard: log(0) se bachao
+    float u2 = (float)(rng2 & 0x7FFFFFFF) / (float)0x7FFFFFFF;
+    float noise = noise_scale * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2); // true N(0,1)
 
     float g = grad[idx];
     if (isnan(g) || isinf(g)) g = 0.0f;
@@ -298,15 +322,16 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids) {
             cuda_vedic_gemm(normed1, blk.W_V[h], V_t);
 
             // Scores = Q × Kᵀ
+            // FIX 4 (CPU Transpose Bug): Pehle K CPU pe transpose ho raha tha — d2h → loop → h2d
+            // Yeh har attention head ke liye GPU sync + 2x PCIe transfer tha → massive slowdown
+            // Ab: GPU pe hi transpose karte hain ek dedicated kernel se
             GPUTensor K_T = gpu_alloc(DH, seq);
-            // Transpose K on GPU (simple kernel would go here)
-            // For now: use CPU for transpose (small matrix)
-            std::vector<float> k_cpu(seq*DH), kt_cpu(DH*seq);
-            d2h(k_cpu.data(), K, seq*DH);
-            for (int i=0;i<seq;++i)
-                for (int j=0;j<DH;++j)
-                    kt_cpu[j*seq+i] = k_cpu[i*DH+j];
-            h2d(K_T, kt_cpu.data(), DH*seq);
+            {
+                // GPU transpose kernel: grid covers output (DH × seq)
+                dim3 tr_block(16, 16);
+                dim3 tr_grid((seq + 15) / 16, (DH + 15) / 16);
+                gpu_transpose_kernel<<<tr_grid, tr_block>>>(K.data, K_T.data, seq, DH);
+            }
 
             GPUTensor scores = gpu_alloc(seq, seq);
             cuda_vedic_gemm(Q, K_T, scores);

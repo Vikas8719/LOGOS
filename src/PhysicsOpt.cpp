@@ -79,7 +79,11 @@ public:
             throw std::invalid_argument("params/grads size mismatch");
 
         anneal_temperature();
-        float noise_scale = std::sqrt(2.0f * friction * temperature * learning_rate);
+        // FIX 1 (Noise Scale): Sahi Langevin noise = sqrt(2·γ·T·dt)
+        // learning_rate = dt (step size), noise_scale mein lr nahi chahiye tha
+        // Pehle: sqrt(2γT·lr) — galat (lr double count ho raha tha vel update se)
+        // Ab:   sqrt(2γT·dt) jahan dt = learning_rate — sahi Fokker-Planck equation
+        float noise_scale = std::sqrt(2.0f * friction * temperature);
 
         for (int pi = 0; pi < (int)params.size(); ++pi) {
             Tensor* W = params[pi];
@@ -95,10 +99,12 @@ public:
                     grad = 0.0f;
                 }
 
-                // Langevin update:
-                // v = (1-γ)·v - lr·∇L + noise
+                // FIX 2 (Velocity Sign): Sahi Langevin momentum update:
+                //   v = γ·v - lr·∇L + sqrt(2γT)·η
+                // Pehle: (1-γ)·v — galat, momentum decay bahut zyada tha (γ=0.9 → sirf 0.1x vel rakhta tha)
+                // Ab:    γ·v — sahi, friction se scale hota hai (0.9x vel retain)
                 float thermal_noise = noise_scale * noise_dist(rng);
-                vel[i] = (1.0f - friction) * vel[i]
+                vel[i] = friction * vel[i]
                           - learning_rate * grad
                           + thermal_noise;
 
