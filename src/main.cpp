@@ -144,7 +144,7 @@ void run_training(const std::string& dataset_path) {
     cfg.num_heads=4; cfg.num_layers=4; cfg.max_seq_len=128;
     LOGOSModel model(cfg);
 
-    LangevinOptimizer opt(3e-4f, 0.9f, 10.0f, 0.001f, 100000);
+    LangevinOptimizer opt(1e-4f, 0.99f, 0.1f, 1e-5f, 100000);
     opt.init(model.parameters());
 
     std::cout << "Training | dataset batches=" << loader.total_batches() << "\n\n";
@@ -196,7 +196,7 @@ void run_training(const std::string& dataset_path) {
 
             std::vector<Tensor*> gptrs;
             for (auto& g : grads) gptrs.push_back(&g);
-            clip_gradients(gptrs);
+            clip_gradients(gptrs, 0.1f);  // tight clip — explosion rokta hai
             opt.step(params, gptrs);
 
             if (step%100==0) {

@@ -41,7 +41,7 @@ public:
     {
         if (velocity.empty()) init(params);
         anneal();
-        float noise_scale = std::sqrt(2.0f * friction * temperature * learning_rate);
+        float noise_scale = std::sqrt(2.0f * friction * temperature * learning_rate) * 0.01f;  // scale down noise
         for (int pi = 0; pi < (int)params.size(); ++pi) {
             Tensor* W = params[pi];
             const Tensor* G = grads[pi];
