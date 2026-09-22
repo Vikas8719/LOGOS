@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(LOGOS VERSION 0.4.0 LANGUAGES CXX CUDA)
+# CUDA ko project() se hataya — pehle CXX configure ho, phir CUDA check karo
+# Warna nvcc na milne par CMake configure stage pe hi crash karta hai
+project(LOGOS VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,10 +24,9 @@ include(CheckLanguage)
 check_language(CUDA)
 
 if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)   # ab safe hai — nvcc confirmed mil gaya
     message(STATUS "✅ CUDA found — building logos_gpu")
 
-    # Detect GPU architecture automatically
-    # T4 = sm_75, A100 = sm_80, V100 = sm_70
     set(CMAKE_CUDA_ARCHITECTURES "75;80;86" CACHE STRING "CUDA architectures")
 
     add_executable(logos_gpu
