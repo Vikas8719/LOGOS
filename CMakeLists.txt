@@ -41,7 +41,7 @@ if(CMAKE_CUDA_COMPILER)
         $<$<COMPILE_LANGUAGE:CUDA>:
             -O3
             --use_fast_math
-            -Xcompiler -O3
+            -Xcompiler=-O3
             --ptxas-options=-v
         >
     )
