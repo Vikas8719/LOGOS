@@ -20,7 +20,6 @@
 
 #include "../include/Tensor.hpp"
 #include "TransformerBlock.cpp"
-#include "LayerNorm.cpp"
 #include "VedicGEMM.cpp"
 #include <fstream>
 #include <iostream>
@@ -39,14 +38,12 @@ public:
     Tensor embedding;       // (vocab_size, d_model) — word embeddings
     Tensor pos_embedding;   // (max_seq, d_model) — positional embeddings
     std::vector<TransformerBlock> layers;
-    LayerNorm final_ln;     // final LayerNorm before LM head (standard transformer)
     Tensor lm_head;         // (d_model, vocab_size) — output projection
 
     LOGOSModel(const ModelConfig& config = {})
         : cfg(config),
           embedding({cfg.vocab_size, cfg.d_model}),
           pos_embedding({cfg.max_seq_len, cfg.d_model}),
-          final_ln(config.d_model),
           lm_head({cfg.d_model, cfg.vocab_size})
     {
         float scale = std::sqrt(2.0f / cfg.d_model);
@@ -91,10 +88,7 @@ public:
         for (auto& block : layers)
             X = block.forward(X);
 
-        // Step 3: Final LayerNorm (standard transformer — stabilizes activations)
-        X = final_ln.forward(X);
-
-        // Step 4: LM Head → logits (Vedic GEMM)
+        // Step 3: LM Head → logits (Vedic GEMM)
         return vedic_gemm(X, lm_head);   // (seq, vocab_size)
     }
 
@@ -176,12 +170,7 @@ public:
 
     // ── All parameters (for optimizer) ───────────────────────
     std::vector<Tensor*> parameters() {
-        // Order: embedding, pos_emb, lm_head, final_ln(γ,β), then per-layer
-        // NOTE: main.cpp backprop hardcodes indices [0]=emb [1]=pos [2]=lm_head
-        //       final_ln grads go at [3],[4] — update grad_offset in main.cpp accordingly
         std::vector<Tensor*> params = {&embedding, &pos_embedding, &lm_head};
-        for (auto* p : final_ln.parameters())
-            params.push_back(p);
         for (auto& layer : layers)
             for (auto* p : layer.parameters())
                 params.push_back(p);

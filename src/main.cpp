@@ -428,12 +428,17 @@ void run_training(const std::string& dataset_path) {
                 block_inputs.push_back(Xcur);  // block_inputs[l] = input to layer l
                 Xcur = blk.forward(Xcur);
             }
-            // FIX 5 (X_final missing): Standard transformer mein final LayerNorm
-            // zaroor hoti hai — sabhi blocks ke baad, LM head se pehle
-            // Pehle: Xcur seedha lm_head mein jaata tha (unnormalized activations)
-            // Ab: Final LayerNorm → stable logits, better loss convergence
-            Tensor X_final = model.final_ln.forward(Xcur);
-            // logits = X_final @ lm_head  (seq, vocab)
+            // FIX 5 (X_final): Final LayerNorm inline — model.final_ln ki zaroorat nahi
+            // Directly Xcur ko normalize karte hain lm_head se pehle
+            Tensor X_final({seq, d}, 0.0f);
+            for(int si=0;si<seq;++si){
+                float mn=0,vr=0;
+                for(int di=0;di<d;++di) mn+=Xcur.at(si,di); mn/=d;
+                for(int di=0;di<d;++di){float v=Xcur.at(si,di)-mn; vr+=v*v;} vr/=d;
+                float inv_std=1.0f/std::sqrt(vr+1e-5f);
+                for(int di=0;di<d;++di)
+                    X_final.at(si,di)=(Xcur.at(si,di)-mn)*inv_std;
+            }
             Tensor logits = vedic_gemm(X_final, model.lm_head);
 
             // ── Loss + dLogits ────────────────────────────────
@@ -464,8 +469,8 @@ void run_training(const std::string& dataset_path) {
             //               [3..] = per-layer weights (mha+ffn+ln1+ln2)
 
             // ── Backprop: lm_head ──────────────────────────────
-            // logits = X_final @ lm_head  (X_final = final_ln(Xcur))
-            // grads[2]=lm_head, grads[3]=final_ln_γ, grads[4]=final_ln_β
+            // logits = X_final @ lm_head  (X_final = inline-normalized Xcur)
+            // grads[2] = lm_head
             Tensor dX_final({seq, d}, 0.0f);
             for(int di=0;di<d;++di)
                 for(int v=0;v<vocab;++v)
@@ -476,27 +481,13 @@ void run_training(const std::string& dataset_path) {
                     for(int v=0;v<vocab;++v)
                         dX_final.at(si,di) += dLogits.at(si,v) * model.lm_head.at(di,v);
 
-            // final_ln gamma/beta grads (indices 3,4)
-            for(int si=0;si<seq;++si){
-                float mn=0,vr=0;
-                for(int j=0;j<d;++j) mn+=Xcur.at(si,j); mn/=d;
-                for(int j=0;j<d;++j){float vv=Xcur.at(si,j)-mn; vr+=vv*vv;} vr/=d;
-                float inv_std=1.0f/std::sqrt(vr+1e-5f);
-                for(int di=0;di<d;++di){
-                    float xh=(Xcur.at(si,di)-mn)*inv_std;
-                    grads[3].at(0,di) += dX_final.at(si,di)*xh;  // dγ
-                    grads[4].at(0,di) += dX_final.at(si,di);      // dβ
-                }
-            }
-
-            // Backprop through final LayerNorm → dXcur
+            // Backprop through inline final LayerNorm → dXcur
             Tensor dXcur = layernorm_backward(Xcur, dX_final);
 
             // ── Backprop: TransformerBlocks (reverse order) ────
-            // params order: [0]=emb [1]=pos_emb [2]=lm_head [3]=final_ln_γ [4]=final_ln_β
-            //               [5..] = per-layer weights
+            // params order: [0]=emb [1]=pos_emb [2]=lm_head [3..] = per-layer
             int n_layers = (int)model.layers.size();
-            int offset = 5; // start after embedding,pos_emb,lm_head,final_ln(γ,β)
+            int offset = 3; // start after embedding, pos_emb, lm_head
 
             // Compute per-layer param counts
             std::vector<int> layer_param_counts(n_layers);
