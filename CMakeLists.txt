@@ -11,7 +11,10 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 include_directories(include)
 
 # ── CPU executable (existing) ────────────────────────────────
-add_executable(logos src/main.cpp)
+add_executable(logos
+    src/main.cpp
+    src/Checkpoint.cpp
+)
 if(APPLE)
     target_compile_options(logos PRIVATE -O3)
 else()
