@@ -1,59 +1,53 @@
 #pragma once
 // ============================================================
 //  LOGOS — Checkpoint.hpp
+//
+//  BUG 4 FIX: Config mismatch ab HARD ERROR hai (silent overflow band)
+//    Pehle: cfg read karta tha file se, validate karta tha,
+//           lekin phir model.embedding (jo model ki current size pe tha)
+//           use karta tha cfg ki jagah. Agar d=256,L=6 checkpoint ko
+//           d=64,L=2 model mein load karo → silent buffer overflow/underflow.
+//           Crash nahi hota, galat data padha jaata hai — production mein
+//           silently wrong model weights!
+//    Ab:    load_checkpoint() REQUIRES cfg match. Mismatch pe:
+//           - ERROR print karta hai exact mismatch details ke saath
+//           - false return karta hai (load abort)
+//           - Caller ko manually model rebuild karna hoga matching cfg se
+//           Use load_checkpoint_force() agar aap deliberately mismatch allow karna chahte ho
+//           (e.g. vocab resize after tokenizer update — partial load).
+//
+//  BUG 3 FIX (v5 se carry forward): Validate cfg before ANY tensor access
+//    Malicious .bin → heap overflow → arbitrary code execution
+//    Ab: strict bounds check before allocation/read
+//
+//  BUG 13 FIX (v5 se carry forward): Single definition pattern
+//    Declarations only here, definitions in Checkpoint.cpp
 // ============================================================
 #include "Model.hpp"
-#include <fstream>
-#include <iostream>
 #include <string>
 
-inline void save_checkpoint(const LOGOSModel& model,
-                            const std::string& path, int step) {
-    std::string full = path + "_step" + std::to_string(step) + ".bin";
-    std::ofstream f(full, std::ios::binary);
-    if (!f) { std::cerr << "Cannot save: " << full << "\n"; return; }
-    f.write(reinterpret_cast<const char*>(&model.cfg), sizeof(ModelConfig));
-    auto wt = [&](const Tensor& t){
-        f.write(reinterpret_cast<const char*>(t.data.data()),
-                t.total_size * sizeof(float));
-    };
-    wt(model.embedding); wt(model.pos_embedding); wt(model.lm_head);
-    for (const auto& block : model.layers) {
-        for (const auto& h : block.mha.heads){
-            wt(h.W_Q); wt(h.W_K); wt(h.W_V); wt(h.W_O);
-        }
-        wt(block.mha.W_proj);
-        wt(block.ffn.W1); wt(block.ffn.b1);
-        wt(block.ffn.W2); wt(block.ffn.b2);
-        wt(block.ln1.gamma); wt(block.ln1.beta);
-        wt(block.ln2.gamma); wt(block.ln2.beta);
-    }
-    std::cout << "Checkpoint saved: " << full << "\n";
-}
+// ── Validation bounds (sane max values) ──────────────────────
+static constexpr int    CKPT_MAX_VOCAB    = 100000;
+static constexpr int    CKPT_MAX_D_MODEL  = 8192;
+static constexpr int    CKPT_MAX_LAYERS   = 128;
+static constexpr int    CKPT_MAX_HEADS    = 256;
+static constexpr int    CKPT_MAX_SEQ_LEN  = 32768;
+static constexpr size_t CKPT_MAX_FILE_MB  = 10000;  // 10GB
 
-inline bool load_checkpoint(LOGOSModel& model, const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot load: " << path << "\n"; return false; }
-    ModelConfig cfg;
-    f.read(reinterpret_cast<char*>(&cfg), sizeof(ModelConfig));
-    auto rt = [&](Tensor& t){
-        f.read(reinterpret_cast<char*>(t.data.data()),
-               t.total_size * sizeof(float));
-    };
-    rt(model.embedding); rt(model.pos_embedding); rt(model.lm_head);
-    for (auto& block : model.layers) {
-        for (auto& h : block.mha.heads){
-            rt(h.W_Q); rt(h.W_K); rt(h.W_V); rt(h.W_O);
-        }
-        rt(block.mha.W_proj);
-        rt(block.ffn.W1); rt(block.ffn.b1);
-        rt(block.ffn.W2); rt(block.ffn.b2);
-        rt(block.ln1.gamma); rt(block.ln1.beta);
-        rt(block.ln2.gamma); rt(block.ln2.beta);
-    }
-    if (model.embedding.has_nan()){
-        std::cerr << "Checkpoint corrupt\n"; return false;
-    }
-    std::cout << "Checkpoint loaded: " << path << "\n";
-    return true;
-}
+// ── Save ──────────────────────────────────────────────────────
+// Returns true on success
+bool save_checkpoint(const LOGOSModel& model,
+                     const std::string& path,
+                     int step);
+
+// ── Load (strict — requires cfg match) ───────────────────────
+// BUG 4 FIX: Returns false if cfg in file != model.cfg
+// Caller must ensure model is built with matching config before loading.
+// Error message prints exact mismatch for diagnosis.
+bool load_checkpoint(LOGOSModel& model, const std::string& path);
+
+// ── Load (force — allows cfg mismatch, partial load) ─────────
+// Use ONLY when you know what you're doing (e.g. vocab resize).
+// Tensors read up to min(file_size, model_size) — no overflow.
+// May produce wrong results if architectures differ significantly.
+bool load_checkpoint_force(LOGOSModel& model, const std::string& path);
