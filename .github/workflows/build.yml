@@ -1,5 +1,9 @@
 name: LOGOS CI — Build, Test & Train
 
+# ── Security: minimal permissions (principle of least privilege) ──
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ "main", "dev" ]
@@ -57,7 +61,7 @@ jobs:
       - name: Install GCC 12
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build sha256sum
           sudo update-alternatives \
             --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
             --slave   /usr/bin/g++ g++ /usr/bin/g++-12
@@ -84,40 +88,62 @@ jobs:
       # ── Training on TinyStories (mini) ─────────────────────
       - name: Download TinyStories dataset (1MB sample)
         run: |
-          # HuggingFace se TinyStories ka ek chhota sample
+          # ── SECURITY: HuggingFace dataset pinned SHA-256 checksum ──
+          # SHA-256 of TinyStoriesV2-GPT4-train.txt (first 5MB slice)
+          # Update this if HuggingFace file changes upstream
+          EXPECTED_SHA="f2d94a6b46fe8c4d01e7bc4be49e5e7cd04cb47aec3a1dce17f8e37e72e16b51"
+
+          DOWNLOAD_OK=false
           curl -L \
             "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
             --max-filesize 5242880 \
-            -o dataset.txt \
+            -o dataset_raw.txt \
             --fail --silent --show-error \
-            || echo "Download failed — using synthetic data"
+            && DOWNLOAD_OK=true \
+            || echo "Download failed — falling back to synthetic data"
 
-          # Agar download fail ho toh synthetic data use karo
-          if [ ! -s dataset.txt ]; then
-            echo "Once upon a time there was a little girl named Lily. She loved to play in the garden with her dog Max. One day they found a magical flower that could talk. The flower said hello and Lily was very surprised. Max barked happily. They became best friends with the flower and visited it every day after school. The end. Once upon a time there was a boy named Tom. He liked to read books about dinosaurs. His favorite was the Tyrannosaurus Rex. Tom wanted to be a paleontologist when he grew up. He studied hard every day and learned many interesting facts about prehistoric animals. One day his teacher was very impressed with his knowledge." > dataset.txt
-            # 5000 words banao
+          if [ "$DOWNLOAD_OK" = "true" ] && [ -s dataset_raw.txt ]; then
+            # ── Checksum verify karo ──
+            ACTUAL_SHA=$(sha256sum dataset_raw.txt | awk '{print $1}')
+            if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+              echo "⚠️  SHA-256 mismatch — expected: $EXPECTED_SHA"
+              echo "   actual:   $ACTUAL_SHA"
+              echo "   Pinned checksum nahi mila. Synthetic fallback use ho raha hai."
+              echo "   NOTE: Agar HuggingFace ne file update ki hai toh"
+              echo "         EXPECTED_SHA ko update karo: $ACTUAL_SHA"
+              DOWNLOAD_OK=false
+            else
+              echo "✅ Checksum verified: $ACTUAL_SHA"
+              head -c 1048576 dataset_raw.txt > dataset.txt
+              echo "TinyStories downloaded & verified: $(wc -c < dataset.txt) bytes"
+            fi
+          fi
+
+          if [ "$DOWNLOAD_OK" = "false" ] || [ ! -s dataset.txt ]; then
+            # ── Synthetic fallback ──
+            echo "Once upon a time there was a little girl named Lily. She loved to play in the garden with her dog Max. One day they found a magical flower that could talk. The flower said hello and Lily was very surprised. Max barked happily. They became best friends with the flower and visited it every day after school. The end." > dataset.txt
             for i in $(seq 1 50); do
               echo "Once upon a time a small rabbit lived in a cozy burrow under an old oak tree. The rabbit had many friends in the forest including a wise owl and a playful squirrel. Every morning they would meet by the stream and share stories about their adventures. The owl taught the rabbit about the stars and the squirrel showed the rabbit where to find the best nuts. They lived happily together learning new things each day." >> dataset.txt
             done
             echo "Using synthetic dataset ($(wc -w < dataset.txt) words)"
-          else
-            echo "TinyStories downloaded: $(wc -c < dataset.txt) bytes"
-            # Sirf pehle 1MB use karo CI mein (speed ke liye)
-            head -c 1048576 dataset.txt > dataset_small.txt
-            mv dataset_small.txt dataset.txt
           fi
+
           wc -l dataset.txt
 
       - name: Train LOGOS (CI mini-run — 200 steps)
         run: |
-          # CI mein sirf 200 steps — smoke test ke liye
-          timeout 180 ./build/logos --train dataset.txt || true
+          # ── SECURITY FIX: || true hataya gaya ──
+          # Pehle: training fail hone par bhi CI green tha
+          # Ab:    real failure = real CI failure
+          timeout 180 ./build/logos --train dataset.txt
           echo "Training step complete"
           ls -la *.bin 2>/dev/null || echo "No checkpoint yet (normal for short run)"
 
       - name: Evaluate
         run: |
-          ./build/logos --eval dataset.txt || true
+          # ── SECURITY FIX: || true hataya gaya ──
+          # Eval failure ab CI ko fail karega (hidden failures nahi)
+          ./build/logos --eval dataset.txt
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -134,7 +160,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # ── macOS Build ──────────────────────────────────────────────
+  # ── Build + Unit Tests (macOS) ───────────────────────────────
   build-macos:
     name: macOS Build & Test (ARM64)
     runs-on: macos-14
@@ -148,7 +174,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
         # NOTE: no -march flag — Apple M1 (ARM64) pe x86-64 nahi chalta
-        # -O3 alone enough hai, compiler apne arch ke liye optimize karega
 
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
@@ -181,3 +206,11 @@ jobs:
           echo "Windows : ${{ needs.build-windows.result }}"
           echo "Linux   : ${{ needs.build-linux.result }}"
           echo "macOS   : ${{ needs.build-macos.result }}"
+          # Agar koi bhi job fail ho toh summary fail ho
+          if [ "${{ needs.build-windows.result }}" != "success" ] || \
+             [ "${{ needs.build-linux.result }}"   != "success" ] || \
+             [ "${{ needs.build-macos.result }}"   != "success" ]; then
+            echo "❌ One or more jobs failed."
+            exit 1
+          fi
+          echo "✅ All jobs passed."

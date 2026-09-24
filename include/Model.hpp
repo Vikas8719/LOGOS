@@ -1,6 +1,19 @@
 #pragma once
 // ============================================================
 //  LOGOS — Model.hpp
+//
+//  BUG 5 FIX: ModelConfig defaults unified — .hpp aur .cpp mismatch band
+//    Pehle .hpp:  d_model=128, num_heads=4, num_layers=4, max_seq_len=128
+//    Pehle .cpp:  d_model=256, num_heads=8, num_layers=6, max_seq_len=512
+//    → koi bhi ModelConfig{} use kare toh alag values milti thi
+//
+//    Ab: SINGLE SOURCE OF TRUTH yahan (Model.hpp) hai.
+//        Model.cpp mein duplicate ModelConfig definition remove kar di gayi.
+//        Chosen defaults: d_model=128, heads=4, layers=4, seq=128
+//        (conservative — fast iteration, easily scalable via explicit cfg)
+//
+//  ✅ ModelConfig ONLY defined here — Model.cpp mein nahi
+//  ✅ LOGOSModel ONLY defined here — Model.cpp is now DEAD (not compiled)
 // ============================================================
 #include "Tensor.hpp"
 #include "VedicGEMM.hpp"
@@ -12,12 +25,16 @@
 #include <stdexcept>
 #include <cmath>
 
+// ── ModelConfig — Single Source of Truth ─────────────────────
+// BUG 5 FIX: One definition, consistent defaults everywhere.
+// To scale up: pass explicit cfg to LOGOSModel constructor.
+// Example: cfg.d_model=256; cfg.num_heads=8; cfg.num_layers=6; cfg.max_seq_len=512;
 struct ModelConfig {
-    int vocab_size  = 4096;
-    int d_model     = 128;
-    int num_heads   = 4;
-    int num_layers  = 4;
-    int max_seq_len = 128;
+    int vocab_size  = 4096;   // default vocab (overridden by tokenizer in practice)
+    int d_model     = 128;    // embedding dimension
+    int num_heads   = 4;      // attention heads (d_model must be divisible by this)
+    int num_layers  = 4;      // transformer blocks
+    int max_seq_len = 128;    // max context length
 };
 
 class LOGOSModel {
@@ -47,7 +64,8 @@ public:
     Tensor forward(const std::vector<int>& token_ids) {
         int seq = (int)token_ids.size();
         if (seq > cfg.max_seq_len)
-            throw std::runtime_error("Input too long");
+            throw std::runtime_error("Input too long: " + std::to_string(seq)
+                                     + " > max_seq_len " + std::to_string(cfg.max_seq_len));
 
         Tensor X({seq, cfg.d_model}, 0.0f);
         for (int i = 0; i < seq; ++i) {
@@ -84,5 +102,15 @@ public:
         std::vector<Tensor*> p = {&embedding, &pos_embedding, &lm_head};
         for (auto& l : layers) for (auto* w : l.parameters()) p.push_back(w);
         return p;
+    }
+
+    // Parameter count (approximate)
+    long long count_parameters() const {
+        long long total = embedding.total_size + pos_embedding.total_size + lm_head.total_size;
+        for (const auto& l : layers)
+            total += (long long)cfg.d_model * cfg.d_model * 8   // attention matrices
+                   + (long long)cfg.d_model * 4 * cfg.d_model * 2 // FFN
+                   + cfg.d_model * 4;                             // LayerNorm
+        return total;
     }
 };
