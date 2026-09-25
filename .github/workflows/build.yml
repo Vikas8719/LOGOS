@@ -202,18 +202,12 @@ jobs:
           fi
 
           if [ "$DOWNLOAD_OK" = "false" ] || [ ! -s dataset.txt ]; then
-            python3 << 'PYEOF'
-import random
-random.seed(42)
-words = ["the","cat","sat","on","mat","a","dog","ran","fast","slow",
-         "big","small","red","blue","green","happy","sad","old","new",
-         "Once","upon","time","there","was","little","girl","named","Lily"]
-lines = []
-for _ in range(5000):
-    n = random.randint(10, 30)
-    lines.append(" ".join(random.choices(words, k=n)) + ".")
-print("\n".join(lines))
-PYEOF
+            python3 -c "
+import random; random.seed(42)
+words = ['the','cat','sat','on','mat','a','dog','ran','fast','slow','big','small','red','blue','green','happy','sad','old','new','Once','upon','time','there','was','little','girl','named','Lily']
+lines = [' '.join(random.choices(words, k=random.randint(10,30)))+'.' for _ in range(5000)]
+open('dataset.txt','w').write('\n'.join(lines))
+"
             echo "Using synthetic dataset"
           fi
           echo "Dataset size: $(wc -c < dataset.txt) bytes"
