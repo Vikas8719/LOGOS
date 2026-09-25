@@ -64,6 +64,7 @@
 #include <algorithm>
 #include <numeric>
 #include <string>
+#include <tuple>
 
 // ── Test framework ────────────────────────────────────────────
 static int g_pass = 0, g_fail = 0;
