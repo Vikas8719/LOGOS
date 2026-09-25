@@ -202,12 +202,7 @@ jobs:
           fi
 
           if [ "$DOWNLOAD_OK" = "false" ] || [ ! -s dataset.txt ]; then
-            python3 -c "
-import random; random.seed(42)
-words = ['the','cat','sat','on','mat','a','dog','ran','fast','slow','big','small','red','blue','green','happy','sad','old','new','Once','upon','time','there','was','little','girl','named','Lily']
-lines = [' '.join(random.choices(words, k=random.randint(10,30)))+'.' for _ in range(5000)]
-open('dataset.txt','w').write('\n'.join(lines))
-"
+            python3 -c "import random; random.seed(42); words = ['the','cat','sat','on','mat','a','dog','ran','fast','slow','big','small','red','blue','green','happy','sad','old','new','Once','upon','time','there','was','little','girl','named','Lily']; lines = [' '.join(random.choices(words, k=random.randint(10,30)))+'.' for _ in range(5000)]; open('dataset.txt','w').write('\n'.join(lines))"
             echo "Using synthetic dataset"
           fi
           echo "Dataset size: $(wc -c < dataset.txt) bytes"
@@ -353,13 +348,13 @@ open('dataset.txt','w').write('\n'.join(lines))
     steps:
       - name: Print results and check failures
         env:
-          R_LINUX: ${{ needs.math-tests-linux.result }}
-          R_WINDOWS: ${{ needs.math-tests-windows.result }}
-          R_MACOS: ${{ needs.math-tests-macos.result }}
-          R_GPU: ${{ needs.gpu-tests.result }}
-          R_TRAIN: ${{ needs.training-pipeline.result }}
-          R_WIN_BUILD: ${{ needs.windows-build.result }}
-          R_MAC_BUILD: ${{ needs.macos-build.result }}
+          R_LINUX: ${{ needs['math-tests-linux'].result }}
+          R_WINDOWS: ${{ needs['math-tests-windows'].result }}
+          R_MACOS: ${{ needs['math-tests-macos'].result }}
+          R_GPU: ${{ needs['gpu-tests'].result }}
+          R_TRAIN: ${{ needs['training-pipeline'].result }}
+          R_WIN_BUILD: ${{ needs['windows-build'].result }}
+          R_MAC_BUILD: ${{ needs['macos-build'].result }}
         run: |
           echo "================================================"
           echo "  LOGOS CI Summary"
