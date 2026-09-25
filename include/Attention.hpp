@@ -20,6 +20,10 @@
 //  Physics: Softmax(QKᵀ/√d) ≡ Boltzmann distribution
 //    P(state_i) = exp(-E_i/T) / Σ exp(-E_j/T)
 //    Energy E = -attention_score, Temperature T = √d_k
+//
+//  Shunyam Sparse Attention (Vedic sutra: शून्यम्  = void/zero)
+//    Non-resonant positions → Shunyam (-1e9) → zeroed by softmax
+//    Local window + global stride pattern: O(seq*(w + seq/s)) not O(seq²)
 // ============================================================
 #include "Tensor.hpp"
 #include "VedicGEMM.hpp"
@@ -77,6 +81,129 @@ inline Tensor causal_mask(int seq_len) {
     return causal_mask_cached(seq_len);  // delegate to cache
 }
 
+// ── Shunyam Sparse Attention Mask ────────────────────────────
+// Vedic sutra "Shunyam" (शून्यम्) = zero / void
+// Strategy: each query attends only to LOCAL window + GLOBAL stride
+//   Local window  : last `window` tokens (recent context — dense)
+//   Global stride : every `stride`-th token (long-range — sparse)
+//   All other positions: zeroed out (-1e9 = Shunyam / void)
+//
+// This reduces O(seq²) full attention to O(seq * (window + seq/stride))
+// Physics: sparse = only resonant frequencies survive (spectral pruning)
+//
+// Parameters:
+//   seq_len : sequence length
+//   window  : local attention window size (default 8)
+//   stride  : global token stride (default 4 — every 4th token)
+inline Tensor shunyam_sparse_mask(int seq_len,
+                                   int window = 8,
+                                   int stride = 4)
+{
+    Tensor mask({seq_len, seq_len}, -1e9f);  // Shunyam: all void by default
+
+    for (int i = 0; i < seq_len; ++i) {
+        // 1. Causal constraint: never attend to future (j > i)
+        // 2. Local window: attend to [max(0, i-window), i]
+        int local_start = std::max(0, i - window);
+        for (int j = local_start; j <= i; ++j)
+            mask.at(i, j) = 0.0f;  // allow: local window
+
+        // 3. Global stride: attend to past stride-aligned positions
+        for (int j = 0; j < i; j += stride)
+            mask.at(i, j) = 0.0f;  // allow: global landmark tokens
+    }
+    return mask;
+}
+
+// Cached version of shunyam mask (same pattern = reuse)
+inline const Tensor& shunyam_sparse_mask_cached(int seq_len,
+                                                  int window = 8,
+                                                  int stride = 4)
+{
+    // Key encodes all three params
+    static std::unordered_map<int, Tensor> sparse_cache;
+    int key = seq_len * 10000 + window * 100 + stride;
+    auto it = sparse_cache.find(key);
+    if (it != sparse_cache.end()) return it->second;
+    sparse_cache.emplace(key, shunyam_sparse_mask(seq_len, window, stride));
+    return sparse_cache.at(key);
+}
+
+// ── Navier-Stokes Attention ───────────────────────────────────
+// Physics: token interactions modelled as viscous fluid flow
+//   Standard attention = ideal fluid (no viscosity, no diffusion)
+//   Navier-Stokes attention = viscous fluid with:
+//     (1) Advection term    : tokens "carry" information downstream
+//                             like fluid particles advecting a scalar field
+//     (2) Diffusion term    : information smooths across neighbours
+//                             like viscous dissipation spreading momentum
+//     (3) Pressure gradient : softmax scores act as pressure field
+//                             high-score regions = low pressure → flow toward
+//
+//   Incompressibility constraint (∇·u = 0):
+//     Attention weights row-sum = 1 (softmax) enforces incompressibility
+//     Total "information volume" is conserved across positions
+//
+// Implementation:
+//   Step 1 — Advection:  Q_adv[i] = Q[i] + η * (Q[i] - Q[i-1])  [upwind scheme]
+//   Step 2 — Standard QK attention with advected queries
+//   Step 3 — Viscous diffusion on output: V_smooth[i] = (1-ν)*V[i] + ν*(V[i-1]+V[i+1])/2
+//   Step 4 — Output blend: (1-α)*std_out + α*ns_out  [Reynolds blend — see Reynolds below]
+//
+//   Parameters:
+//     eta  (η): advection strength  (0 = no advection, 0.1 = mild convection)
+//     nu   (ν): kinematic viscosity (0 = inviscid, 0.1 = viscous diffusion)
+//     Note: η and ν are annealed by ReynoldsBatch — no hardcoding needed
+inline Tensor navier_stokes_attention(const Tensor& Q, const Tensor& K, const Tensor& V,
+                                       const Tensor& mask,
+                                       float temperature,
+                                       float eta  = 0.1f,    // advection
+                                       float nu   = 0.05f)   // viscosity
+{
+    int seq = Q.rows(), d_k = Q.cols(), d_v = V.cols();
+
+    // ── Step 1: Upwind Advection on Q (convective derivative DQ/Dt) ──
+    // Q_adv[i] = Q[i] + η * (Q[i] - Q[i-1])
+    // Upwind scheme (first-order): stable for η > 0 (forward flow)
+    // Physics: query at pos i is "advected" by information flow from i-1
+    Tensor Q_adv(Q.shape, 0.0f);
+    for (int i = 0; i < seq; ++i) {
+        for (int j = 0; j < d_k; ++j) {
+            float q_i   = Q.at(i, j);
+            float q_im1 = (i > 0) ? Q.at(i-1, j) : q_i;  // boundary: no flow at i=0
+            Q_adv.at(i, j) = q_i + eta * (q_i - q_im1);
+        }
+    }
+
+    // ── Step 2: Standard scaled-dot-product attention with advected Q ──
+    // Scores = Q_adv @ K^T / sqrt(d_k)   [pressure field]
+    Tensor K_T    = K.transpose();
+    Tensor scores = vedic_gemm(Q_adv, K_T);
+    scores += mask;  // causal / sparse mask
+
+    Tensor attn_weights = boltzmann_softmax(scores, temperature);
+
+    // ── Step 3: Viscous diffusion on V before mixing ──────────
+    // V_smooth[i] = (1-ν)*V[i] + ν*(V[i-1]+V[i+1])/2
+    // Central difference Laplacian: ∂²V/∂x² ≈ (V[i+1]-2V[i]+V[i-1]) / h²
+    // Euler step: V_smooth = V + ν*Δt * ∇²V  ≈ (1-ν)*V + ν*(V_{left}+V_{right})/2
+    // Boundary: mirror (V[-1]=V[0], V[seq]=V[seq-1]) — zero-flux Neumann BC
+    Tensor V_smooth(V.shape, 0.0f);
+    for (int i = 0; i < seq; ++i) {
+        int i_left  = (i > 0)      ? i - 1 : 0;
+        int i_right = (i < seq-1)  ? i + 1 : seq - 1;
+        for (int j = 0; j < d_v; ++j) {
+            V_smooth.at(i, j) = (1.0f - nu) * V.at(i, j)
+                               + (nu * 0.5f) * (V.at(i_left, j) + V.at(i_right, j));
+        }
+    }
+
+    // ── Step 4: Weighted output (attention × smoothed values) ─
+    // output = attn_weights @ V_smooth
+    // This is the "incompressible" mixing step: weights sum to 1 (∇·u=0)
+    return vedic_gemm(attn_weights, V_smooth);
+}
+
 // ── Single Attention Head ─────────────────────────────────────
 struct AttentionHead {
     Tensor W_Q, W_K, W_V, W_O;
@@ -94,6 +221,17 @@ struct AttentionHead {
         W_O.fill_random(-scale, scale);
     }
 
+    // use_sparse: true = Shunyam sparse mask, false = full causal mask
+    bool  use_sparse     = true;
+    int   sparse_window  = 8;
+    int   sparse_stride  = 4;
+    // use_navier_stokes: true = NS fluid attention, false = standard attention
+    // ns_alpha: blend weight — 0.0 = pure standard, 1.0 = pure NS
+    bool  use_navier_stokes = false;
+    float ns_alpha          = 0.3f;   // blend fraction for NS path
+    float ns_eta            = 0.1f;   // advection strength
+    float ns_nu             = 0.05f;  // kinematic viscosity
+
     Tensor forward(const Tensor& X) {
         float temperature = std::sqrt(static_cast<float>(d_k));
 
@@ -101,15 +239,48 @@ struct AttentionHead {
         Tensor K = vedic_gemm(X, W_K);
         Tensor V = vedic_gemm(X, W_V);
 
-        Tensor K_T    = K.transpose();
-        Tensor scores = vedic_gemm(Q, K_T);
+        // Select mask
+        int seq = X.rows();
+        const Tensor* mask_ptr = nullptr;
+        Tensor sparse_mask_copy;
+        if (use_sparse && seq > sparse_window) {
+            sparse_mask_copy = shunyam_sparse_mask_cached(seq, sparse_window, sparse_stride);
+            mask_ptr         = &sparse_mask_copy;
+        } else {
+            sparse_mask_copy = causal_mask_cached(seq);
+            mask_ptr         = &sparse_mask_copy;
+        }
 
-        // BUG 7 FIX: cached mask — no alloc on repeated calls
-        scores += causal_mask_cached(X.rows());
+        if (use_navier_stokes && ns_alpha > 0.0f) {
+            // ── Navier-Stokes path ────────────────────────────
+            // Standard output (for blending)
+            Tensor K_T       = K.transpose();
+            Tensor scores_std = vedic_gemm(Q, K_T);
+            scores_std       += *mask_ptr;
+            Tensor w_std      = boltzmann_softmax(scores_std, temperature);
+            Tensor out_std    = vedic_gemm(w_std, V);
+            Tensor out_std_O  = vedic_gemm(out_std, W_O);
 
-        Tensor attn_weights = boltzmann_softmax(scores, temperature);
-        Tensor output       = vedic_gemm(attn_weights, V);
-        return vedic_gemm(output, W_O);
+            // NS viscous-advective output
+            Tensor out_ns = navier_stokes_attention(Q, K, V, *mask_ptr,
+                                                     temperature, ns_eta, ns_nu);
+            Tensor out_ns_O = vedic_gemm(out_ns, W_O);
+
+            // Blend: (1-α)*standard + α*NS
+            Tensor blended({seq, d_model}, 0.0f);
+            float w1 = 1.0f - ns_alpha, w2 = ns_alpha;
+            for (int i = 0; i < blended.total_size; ++i)
+                blended.data[i] = w1 * out_std_O.data[i] + w2 * out_ns_O.data[i];
+            return blended;
+        } else {
+            // ── Standard path ─────────────────────────────────
+            Tensor K_T    = K.transpose();
+            Tensor scores = vedic_gemm(Q, K_T);
+            scores       += *mask_ptr;
+            Tensor attn_weights = boltzmann_softmax(scores, temperature);
+            Tensor output       = vedic_gemm(attn_weights, V);
+            return vedic_gemm(output, W_O);
+        }
     }
 
     std::vector<Tensor*> parameters() { return {&W_Q, &W_K, &W_V, &W_O}; }

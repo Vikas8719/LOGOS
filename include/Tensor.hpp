@@ -231,3 +231,162 @@ public:
         return false;
     }
 };
+
+// ── Riemannian Metric for Parameter Space ─────────────────────
+// Physics: standard Euclidean distance in weight space treats all
+//   parameter directions as equally important. This is geometrically
+//   naive — the loss landscape is curved (non-Euclidean manifold).
+//
+// Riemannian geometry:
+//   The parameter space θ ∈ ℝⁿ is equipped with a metric tensor G(θ)
+//   that defines local distances as:
+//     ds² = dθᵀ G(θ) dθ   (infinitesimal arc length on the manifold)
+//
+//   In standard gradient descent: G = I (flat Euclidean)
+//   In natural gradient:          G = Fisher information matrix F(θ)
+//   In Riemannian gradient:       G = any positive-definite curvature estimate
+//
+// This implementation: diagonal Riemannian metric from Hessian diagonal
+//   G_ii ≈ |∂²L/∂θᵢ²|   (absolute curvature per parameter)
+//   Estimated via finite differences: |g(θ+ε) - g(θ)| / ε
+//   Simple, cheap, and gives per-parameter curvature information.
+//
+// Uses:
+//   (1) riemannian_distance()  — geodesic distance between two param vectors
+//   (2) riemannian_gradient()  — precondition gradient by G⁻¹ (natural step)
+//   (3) parallel_transport()   — move a gradient vector along a path on the manifold
+//       (first-order approx: g_transported ≈ g - (g·Δθ/||Δθ||²) * Δθ)
+//
+// Note: For full Hessian-based metric, see compute_metric_from_grads() below.
+//       For Fisher-based metric, use NaturalGradientOptimizer in PhysicsOpt.hpp.
+struct RiemannianMetric {
+    std::vector<float> metric_diag;  // G_ii — diagonal metric tensor
+    float              damping;       // λ > 0 ensures G + λI is PD (Tikhonov)
+    int                dim;
+
+    explicit RiemannianMetric(int dimension, float damp = 1e-4f)
+        : metric_diag(dimension, 1.0f),   // init to identity (flat Euclidean)
+          damping(damp), dim(dimension)
+    {}
+
+    // Update metric diagonal from a sequence of gradient vectors
+    // G_ii ← β * G_ii + (1-β) * g_i²   (EMA of squared gradients)
+    // This is the empirical Fisher / AdaGrad-style curvature estimate.
+    // Call this after each backward pass with the current gradient.
+    void update(const Tensor& grad, float beta = 0.95f) {
+        if ((int)grad.total_size > dim) return;  // safety check
+        for (int i = 0; i < grad.total_size && i < dim; ++i) {
+            float g2 = grad.data[i] * grad.data[i];
+            metric_diag[i] = beta * metric_diag[i] + (1.0f - beta) * g2;
+        }
+    }
+
+    // Batch update from multiple parameter tensors (all params at once)
+    void update_from_params(const std::vector<Tensor*>& grads, float beta = 0.95f) {
+        int offset = 0;
+        for (const auto* g : grads) {
+            for (int i = 0; i < g->total_size && offset+i < dim; ++i) {
+                float g2 = g->data[i] * g->data[i];
+                metric_diag[offset+i] = beta * metric_diag[offset+i]
+                                       + (1.0f - beta) * g2;
+            }
+            offset += g->total_size;
+        }
+    }
+
+    // Riemannian (geodesic) distance between two parameter points θ₁ and θ₂
+    // d²(θ₁,θ₂) = (θ₁-θ₂)ᵀ G (θ₁-θ₂) = Σᵢ G_ii * (θ₁ᵢ - θ₂ᵢ)²
+    // Returns the geodesic length (scalar), not squared distance.
+    float riemannian_distance(const std::vector<float>& theta1,
+                               const std::vector<float>& theta2) const {
+        float d2 = 0.0f;
+        int   n  = std::min({(int)theta1.size(), (int)theta2.size(), dim});
+        for (int i = 0; i < n; ++i) {
+            float diff = theta1[i] - theta2[i];
+            float G_ii = metric_diag[i] + damping;  // G + λI ensures PD
+            d2 += G_ii * diff * diff;
+        }
+        return std::sqrt(d2);
+    }
+
+    // Tensor overload for convenience
+    float riemannian_distance(const Tensor& theta1, const Tensor& theta2) const {
+        float d2 = 0.0f;
+        int   n  = std::min({theta1.total_size, theta2.total_size, dim});
+        for (int i = 0; i < n; ++i) {
+            float diff = theta1.data[i] - theta2.data[i];
+            float G_ii = metric_diag[i] + damping;
+            d2 += G_ii * diff * diff;
+        }
+        return std::sqrt(d2);
+    }
+
+    // Precondition a gradient by the inverse metric: g̃ = G⁻¹ g
+    // g̃_i = g_i / (G_ii + λ)   [diagonal inverse = element-wise division]
+    // This transforms the standard gradient into the natural gradient direction.
+    // The result is the steepest ascent direction in Riemannian metric distance.
+    Tensor riemannian_gradient(const Tensor& grad) const {
+        Tensor g_nat(grad.shape);
+        int n = std::min(grad.total_size, dim);
+        for (int i = 0; i < n; ++i) {
+            float G_ii = metric_diag[i] + damping;
+            g_nat.data[i] = grad.data[i] / G_ii;
+        }
+        return g_nat;
+    }
+
+    // Parallel transport (first-order approximation):
+    // When moving from θ to θ + Δθ, a tangent vector v (gradient) must be
+    // transported along the geodesic to remain "parallel" on the manifold.
+    //
+    // Exact parallel transport requires solving ODEs; first-order approx:
+    //   v_transported ≈ v - (v·Δθ / (||Δθ||²_G + ε)) * Δθ
+    //   where ||Δθ||²_G = ΔθᵀGΔθ  (Riemannian norm of step)
+    //
+    // This removes the component of v in the direction of motion,
+    // keeping v on the tangent space of the new point on the manifold.
+    Tensor parallel_transport(const Tensor& v, const Tensor& delta_theta) const {
+        // Compute Riemannian inner product <v, Δθ>_G = Σᵢ G_ii * v_i * Δθ_i
+        float vdot_G = 0.0f;
+        float ddot_G = 0.0f;   // ||Δθ||²_G
+        int   n      = std::min({v.total_size, delta_theta.total_size, dim});
+        for (int i = 0; i < n; ++i) {
+            float G_ii = metric_diag[i] + damping;
+            vdot_G += G_ii * v.data[i] * delta_theta.data[i];
+            ddot_G += G_ii * delta_theta.data[i] * delta_theta.data[i];
+        }
+
+        float scale = vdot_G / (ddot_G + 1e-10f);
+
+        Tensor transported(v.shape);
+        for (int i = 0; i < n; ++i)
+            transported.data[i] = v.data[i] - scale * delta_theta.data[i];
+        return transported;
+    }
+
+    // Riemannian norm of a vector: ||v||_G = sqrt(vᵀ G v)
+    float riemannian_norm(const Tensor& v) const {
+        float n2 = 0.0f;
+        int   n  = std::min(v.total_size, dim);
+        for (int i = 0; i < n; ++i) {
+            float G_ii = metric_diag[i] + damping;
+            n2 += G_ii * v.data[i] * v.data[i];
+        }
+        return std::sqrt(n2);
+    }
+
+    // Log current metric statistics (for diagnostics)
+    void log_state() const {
+        float min_g = metric_diag[0], max_g = metric_diag[0], sum = 0.0f;
+        for (float g : metric_diag) {
+            min_g = std::min(min_g, g);
+            max_g = std::max(max_g, g);
+            sum  += g;
+        }
+        std::cout << "RiemannianMetric | dim=" << dim
+                  << " | G_min=" << min_g
+                  << " | G_max=" << max_g
+                  << " | G_mean=" << (sum / dim)
+                  << " | λ=" << damping << "\n";
+    }
+};

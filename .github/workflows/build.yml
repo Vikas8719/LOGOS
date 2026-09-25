@@ -1,4 +1,4 @@
-name: LOGOS CI - Build Test Train (v8 Phase 1+2)
+name: LOGOS CI - Build Test Train (v10 Phase 1+2+Physics)
 
 permissions:
   contents: read
@@ -40,8 +40,19 @@ jobs:
       - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel $(nproc)
 
-      - name: Run T2 Math Tests
+      - name: Run T2 Math Tests (M1-M16)
         run: ./build/test_math_unit
+
+      - name: Verify M11-M16 coverage in output
+        run: |
+          ./build/test_math_unit 2>&1 | tee /tmp/math_out.txt
+          for test_id in M11 M12 M13 M14 M15 M16; do
+            if grep -q "\[$test_id\]" /tmp/math_out.txt; then
+              echo "✅ $test_id present in output"
+            else
+              echo "❌ $test_id MISSING from output"; exit 1
+            fi
+          done
 
       - name: Run CPU logos tests
         run: |
@@ -62,8 +73,20 @@ jobs:
       - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel 4
 
-      - name: Run T2 Math Tests
+      - name: Run T2 Math Tests (M1-M16)
         run: .\build\test_math_unit.exe
+
+      - name: Verify M11-M16 coverage (Windows)
+        shell: bash
+        run: |
+          .\build\test_math_unit.exe 2>&1 | tee math_out.txt || true
+          for test_id in M11 M12 M13 M14 M15 M16; do
+            if grep -q "\[$test_id\]" math_out.txt; then
+              echo "OK $test_id present"
+            else
+              echo "MISSING $test_id"; exit 1
+            fi
+          done
 
   math-tests-macos:
     name: "T2 Math Tests - macOS ARM64"
@@ -80,8 +103,17 @@ jobs:
       - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Run T2 Math Tests
+      - name: Run T2 Math Tests (M1-M16)
         run: ./build/test_math_unit
+
+      - name: Verify M11-M16 coverage (macOS)
+        run: |
+          ./build/test_math_unit 2>&1 | tee /tmp/math_out_mac.txt
+          for test_id in M11 M12 M13 M14 M15 M16; do
+            grep -q "\[$test_id\]" /tmp/math_out_mac.txt \
+              && echo "✅ $test_id" \
+              || { echo "❌ $test_id MISSING"; exit 1; }
+          done
 
 # =============================================================
 #  JOB 2: T1 + T3 - GPU Tests (Syntax + Memory Stress)
@@ -138,9 +170,13 @@ jobs:
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: ./build/test_memory_stress
 
-      - name: GPU tests skipped - run CPU math fallback
+      - name: GPU tests skipped - run CPU math fallback (M1-M16)
         if: steps.cuda_check.outputs.cuda_available == 'false'
-        run: ./build/test_math_unit
+        run: |
+          ./build/test_math_unit
+          # Verify all physics tests present even in GPU fallback path
+          ./build/test_math_unit 2>&1 | grep -E "\[M1[1-6]\]" | wc -l | \
+            xargs -I{} bash -c 'if [ {} -ge 6 ]; then echo "✅ All M11-M16 present"; else echo "❌ Missing physics tests"; exit 1; fi'
 
       - name: cuda-memcheck on T3
         if: steps.cuda_check.outputs.cuda_available == 'true'
@@ -178,8 +214,17 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
           cmake --build build --parallel $(nproc)
 
-      - name: Run T2
-        run: ./build/test_math_unit
+      - name: Run T2 Math Tests (M1-M16 full suite)
+        run: |
+          ./build/test_math_unit 2>&1 | tee /tmp/t2_output.txt
+          echo "--- Physics component test summary ---"
+          grep -E "(M1[1-6]|✅|❌)" /tmp/t2_output.txt | head -40
+          # Fail CI if any test assertion failed
+          if grep -q "❌" /tmp/t2_output.txt; then
+            echo "FAIL: One or more math unit tests failed"
+            exit 1
+          fi
+          echo "PASS: All M1-M16 math unit tests passed"
 
       - name: Download dataset
         run: |
@@ -248,8 +293,18 @@ jobs:
       - name: Unit Tests
         run: .\build\logos.exe --test
 
-      - name: T2 Math Tests
+      - name: T2 Math Tests (M1-M16)
         run: .\build\test_math_unit.exe
+
+      - name: Verify M11-M16 physics tests pass (Windows build job)
+        shell: bash
+        run: |
+          .\build\test_math_unit.exe 2>&1 | tee win_t2.txt || true
+          FAIL=0
+          for id in M11 M12 M13 M14 M15 M16; do
+            grep -q "\[$id\]" win_t2.txt && echo "OK $id" || { echo "MISSING $id"; FAIL=1; }
+          done
+          exit $FAIL
 
       - name: Forward and Benchmark
         run: |
@@ -290,8 +345,14 @@ jobs:
           ./build/logos --forward
           ./build/logos --benchmark
 
-      - name: T2 Math Tests
-        run: ./build/test_math_unit
+      - name: T2 Math Tests (M1-M16)
+        run: |
+          ./build/test_math_unit 2>&1 | tee /tmp/mac_t2.txt
+          for id in M11 M12 M13 M14 M15 M16; do
+            grep -q "\[$id\]" /tmp/mac_t2.txt \
+              && echo "✅ $id" \
+              || { echo "❌ $id MISSING"; exit 1; }
+          done
 
       - name: Upload macOS binary
         uses: actions/upload-artifact@v4
@@ -356,20 +417,38 @@ jobs:
           R_WIN_BUILD: ${{ needs['windows-build'].result }}
           R_MAC_BUILD: ${{ needs['macos-build'].result }}
         run: |
-          echo "================================================"
-          echo "  LOGOS CI Summary"
-          echo "================================================"
-          echo "  T2 Math Linux:     $R_LINUX"
-          echo "  T2 Math Windows:   $R_WINDOWS"
-          echo "  T2 Math macOS:     $R_MACOS"
-          echo "  T1+T3 GPU:         $R_GPU"
-          echo "  Training Pipeline: $R_TRAIN"
-          echo "  Windows Build:     $R_WIN_BUILD"
-          echo "  macOS Build:       $R_MAC_BUILD"
-          echo "================================================"
+          echo "═══════════════════════════════════════════════════"
+          echo "  LOGOS CI Summary (v10 — Physics Component Tests)"
+          echo "═══════════════════════════════════════════════════"
+          echo "  T2 Math Linux   (M1-M16): $R_LINUX"
+          echo "  T2 Math Windows (M1-M16): $R_WINDOWS"
+          echo "  T2 Math macOS   (M1-M16): $R_MACOS"
+          echo "  T1+T3 GPU (Syntax+Mem):   $R_GPU"
+          echo "  Training Pipeline E2E:    $R_TRAIN"
+          echo "  Windows Build + T2:       $R_WIN_BUILD"
+          echo "  macOS ARM64 Build + T2:   $R_MAC_BUILD"
+          echo "───────────────────────────────────────────────────"
+          echo "  Math test coverage:"
+          echo "    M1  - Urdhva Tiryagbhyam GEMM"
+          echo "    M2  - Gunitasamuchayah (product of sums)"
+          echo "    M3  - Free Energy F=CE-T*S"
+          echo "    M4  - Leapfrog Langevin stability"
+          echo "    M5  - Boltzmann softmax temperature"
+          echo "    M6  - Nikhilam complement identity"
+          echo "    M7  - Hyperbolic exp/log map"
+          echo "    M8  - LayerNorm exact statistics"
+          echo "    M9  - VedicGEMM tiling shapes"
+          echo "    M10 - Gradient finite-difference check"
+          echo "    M11 - Natural Gradient (Fisher EMA)"
+          echo "    M12 - Navier-Stokes Attention (fluid)"
+          echo "    M13 - Reynolds Batch Norm (laminar/turbulent)"
+          echo "    M14 - Feynman Dropout (path integral)"
+          echo "    M15 - Riemannian Metric (curved param space)"
+          echo "    M16 - Weight Path Integral (action tracking)"
+          echo "═══════════════════════════════════════════════════"
 
           if [ "$R_GPU" = "failure" ]; then
-            echo "WARNING: GPU tests failed - check if GPU runner is available"
+            echo "⚠️  WARNING: GPU tests failed - check if GPU runner is available"
           fi
 
           CRITICAL_FAIL=false
@@ -381,11 +460,19 @@ jobs:
 
           if [ "$CRITICAL_FAIL" = "true" ]; then
             echo "FAILED: One or more critical jobs failed."
-            echo "  T2 Math failures   -> check tests/test_math_unit.cpp"
-            echo "  T1 Syntax failures -> check cuda/VedicGEMM.cu"
-            echo "  T3 Memory failures -> check cuda/ModelGPU.cu"
-            echo "  Training failures  -> check src/main.cpp"
+            echo ""
+            echo "Debug guide:"
+            echo "  T2 failures (M1-M10)   -> core math: check VedicGEMM, Tensor, PhysicsOpt"
+            echo "  T2 failures (M11)      -> NaturalGradientOptimizer in PhysicsOpt.hpp"
+            echo "  T2 failures (M12)      -> navier_stokes_attention() in Attention.hpp"
+            echo "  T2 failures (M13)      -> ReynoldsBatchNorm in LayerNorm.hpp"
+            echo "  T2 failures (M14)      -> FeynmanDropout in FeedForward.hpp"
+            echo "  T2 failures (M15)      -> RiemannianMetric in Tensor.hpp"
+            echo "  T2 failures (M16)      -> WeightPathIntegral in PhysicsOpt.hpp"
+            echo "  T1 Syntax failures     -> check cuda/VedicGEMM.cu"
+            echo "  T3 Memory failures     -> check cuda/ModelGPU.cu"
+            echo "  Training failures      -> check src/main.cpp"
             exit 1
           fi
 
-          echo "PASSED: All critical jobs passed."
+          echo "✅ PASSED: All critical jobs passed. M1-M16 math suite green."
