@@ -142,6 +142,9 @@ void      d2h(float* dst, const GPUTensor& src, int size);
 
 // ── Core GPU ops (v4, retained) ──────────────────────────────
 void cuda_vedic_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C);
+// True when this build routes GEMM through NVIDIA cuBLAS. The Vedic
+// Gunitasamuchayah verification remains available for either backend.
+bool cuda_vedic_gemm_uses_cublas();
 void cuda_vedic_gemm_bias(const GPUTensor& A, const GPUTensor& W,
                            const GPUTensor& bias, GPUTensor& C);
 void cuda_boltzmann_softmax(const GPUTensor& scores, GPUTensor& probs,

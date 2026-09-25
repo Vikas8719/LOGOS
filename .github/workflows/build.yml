@@ -141,6 +141,8 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_CXX_COMPILER=g++-12 \
               -DCUDA_ARCH_MODE=native \
+              -DLOGOS_USE_CUBLAS=ON \
+              -DLOGOS_CUBLAS_TF32=OFF \
               -DCMAKE_CUDA_FLAGS="--extended-lambda"
           else
             cmake -B build -G Ninja \

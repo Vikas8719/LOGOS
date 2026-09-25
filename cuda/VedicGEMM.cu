@@ -44,6 +44,18 @@
 #include <stdexcept>
 #include <climits>
 
+#ifndef LOGOS_USE_CUBLAS
+#define LOGOS_USE_CUBLAS 0
+#endif
+
+#ifndef LOGOS_CUBLAS_TF32
+#define LOGOS_CUBLAS_TF32 0
+#endif
+
+#if LOGOS_USE_CUBLAS
+#include <cublas_v2.h>
+#endif
+
 #define TILE_SIZE 16
 
 // ============================================================
@@ -105,6 +117,14 @@ __global__ void vedic_gemm_bias_kernel(
         __syncthreads();
     }
     if (row < M && col < N) C[row * N + col] = acc + bias[col];
+}
+
+__global__ void add_bias_kernel(float* __restrict__ C,
+                                const float* __restrict__ bias,
+                                int M, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = M * N;
+    if (idx < size) C[idx] += bias[idx % N];
 }
 
 // ============================================================
@@ -609,21 +629,76 @@ void d2h(float* dst, const GPUTensor& src, int size) {
     CUDA_CHECK(cudaMemcpy(dst, src.data, size*sizeof(float), cudaMemcpyDeviceToHost));
 }
 
+#if LOGOS_USE_CUBLAS
+static void cublas_check(cublasStatus_t status, const char* operation) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string("cuBLAS error in ") + operation +
+                                 ": status=" + std::to_string(static_cast<int>(status)));
+    }
+}
+
+static cublasHandle_t logos_cublas_handle() {
+    static cublasHandle_t handle = [] {
+        cublasHandle_t created = nullptr;
+        cublas_check(cublasCreate(&created), "cublasCreate");
+        return created;
+    }();
+    return handle;
+}
+#endif
+
+bool cuda_vedic_gemm_uses_cublas() {
+#if LOGOS_USE_CUBLAS
+    return true;
+#else
+    return false;
+#endif
+}
+
 void cuda_vedic_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C) {
     int M=A.rows, K=A.cols, N=B.cols;
+#if LOGOS_USE_CUBLAS
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasHandle_t handle = logos_cublas_handle();
+#if LOGOS_CUBLAS_TF32
+    // Row-major C=A*B is column-major C^T=B^T*A^T.
+    cublas_check(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                               N, M, K, &alpha,
+                               B.data, CUDA_R_32F, N,
+                               A.data, CUDA_R_32F, K,
+                               &beta, C.data, CUDA_R_32F, N,
+                               CUBLAS_COMPUTE_32F_FAST_TF32,
+                               CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmEx");
+#else
+    cublas_check(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                              N, M, K, &alpha, B.data, N,
+                              A.data, K, &beta, C.data, N),
+                "cublasSgemm");
+#endif
+#else
     dim3 block(TILE_SIZE,TILE_SIZE);
     dim3 grid((N+TILE_SIZE-1)/TILE_SIZE,(M+TILE_SIZE-1)/TILE_SIZE);
     vedic_gemm_kernel<<<grid,block>>>(A.data,B.data,C.data,M,K,N);
     CUDA_KERNEL_CHECK();
+#endif
 }
 
 void cuda_vedic_gemm_bias(const GPUTensor& A, const GPUTensor& W,
                            const GPUTensor& bias, GPUTensor& C) {
     int M=A.rows, K=A.cols, N=W.cols;
+#if LOGOS_USE_CUBLAS
+    cuda_vedic_gemm(A, W, C);
+    int size = M * N;
+    add_bias_kernel<<<(size + 255) / 256, 256>>>(C.data, bias.data, M, N);
+    CUDA_KERNEL_CHECK();
+#else
     dim3 block(TILE_SIZE,TILE_SIZE);
     dim3 grid((N+TILE_SIZE-1)/TILE_SIZE,(M+TILE_SIZE-1)/TILE_SIZE);
     vedic_gemm_bias_kernel<<<grid,block>>>(A.data,W.data,bias.data,C.data,M,K,N);
     CUDA_KERNEL_CHECK();
+#endif
 }
 
 void cuda_boltzmann_softmax(const GPUTensor& scores, GPUTensor& probs,

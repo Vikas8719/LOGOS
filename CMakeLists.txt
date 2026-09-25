@@ -37,7 +37,16 @@ check_language(CUDA)
 
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
     message(STATUS "✅ CUDA found — building GPU targets")
+
+    option(LOGOS_USE_CUBLAS "Use cuBLAS as the primary CUDA GEMM backend" ON)
+    option(LOGOS_CUBLAS_TF32 "Use NVIDIA Tensor Core TF32 math for float GEMM" OFF)
+
+    set(LOGOS_CUDA_LIBRARIES CUDA::cudart)
+    if(LOGOS_USE_CUBLAS)
+        list(APPEND LOGOS_CUDA_LIBRARIES CUDA::cublas)
+    endif()
 
     # ── CUDA Architecture ─────────────────────────────────────
     set(CUDA_ARCH_MODE "native" CACHE STRING
@@ -73,7 +82,10 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_include_directories(logos_gpu PRIVATE include cuda)
     target_compile_options(logos_gpu PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(logos_gpu PRIVATE cudart)
+    target_link_libraries(logos_gpu PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_compile_definitions(logos_gpu PRIVATE
+        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
     # ── TEST 1: Syntax & Build Test ───────────────────────────
     # Tests: CUDA device, GPUTensor RAII, all kernels, full pipeline
@@ -85,9 +97,12 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_include_directories(test_syntax_build PRIVATE include cuda tests)
     target_compile_options(test_syntax_build PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(test_syntax_build PRIVATE cudart)
+    target_link_libraries(test_syntax_build PRIVATE ${LOGOS_CUDA_LIBRARIES})
     # Exclude main.cpp's main() — test has its own
-    target_compile_definitions(test_syntax_build PRIVATE LOGOS_TEST_BUILD=1)
+    target_compile_definitions(test_syntax_build PRIVATE
+        LOGOS_TEST_BUILD=1
+        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
     # ── TEST 2: Mathematical Unit Test ────────────────────────
     # Tests: CPU math only — no CUDA dependency, pure math correctness
@@ -114,7 +129,10 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_include_directories(test_memory_stress PRIVATE include cuda tests)
     target_compile_options(test_memory_stress PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(test_memory_stress PRIVATE cudart)
+    target_link_libraries(test_memory_stress PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_compile_definitions(test_memory_stress PRIVATE
+        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
     # ── CTest integration ─────────────────────────────────────
     enable_testing()

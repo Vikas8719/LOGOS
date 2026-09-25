@@ -205,6 +205,51 @@ static void test_s6_gemm() {
     for (float v : h) max_err = std::max(max_err, std::abs(v - expected));
     TEST("GEMM result: C = K*A*B (expected 16.0)", max_err < 0.1f);
     TEST("GEMM output: no NaN/Inf", gpu_tensor_finite(C));
+
+    // Non-tile-aligned dimensions catch row/column-major mapping errors in
+    // the cuBLAS backend and bounds errors in the Vedic fallback.
+    GPUTensor A2 = gpu_alloc(3, 5);
+    GPUTensor B2 = gpu_alloc(5, 7);
+    GPUTensor C2 = gpu_alloc(3, 7);
+    std::vector<float> h_a2(15), h_b2(35), h_c2(21);
+    for (int i = 0; i < 15; ++i) h_a2[i] = static_cast<float>((i % 5) - 2);
+    for (int i = 0; i < 35; ++i) h_b2[i] = static_cast<float>((i % 7) - 3);
+    h2d(A2, h_a2.data(), 15);
+    h2d(B2, h_b2.data(), 35);
+    cuda_vedic_gemm(A2, B2, C2);
+    d2h(h_c2.data(), C2, 21);
+    float irregular_max_err = 0.f;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 7; ++col) {
+            float reference = 0.f;
+            for (int k = 0; k < 5; ++k)
+                reference += h_a2[row * 5 + k] * h_b2[k * 7 + col];
+            irregular_max_err = std::max(irregular_max_err,
+                std::abs(h_c2[row * 7 + col] - reference));
+        }
+    }
+    TEST("GEMM irregular shape: matches CPU reference", irregular_max_err < 1e-4f);
+
+    GPUTensor bias = gpu_alloc(1, 7);
+    std::vector<float> h_bias(7);
+    for (int col = 0; col < 7; ++col) h_bias[col] = 0.25f * col;
+    h2d(bias, h_bias.data(), 7);
+    cuda_vedic_gemm_bias(A2, B2, bias, C2);
+    d2h(h_c2.data(), C2, 21);
+    float bias_max_err = 0.f;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 7; ++col) {
+            float reference = h_bias[col];
+            for (int k = 0; k < 5; ++k)
+                reference += h_a2[row * 5 + k] * h_b2[k * 7 + col];
+            bias_max_err = std::max(bias_max_err,
+                std::abs(h_c2[row * 7 + col] - reference));
+        }
+    }
+    TEST("GEMM bias: matches CPU reference", bias_max_err < 1e-4f);
+    std::cout << "    GEMM backend: "
+              << (cuda_vedic_gemm_uses_cublas() ? "cuBLAS" : "Vedic tiled fallback")
+              << "\n";
 }
 
 // ============================================================
