@@ -30,18 +30,19 @@ inline float gelu(float x) {
 //
 // Amplitude distribution:
 //   Classical path  : weight = 1 with prob (1-p), 0 with prob p
-//   Quantum path    : weight ~ Beta(α, β) where α=(1-p)/ħ, β=p/ħ
+//   Quantum path    : weight ~ Beta(α, β) where α=(1-p)ħ, β=pħ
 //   (Beta distribution → Bernoulli as ħ → 0)
 //
 // In practice: Beta(α,β) sampled via ratio of Gamma draws (Johnk's method)
 //   If X ~ Gamma(α,1) and Y ~ Gamma(β,1), then X/(X+Y) ~ Beta(α,β)
 //   When ħ=1 → Beta(1-p, p) (simple linear interpolation)
-//   When ħ→0 → sharp Bernoulli (classical limit recovered)
+//   When ħ→0 → sharp Bernoulli (classical limit recovered); large ħ concentrates
+//   around the mean (1-p).
 //
 // Inference (training=false): identity (no dropout), consistent with classical limit
 //
 // Scale invariance: outputs divided by (1-p) to maintain expected activation scale
-//   E[weight] = α/(α+β) = (1-p)/ħ / ((1-p)/ħ + p/ħ) = (1-p)   [independent of ħ!]
+//   E[weight] = α/(α+β) = (1-p)ħ / ((1-p)ħ + pħ) = (1-p)   [independent of ħ!]
 //   → same expected magnitude as standard dropout, regardless of ħ
 //
 // Parameters:
@@ -54,22 +55,22 @@ struct FeynmanDropout {
 
     mutable std::mt19937 rng;
     // Gamma distribution samplers (for Beta via ratio method)
-    mutable std::gamma_distribution<float> gamma_alive;   // Gamma(α=(1-p)/ħ, 1)
-    mutable std::gamma_distribution<float> gamma_dead;    // Gamma(β=p/ħ,   1)
+    mutable std::gamma_distribution<float> gamma_alive;   // Gamma(α=(1-p)ħ, 1)
+    mutable std::gamma_distribution<float> gamma_dead;    // Gamma(β=pħ,   1)
 
     FeynmanDropout(float dropout_p = 0.1f, float hbar_ = 1.0f, int seed = 123)
         : p(dropout_p), hbar(hbar_), rng(seed),
-          gamma_alive(std::max(1e-3f, (1.0f - dropout_p) / hbar_), 1.0f),
-          gamma_dead (std::max(1e-3f,           dropout_p  / hbar_), 1.0f)
+          gamma_alive(std::max(1e-3f, (1.0f - dropout_p) * hbar_), 1.0f),
+          gamma_dead (std::max(1e-3f,           dropout_p  * hbar_), 1.0f)
     {}
 
     // Sample one path-integral weight for a single neuron
-    // Returns a value in [0,1] drawn from Beta((1-p)/ħ, p/ħ)
+    // Returns a value in [0,1] drawn from Beta((1-p)ħ, pħ)
     // Near ħ→0: approaches Bernoulli(1-p)
-    // At ħ=1:   soft continuous interpolation
+    // Large ħ:   concentrates around the mean (1-p)
     float sample_weight() const {
-        float x = gamma_alive(rng);   // X ~ Gamma((1-p)/ħ, 1)
-        float y = gamma_dead(rng);    // Y ~ Gamma(p/ħ,     1)
+        float x = gamma_alive(rng);   // X ~ Gamma((1-p)ħ, 1)
+        float y = gamma_dead(rng);    // Y ~ Gamma(pħ,     1)
         float total = x + y;
         if (total < 1e-9f) return 1.0f - p;  // degenerate: use mean
         return x / total;                     // Beta(α,β) via ratio method
@@ -96,9 +97,9 @@ struct FeynmanDropout {
     void set_hbar(float hbar_new) {
         hbar = std::max(1e-3f, hbar_new);
         gamma_alive = std::gamma_distribution<float>(
-            std::max(1e-3f, (1.0f-p)/hbar), 1.0f);
+            std::max(1e-3f, (1.0f-p)*hbar), 1.0f);
         gamma_dead  = std::gamma_distribution<float>(
-            std::max(1e-3f,    p/hbar),     1.0f);
+            std::max(1e-3f,    p*hbar),     1.0f);
     }
 
     // Convenience: current mean weight (should ≈ 1-p regardless of ħ)

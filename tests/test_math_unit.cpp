@@ -967,6 +967,28 @@ static void test_m14_feynman_dropout() {
         std::cout << "    var(ħ=0.01)=" << var_c << " var(ħ=2.0)=" << var_q << "\n";
     }
 
+    // set_hbar must update the underlying Beta distribution as well.
+    {
+        FeynmanDropout fd(0.3f, 2.0f, 1234);
+        auto sample_variance = [&](int count) {
+            float sum = 0.0f, sum_sq = 0.0f;
+            for (int i = 0; i < count; ++i) {
+                const float w = fd.sample_weight();
+                sum += w;
+                sum_sq += w * w;
+            }
+            const float mean = sum / count;
+            return sum_sq / count - mean * mean;
+        };
+        const float smooth_variance = sample_variance(N_samples);
+        fd.set_hbar(0.01f);
+        const float classical_variance = sample_variance(N_samples);
+        TEST("set_hbar: smaller ħ produces more Bernoulli-like weights",
+             classical_variance > smooth_variance);
+        std::cout << "    set_hbar variance: ħ=2 " << smooth_variance
+                  << " → ħ=0.01 " << classical_variance << "\n";
+    }
+
     // d) p=0: identity (no dropout)
     {
         FeynmanDropout fd(0.0f, 1.0f, 1);

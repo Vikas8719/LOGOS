@@ -40,11 +40,10 @@ jobs:
       - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel $(nproc)
 
-      - name: Run T2 Math Tests (M1-M16)
-        run: ./build/test_math_unit
-
       - name: Verify M11-M16 coverage in output
         run: |
+          set -o pipefail
+          ctest --test-dir build -C Release --output-on-failure
           ./build/test_math_unit 2>&1 | tee /tmp/math_out.txt
           for test_id in M11 M12 M13 M14 M15 M16; do
             if grep -q "\[$test_id\]" /tmp/math_out.txt; then
@@ -67,26 +66,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
+      - name: Configure (MSVC)
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 
       - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel 4
 
-      - name: Run T2 Math Tests (M1-M16)
-        run: .\build\test_math_unit.exe
-
       - name: Verify M11-M16 coverage (Windows)
-        shell: bash
         run: |
-          .\build\test_math_unit.exe 2>&1 | tee math_out.txt || true
-          for test_id in M11 M12 M13 M14 M15 M16; do
-            if grep -q "\[$test_id\]" math_out.txt; then
-              echo "OK $test_id present"
-            else
-              echo "MISSING $test_id"; exit 1
-            fi
-          done
+          ctest --test-dir build -C Release --output-on-failure
+          $output = & .\build\Release\test_math_unit.exe 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Tee-Object -FilePath math_out.txt
+          if ($exitCode -ne 0) { exit $exitCode }
+          foreach ($test_id in @('M11','M12','M13','M14','M15','M16')) {
+            if (-not ($output -match "\[$test_id\]")) { throw "MISSING $test_id" }
+          }
 
   math-tests-macos:
     name: "T2 Math Tests - macOS ARM64"
@@ -103,11 +98,10 @@ jobs:
       - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Run T2 Math Tests (M1-M16)
-        run: ./build/test_math_unit
-
       - name: Verify M11-M16 coverage (macOS)
         run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure
           ./build/test_math_unit 2>&1 | tee /tmp/math_out_mac.txt
           for test_id in M11 M12 M13 M14 M15 M16; do
             grep -q "\[$test_id\]" /tmp/math_out_mac.txt \
@@ -284,40 +278,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+      - name: Configure (MSVC)
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 
       - name: Build all CPU targets
         run: cmake --build build --parallel 4
 
       - name: Unit Tests
-        run: .\build\logos.exe --test
+        run: .\build\Release\logos.exe --test
 
       - name: T2 Math Tests (M1-M16)
-        run: .\build\test_math_unit.exe
+        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Verify M11-M16 physics tests pass (Windows build job)
-        shell: bash
         run: |
-          .\build\test_math_unit.exe 2>&1 | tee win_t2.txt || true
-          FAIL=0
-          for id in M11 M12 M13 M14 M15 M16; do
-            grep -q "\[$id\]" win_t2.txt && echo "OK $id" || { echo "MISSING $id"; FAIL=1; }
-          done
-          exit $FAIL
+          $output = & .\build\Release\test_math_unit.exe 2>&1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output | Tee-Object -FilePath win_t2.txt
+          foreach ($id in @('M11','M12','M13','M14','M15','M16')) {
+            if (-not ($output -match "\[$id\]")) { throw "MISSING $id" }
+          }
 
       - name: Forward and Benchmark
         run: |
-          .\build\logos.exe --forward
-          .\build\logos.exe --benchmark
+          .\build\Release\logos.exe --forward
+          .\build\Release\logos.exe --benchmark
 
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
         with:
           name: logos-windows-x86_64
           path: |
-            build/logos.exe
-            build/test_math_unit.exe
+            build/Release/logos.exe
+            build/Release/test_math_unit.exe
           retention-days: 7
 
 # =============================================================

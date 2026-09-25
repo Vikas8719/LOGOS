@@ -15,9 +15,21 @@ add_executable(logos
 )
 if(APPLE)
     target_compile_options(logos PRIVATE -O3)
+elseif(MSVC)
+    target_compile_options(logos PRIVATE /O2)
 else()
     target_compile_options(logos PRIVATE -O3 -march=x86-64)
 endif()
+
+function(logos_set_cpu_test_options target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /O2)
+    elseif(APPLE)
+        target_compile_options(${target} PRIVATE -O2 -std=c++20)
+    else()
+        target_compile_options(${target} PRIVATE -O2 -march=x86-64 -std=c++20)
+    endif()
+endfunction()
 
 # ── CUDA detection ────────────────────────────────────────────
 include(CheckLanguage)
@@ -83,11 +95,7 @@ if(CMAKE_CUDA_COMPILER)
         tests/test_math_unit.cpp
     )
     target_include_directories(test_math_unit PRIVATE include tests)
-    if(APPLE)
-        target_compile_options(test_math_unit PRIVATE -O2 -std=c++20)
-    else()
-        target_compile_options(test_math_unit PRIVATE -O2 -march=x86-64 -std=c++20)
-    endif()
+    logos_set_cpu_test_options(test_math_unit)
     # No CUDA needed for math unit tests — pure CPU
 
     # ── TEST 3: Memory & Bounds Stress Test ───────────────────
@@ -130,11 +138,7 @@ else()
         tests/test_math_unit.cpp
     )
     target_include_directories(test_math_unit PRIVATE include tests)
-    if(APPLE)
-        target_compile_options(test_math_unit PRIVATE -O2 -std=c++20)
-    else()
-        target_compile_options(test_math_unit PRIVATE -O2 -march=x86-64 -std=c++20)
-    endif()
+    logos_set_cpu_test_options(test_math_unit)
 
     enable_testing()
     add_test(NAME "T2_Math_Unit" COMMAND test_math_unit)
