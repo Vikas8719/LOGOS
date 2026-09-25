@@ -1063,16 +1063,18 @@ static void test_m15_riemannian_metric() {
         std::cout << "    metric_diag: " << initial << " → " << updated << "\n";
     }
 
-    // e) Natural gradient: ||g̃||_G ≤ ||g||_G (G-norm of natural grad ≤ raw grad)
+    // e) Natural gradient solves G·g̃ = g for the diagonal metric.
     {
         Tensor g({1, dim}); g.fill_random(-1.0f, 1.0f);
         rm.update(g, 0.9f);
         Tensor g_nat = rm.riemannian_gradient(g);
-        float norm_g     = rm.riemannian_norm(g);
-        float norm_g_nat = rm.riemannian_norm(g_nat);
-        TEST("||g̃||_G ≤ ||g||_G (natural grad has less Riemannian norm)",
-             norm_g_nat <= norm_g + 1e-4f);
-        std::cout << "    ||g||_G=" << norm_g << " ||g̃||_G=" << norm_g_nat << "\n";
+        float max_residual = 0.0f;
+        for (int i = 0; i < dim; ++i) {
+            const float recovered = (rm.metric_diag[i] + rm.damping) * g_nat.data[i];
+            max_residual = std::max(max_residual, std::abs(recovered - g.data[i]));
+        }
+        TEST("Natural gradient: G·g̃ reconstructs g", max_residual < 1e-5f);
+        std::cout << "    max ||G·g̃-g||=" << max_residual << "\n";
     }
 
     // f) Parallel transport: transported vector has reduced component along Δθ

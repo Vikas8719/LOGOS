@@ -69,6 +69,13 @@ struct FeynmanDropout {
     // Near ħ→0: approaches Bernoulli(1-p)
     // Large ħ:   concentrates around the mean (1-p)
     float sample_weight() const {
+        // std::gamma_distribution loses precision for very small shape values.
+        // The limiting distribution is exactly Bernoulli(1-p), so sample that
+        // limit directly before the Gamma ratio becomes numerically degenerate.
+        if (hbar <= 0.05f) {
+            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+            return uniform(rng) < p ? 0.0f : 1.0f;
+        }
         float x = gamma_alive(rng);   // X ~ Gamma((1-p)ħ, 1)
         float y = gamma_dead(rng);    // Y ~ Gamma(pħ,     1)
         float total = x + y;

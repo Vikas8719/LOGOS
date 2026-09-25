@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <iostream>
 #include <numeric>
 #include <cmath>
