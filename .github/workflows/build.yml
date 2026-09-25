@@ -37,8 +37,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      - name: Build test_math_unit
-        run: cmake --build build --target test_math_unit --parallel $(nproc)
+      - name: Build CPU tests
+        run: cmake --build build --target test_math_unit test_checkpoint --parallel $(nproc)
 
       - name: Verify M11-M16 coverage in output
         run: |
@@ -69,8 +69,8 @@ jobs:
       - name: Configure (MSVC)
         run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build test_math_unit
-        run: cmake --build build --target test_math_unit --parallel 4
+      - name: Build CPU tests (Release)
+        run: cmake --build build --config Release --target test_math_unit test_checkpoint --parallel 4
 
       - name: Verify M11-M16 coverage (Windows)
         run: |
@@ -95,8 +95,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
 
-      - name: Build test_math_unit
-        run: cmake --build build --target test_math_unit --parallel $(sysctl -n hw.logicalcpu)
+      - name: Build CPU tests
+        run: cmake --build build --target test_math_unit test_checkpoint --parallel $(sysctl -n hw.logicalcpu)
 
       - name: Verify M11-M16 coverage (macOS)
         run: |
@@ -150,11 +150,14 @@ jobs:
           fi
 
       - name: Build CPU targets
-        run: cmake --build build --target logos test_math_unit --parallel $(nproc)
+        run: cmake --build build --target logos test_math_unit test_checkpoint --parallel $(nproc)
 
       - name: Build GPU targets
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: cmake --build build --target logos_gpu test_syntax_build test_memory_stress --parallel $(nproc)
+
+      - name: Run checkpoint round-trip test
+        run: ctest --test-dir build -R Checkpoint_Roundtrip --output-on-failure
 
       - name: Run T1 - Syntax and Build Tests
         if: steps.cuda_check.outputs.cuda_available == 'true'
@@ -282,7 +285,7 @@ jobs:
         run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 
       - name: Build all CPU targets
-        run: cmake --build build --parallel 4
+        run: cmake --build build --config Release --parallel 4
 
       - name: Unit Tests
         run: .\build\Release\logos.exe --test

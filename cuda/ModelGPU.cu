@@ -438,6 +438,8 @@ ModelGPU::ModelGPU(const ModelConfig& cfg_, const HyperConfig& hcfg)
     gpu_embedding     = gpu_alloc(V,D);
     gpu_pos_embedding = gpu_alloc(S,D);
     gpu_lm_head       = gpu_alloc(D,V);
+    std::vector<float> zero_positions(static_cast<size_t>(S) * D, 0.0f);
+    h2d(gpu_pos_embedding, zero_positions.data(), S * D);
 
     for (int l=0; l<cfg.num_layers; ++l) {
         GPUBlock blk;
@@ -497,7 +499,8 @@ void ModelGPU::free_layer_cache() {
 
 void ModelGPU::load_from_cpu(const LOGOSModel& cpu_model) {
     h2d(gpu_embedding,     cpu_model.embedding.data.data(),     cpu_model.embedding.total_size);
-    h2d(gpu_pos_embedding, cpu_model.pos_embedding.data.data(), cpu_model.pos_embedding.total_size);
+    // The CPU model uses parameter-free RoPE; the GPU backend retains its own
+    // learned positional table, initialized to zero in the constructor.
     h2d(gpu_lm_head,       cpu_model.lm_head.data.data(),       cpu_model.lm_head.total_size);
     for (int l=0;l<cfg.num_layers;++l) {
         auto& gblk=gpu_blocks[l];
@@ -545,7 +548,6 @@ std::vector<GPUTensor*> ModelGPU::alloc_grad_buffers() const {
 
 void ModelGPU::sync_to_cpu(LOGOSModel& cpu_model) const {
     d2h(cpu_model.embedding.data.data(),    gpu_embedding,    gpu_embedding.size);
-    d2h(cpu_model.pos_embedding.data.data(),gpu_pos_embedding,gpu_pos_embedding.size);
     d2h(cpu_model.lm_head.data.data(),      gpu_lm_head,      gpu_lm_head.size);
     for (int l=0;l<cfg.num_layers;++l) {
         const auto& gblk=gpu_blocks[l];

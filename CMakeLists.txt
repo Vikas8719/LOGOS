@@ -16,14 +16,14 @@ add_executable(logos
 if(APPLE)
     target_compile_options(logos PRIVATE -O3)
 elseif(MSVC)
-    target_compile_options(logos PRIVATE /O2)
+    target_compile_options(logos PRIVATE $<$<CONFIG:Release>:/O2>)
 else()
     target_compile_options(logos PRIVATE -O3 -march=x86-64)
 endif()
 
 function(logos_set_cpu_test_options target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /O2)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
     elseif(APPLE)
         target_compile_options(${target} PRIVATE -O2 -std=c++20)
     else()
@@ -98,6 +98,13 @@ if(CMAKE_CUDA_COMPILER)
     logos_set_cpu_test_options(test_math_unit)
     # No CUDA needed for math unit tests — pure CPU
 
+    add_executable(test_checkpoint
+        tests/test_checkpoint.cpp
+        src/Checkpoint.cpp
+    )
+    target_include_directories(test_checkpoint PRIVATE include)
+    logos_set_cpu_test_options(test_checkpoint)
+
     # ── TEST 3: Memory & Bounds Stress Test ───────────────────
     # Tests: VRAM limits, 1M+ data, boundary reads/writes, leak detection
     add_executable(test_memory_stress
@@ -114,6 +121,7 @@ if(CMAKE_CUDA_COMPILER)
 
     add_test(NAME "T2_Math_Unit"
              COMMAND test_math_unit)
+    add_test(NAME "Checkpoint_Roundtrip" COMMAND test_checkpoint)
 
     add_test(NAME "T1_Syntax_Build"
              COMMAND test_syntax_build)
@@ -123,6 +131,7 @@ if(CMAKE_CUDA_COMPILER)
 
     # Timeouts: math=60s, syntax=120s, memory=300s
     set_tests_properties("T2_Math_Unit"    PROPERTIES TIMEOUT 60)
+    set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
     set_tests_properties("T1_Syntax_Build" PROPERTIES TIMEOUT 120)
     set_tests_properties("T3_Memory_Stress" PROPERTIES TIMEOUT 300)
 
@@ -140,9 +149,18 @@ else()
     target_include_directories(test_math_unit PRIVATE include tests)
     logos_set_cpu_test_options(test_math_unit)
 
+    add_executable(test_checkpoint
+        tests/test_checkpoint.cpp
+        src/Checkpoint.cpp
+    )
+    target_include_directories(test_checkpoint PRIVATE include)
+    logos_set_cpu_test_options(test_checkpoint)
+
     enable_testing()
     add_test(NAME "T2_Math_Unit" COMMAND test_math_unit)
+    add_test(NAME "Checkpoint_Roundtrip" COMMAND test_checkpoint)
     set_tests_properties("T2_Math_Unit" PROPERTIES TIMEOUT 60)
+    set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
 endif()
 
 install(TARGETS logos DESTINATION bin)

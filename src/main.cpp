@@ -21,7 +21,7 @@
 //  Backprop scope:
 //    - lm_head:    full gradient  ✅
 //    - embedding:  full gradient  ✅
-//    - pos_emb:    full gradient  ✅
+//    - RoPE:       parameter-free positional encoding
 //    - layers:     Langevin thermal noise + dX signal via lm_head backprop ✅
 //
 //  Vedic GEMM + Langevin Dynamics — NO Adam
@@ -161,7 +161,7 @@ void run_tests() {
 
         // BUG 2 FIX: Rebuild X for lm_head grad using embedding only (cheap)
         // No second forward pass through layers needed for lm_head gradient.
-        // We use the actual transformer output: recompute embedding+pos, then layers.
+        // Recompute the same embedding + RoPE + layers path as LOGOSModel::forward().
         // This IS necessary for correct dW_lm — but it's ONE pass total per step
         // (the first model.forward call above AND this are the same computation).
         // SOLUTION: compute X_final by running embedding+layers once, reuse for both
@@ -171,8 +171,9 @@ void run_tests() {
         for(int i=0;i<seq;++i){
             int ti=std::max(0,std::min(inp[i],cfg2.vocab_size-1));
             for(int di=0;di<d;++di)
-                X_final.at(i,di)=m2.embedding.at(ti,di)+m2.pos_embedding.at(i,di);
+                X_final.at(i,di)=m2.embedding.at(ti,di);
         }
+        apply_rope(X_final, seq, d);
         for(auto& blk : m2.layers)
             X_final = blk.forward(X_final);
         // X_final = actual transformer output (same as what forward() used)
@@ -181,11 +182,11 @@ void run_tests() {
         // That refactor is tracked separately. For now: semantically correct, 1 extra pass
         // only for grad (not 2 full passes for loss — loss uses model.forward above).
 
-        // grads[2] = lm_head {d_model, vocab}
+        // grads[1] = lm_head {d_model, vocab}
         for(int di=0;di<d;++di)
             for(int v=0;v<vocab2;++v)
                 for(int i=0;i<seq;++i)
-                    grads2[2].at(di,v)+=X_final.at(i,di)*dL.at(i,v);
+                    grads2[1].at(di,v)+=X_final.at(i,di)*dL.at(i,v);
 
         // BUG 3 FIX: dX — gradient signal flowing back from lm_head
         // dX[i,d] = sum_v( dL[i,v] * lm_head[d,v] )
@@ -201,24 +202,22 @@ void run_tests() {
             }
 
         // grads[0] = embedding {vocab, d}
-        // grads[1] = pos_emb   {max_seq, d}
+        // RoPE has no trainable positional tensor; accumulate token gradients only.
         for(int si=0;si<seq;++si){
             int ti=std::max(0,std::min(inp[si],cfg2.vocab_size-1));
             for(int di=0;di<d;++di){
                 float g=dX.at(si,di);
                 if(ti < grads2[0].rows() && di < grads2[0].cols())
                     grads2[0].at(ti,di)+=g;
-                if(si < grads2[1].rows() && di < grads2[1].cols())
-                    grads2[1].at(si,di)+=g;
             }
         }
 
         // BUG 3 FIX: Transformer layer params get dX-based gradient signal
-        // grads[3+] are layer weights. We can't do full backprop through attention
+        // grads[2+] are layer weights. We can't do full backprop through attention
         // without autograd, but we give layers a meaningful gradient signal:
         // use dX norm as a scale factor for their Langevin noise contribution.
         // The optimizer's thermal noise (Langevin) handles exploration for layers,
-        // but we ensure grads[3+] are NOT zero — they carry dX magnitude.
+        // but we ensure grads[2+] are NOT zero — they carry dX magnitude.
         // This is a principled approximation: gradient magnitude from output layer
         // used as a proxy signal for inner layer gradient scale.
         {
@@ -230,7 +229,7 @@ void run_tests() {
 
             // Fill layer grads with scaled signal (not zero!)
             // Langevin will add thermal noise on top of this signal.
-            for(int gi=3; gi<(int)grads2.size(); ++gi){
+            for(int gi=2; gi<(int)grads2.size(); ++gi){
                 for(int k=0; k<grads2[gi].total_size; ++k){
                     // Small gradient signal proportional to output gradient norm
                     // Better than zero: gives Langevin a non-zero starting point
@@ -290,14 +289,14 @@ void run_benchmark() {
 //    - Long-term fix: refactor forward() to return {logits, hidden_state}
 //
 //  BUG 3 FIX: Transformer layer weights get non-zero gradient signal.
-//    - grads[3+] filled with dX_norm proxy instead of staying zero
+//    - grads[2+] filled with dX_norm proxy instead of staying zero
 //    - Langevin thermal noise still dominates for layer exploration
 //    - But gradient signal is no longer completely absent
 // ============================================================
 void run_training(const std::string& dataset_path) {
     std::cout << "\n========== LOGOS Training ==========\n";
     std::cout << "Optimizer : Langevin Dynamics (NO Adam)\n";
-    std::cout << "Backprop  : lm_head + embedding + pos_emb (exact)\n";
+    std::cout << "Backprop  : lm_head + embedding (RoPE positional encoding)\n";
     std::cout << "Layers    : dX proxy signal + Langevin thermal noise\n\n";
 
     // ── Tokenizer ─────────────────────────────────────────────
@@ -397,9 +396,8 @@ void run_training(const std::string& dataset_path) {
             for (auto* p : params)
                 grads.emplace_back(p->shape, 0.0f);
             // params[0]=embedding {vocab,d}
-            // params[1]=pos_emb   {seq_max,d}
-            // params[2]=lm_head   {d,vocab}
-            // params[3+]=layer weights
+            // params[1]=lm_head   {d,vocab}
+            // params[2+]=layer weights
 
             // ── Compute X_final (transformer output) for gradient ──
             // This is the hidden state that produced logits.
@@ -411,15 +409,15 @@ void run_training(const std::string& dataset_path) {
             for (int i = 0; i < seq; ++i) {
                 int ti = std::max(0, std::min(input_ids[i], vocab-1));
                 for (int di = 0; di < d; ++di)
-                    X_final.at(i, di) = model.embedding.at(ti, di)
-                                      + model.pos_embedding.at(i, di);
+                    X_final.at(i, di) = model.embedding.at(ti, di);
             }
+            apply_rope(X_final, seq, d);
             for (auto& blk : model.layers)
                 X_final = blk.forward(X_final);
 
             // ── Grad: lm_head {d, vocab} ──────────────────────
             // dW_lm = X_final^T @ dLogits  → shape {d, vocab} ✅
-            Tensor& g_lm = grads[2];
+            Tensor& g_lm = grads[1];
             for (int di = 0; di < d; ++di)
                 for (int v = 0; v < vocab; ++v)
                     for (int si = 0; si < seq; ++si)
@@ -438,24 +436,21 @@ void run_training(const std::string& dataset_path) {
                     dX.at(si, di) = g;
                 }
 
-            // ── Grad: embedding {vocab, d} + pos_emb {max_seq, d} ──
+            // ── Grad: embedding {vocab, d}; RoPE has no learned parameters ──
             // Uses dX (not dLogits directly — that was wrong too, subtle bug)
             // dEmb[tok] += dX[i]  where tok = input_ids[i]
             Tensor& g_emb = grads[0];
-            Tensor& g_pos = grads[1];
             for (int si = 0; si < seq; ++si) {
                 int ti = std::max(0, std::min(input_ids[si], vocab-1));
                 for (int di = 0; di < d; ++di) {
                     float g = dX.at(si, di);
                     if (ti < g_emb.rows() && di < g_emb.cols())
                         g_emb.at(ti, di) += g;
-                    if (si < g_pos.rows() && di < g_pos.cols())
-                        g_pos.at(si, di) += g;
                 }
             }
 
             // ── BUG 3 FIX: Transformer layer grads — non-zero signal ──
-            // Pehle: grads[3+] zero rehte the → layers ko SIRF Langevin noise milti thi
+            // Pehle: layer grads zero rehte the → layers ko SIRF Langevin noise milti thi
             //        gradient signal = 0 → layers effectively random walk kar rahe the
             // Ab:    dX_norm se proxy gradient signal milta hai layers ko
             //        Langevin exploration + gradient direction = better convergence
@@ -474,7 +469,7 @@ void run_training(const std::string& dataset_path) {
                 // Scale = dX_rms * 0.1 (small — Langevin handles most exploration)
                 // NOT zero — gives layers a non-trivial gradient signal direction
                 float layer_grad_proxy = dX_rms * 0.1f;
-                for (int gi = 3; gi < (int)grads.size(); ++gi) {
+                for (int gi = 2; gi < (int)grads.size(); ++gi) {
                     for (int k = 0; k < grads[gi].total_size; ++k) {
                         grads[gi].data[k] = layer_grad_proxy;
                     }

@@ -23,6 +23,44 @@
 #include <cstring>
 #include <algorithm>
 
+// Keep the legacy positional-embedding block in the binary layout so existing
+// checkpoints remain readable. RoPE has no learned position tensor, so newly
+// saved checkpoints write zeros here and loaders discard the block.
+static void write_legacy_position_slot(std::ofstream& f, const ModelConfig& cfg) {
+    constexpr size_t CHUNK_BYTES = 64 * 1024;
+    const std::vector<char> zeros(CHUNK_BYTES, 0);
+    size_t remaining = static_cast<size_t>(cfg.max_seq_len) * cfg.d_model * sizeof(float);
+    while (remaining > 0 && f) {
+        const size_t chunk = std::min(remaining, CHUNK_BYTES);
+        f.write(zeros.data(), static_cast<std::streamsize>(chunk));
+        remaining -= chunk;
+    }
+}
+
+static bool discard_legacy_position_slot(std::ifstream& f,
+                                         const ModelConfig& cfg,
+                                         const std::string& path,
+                                         bool allow_truncated) {
+    constexpr size_t CHUNK_BYTES = 64 * 1024;
+    std::vector<char> buffer(CHUNK_BYTES);
+    size_t remaining = static_cast<size_t>(cfg.max_seq_len) * cfg.d_model * sizeof(float);
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, CHUNK_BYTES);
+        f.read(buffer.data(), static_cast<std::streamsize>(chunk));
+        const size_t read = static_cast<size_t>(f.gcount());
+        if (read != chunk) {
+            std::cerr << "❌ Checkpoint truncated in legacy position block: " << path << "\n";
+            if (allow_truncated) {
+                f.clear();
+                return true;
+            }
+            return false;
+        }
+        remaining -= read;
+    }
+    return true;
+}
+
 // ── Internal: validate cfg fields from file ──────────────────
 // BUG 3 FIX: All fields checked before ANY allocation or tensor access
 static bool validate_checkpoint_cfg(const ModelConfig& cfg, const std::string& path) {
@@ -142,7 +180,7 @@ bool save_checkpoint(const LOGOSModel& model,
     };
 
     wt(model.embedding);
-    wt(model.pos_embedding);
+    write_legacy_position_slot(f, model.cfg);
     wt(model.lm_head);
 
     for (const auto& block : model.layers) {
@@ -202,7 +240,7 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     };
 
     if (!rt(model.embedding))     return false;
-    if (!rt(model.pos_embedding)) return false;
+    if (!discard_legacy_position_slot(f, file_cfg, path, false)) return false;
     if (!rt(model.lm_head))       return false;
 
     for (auto& block : model.layers) {
@@ -276,7 +314,7 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     };
 
     if (!rt(model.embedding))     return false;
-    if (!rt(model.pos_embedding)) return false;
+    if (!discard_legacy_position_slot(f, file_cfg, path, true)) return false;
     if (!rt(model.lm_head))       return false;
 
     for (auto& block : model.layers) {
