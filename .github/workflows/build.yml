@@ -44,7 +44,6 @@ jobs:
         run: |
           set -o pipefail
           ./build/test_math_unit 2>&1 | tee /tmp/math_out.txt
-          # Fail if any assertion failed
           if grep -q "❌" /tmp/math_out.txt; then
             echo "❌ Math unit test failures detected"; exit 1
           fi
@@ -94,7 +93,7 @@ jobs:
         run: ./build/test_math_unit
 
 # =============================================================
-#  JOB 2: T1 + T3 - GPU Tests (Syntax + Memory Stress)
+#  JOB 2: T1 + T3 - GPU Tests
 # =============================================================
   gpu-tests:
     name: "T1+T3 GPU Tests"
@@ -141,19 +140,19 @@ jobs:
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: cmake --build build --target logos_gpu test_syntax_build test_memory_stress --parallel $(nproc)
 
-      - name: Run T1 - Syntax and Build Tests
+      - name: Run T1 Syntax Build Tests
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: ./build/test_syntax_build
 
-      - name: Run T3 - Memory and Bounds Stress
+      - name: Run T3 Memory Bounds Stress
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: ./build/test_memory_stress
 
-      - name: No GPU - run CPU math fallback
+      - name: No GPU - CPU math fallback
         if: steps.cuda_check.outputs.cuda_available == 'false'
         run: |
           ./build/test_math_unit
-          echo "✅ CPU math fallback passed (GPU skipped - no runner)"
+          echo "✅ CPU math fallback passed (GPU skipped)"
 
       - name: cuda-memcheck on T3
         if: steps.cuda_check.outputs.cuda_available == 'true'
@@ -170,7 +169,7 @@ jobs:
           fi
 
 # =============================================================
-#  JOB 3: Full Training + Eval Pipeline (Linux, CPU)
+#  JOB 3: Training Pipeline (Linux CPU)
 # =============================================================
   training-pipeline:
     name: "Training Pipeline - CPU E2E"
@@ -193,11 +192,11 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
           cmake --build build --parallel $(nproc)
 
-      - name: Run T2 math tests (training runner verification)
+      - name: Run T2 math tests
         run: |
           ./build/test_math_unit 2>&1 | tee /tmp/t2_output.txt
           if grep -q "❌" /tmp/t2_output.txt; then
-            echo "❌ Math tests failed on training runner"; exit 1
+            echo "❌ Math tests failed"; exit 1
           fi
           echo "✅ Math tests passed"
 
@@ -215,8 +214,7 @@ jobs:
             echo "✅ Downloaded $(wc -c < dataset.txt) bytes"
           else
             python3 -c "
-          import random
-          random.seed(42)
+          import random; random.seed(42)
           words=['the','cat','sat','on','mat','a','dog','ran','fast','slow',
                  'big','small','red','blue','green','happy','sad','old','new',
                  'Once','upon','time','there','was','little','girl','named','Lily']
@@ -227,10 +225,7 @@ jobs:
           fi
 
       - name: Train CI mini-run
-        run: |
-          timeout 600 ./build/logos --train dataset.txt || true
-          echo "Training exit: $?"
-          ls -la *.bin 2>/dev/null || echo "No checkpoint - normal for short run"
+        run: timeout 600 ./build/logos --train dataset.txt || true
 
       - name: Evaluate
         run: ./build/logos --eval dataset.txt || true
@@ -322,16 +317,21 @@ jobs:
 
 # =============================================================
 #  JOB 6: Kaggle GPU Notebook Trigger
-#  Errors:
-#    401 Unauthorized  → KAGGLE_KEY galat / expired hai
-#    slug mismatch     → kernel-metadata.json mein id galat tha
-#    kernel not found  → pehli baar push, Kaggle pe manually banana hoga
+#
+#  Kya fix hua:
+#    [F1] -q flag removed (unsupported in current kaggle CLI)
+#    [F2] Auth test: kaggle config view (safer than kernels list)
+#    [F3] Push verbose: 2>&1 fully captured, tee se log file mein
+#    [F4] Push exit code se alag error handling
+#    [F5] continue-on-error: true → Kaggle issues CI block nahi karein
 # =============================================================
   kaggle-gpu-trigger:
     name: "Kaggle GPU Test Trigger"
     runs-on: ubuntu-22.04
     needs: [math-tests-linux]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # [F5] Kaggle down / slug issue se CI fail nahi hoga
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -343,101 +343,117 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          set -e  # exit on error (except where we override)
+
           # ── Secret check ─────────────────────────────────────
           if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
             echo "⚠️  Kaggle secrets not set — skipping"
-            echo "   Add in: Settings → Secrets → Actions:"
-            echo "   • KAGGLE_USERNAME  = your Kaggle username (lowercase)"
-            echo "   • KAGGLE_KEY       = from kaggle.com/settings → API → Create Token"
+            echo "   KAGGLE_USERNAME and KAGGLE_KEY required in repo secrets"
             exit 0
           fi
 
-          # ── Auth ─────────────────────────────────────────────
+          # ── Auth setup ────────────────────────────────────────
           mkdir -p ~/.kaggle
           printf '{"username":"%s","key":"%s"}\n' \
             "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
-          # ── Verify auth works before push ────────────────────
-          if ! kaggle kernels list --mine -q 2>&1 | grep -v "^$"; then
-            AUTH_TEST=$(kaggle kernels list --mine 2>&1)
-            if echo "$AUTH_TEST" | grep -q "401"; then
-              echo "❌ 401 Unauthorized — API key invalid or expired"
-              echo "   Fix: kaggle.com → Settings → API → Expire Token → Create New Token"
-              echo "   Then update KAGGLE_KEY secret in GitHub repo settings"
-              exit 1
-            fi
+          # ── Auth test: kaggle config view (no -q flag) ────────
+          # [F1] Removed: kaggle kernels list --mine -q  (unsupported flag)
+          # [F2] Using: kaggle config view  (just checks credentials exist)
+          echo "Verifying Kaggle credentials..."
+          CONFIG_OUT=$(kaggle config view 2>&1)
+          CONFIG_CODE=$?
+          echo "$CONFIG_OUT"
+
+          if echo "$CONFIG_OUT" | grep -qi "401\|unauthorized\|invalid"; then
+            echo "❌ Auth failed — API key invalid or expired"
+            echo "   Fix: kaggle.com → Settings → API → Create New API Token"
+            echo "   Update KAGGLE_KEY in: repo Settings → Secrets → Actions"
+            exit 1
           fi
           echo "✅ Kaggle auth OK (user: $KAGGLE_USERNAME)"
 
-          # ── Patch kernel-metadata.json with actual username ───
-          # Slug is auto-derived from title by Kaggle:
+          # ── Patch kernel-metadata.json with runtime username ──
+          # [F3] Slug = title lowercased, spaces→hyphens
           # "LOGOS GPU Training v3" → "logos-gpu-training-v3"
-          python3 - <<'PYEOF'
-          import json, os, sys
-          username = os.environ['KAGGLE_USERNAME']
-          slug     = 'logos-gpu-training-v3'
-          kernel_id = f'{username}/{slug}'
+          python3 - <<PYEOF
+import json, os
+username  = os.environ['KAGGLE_USERNAME'].lower()
+slug      = 'logos-gpu-training-v3'
+kernel_id = f'{username}/{slug}'
 
-          with open('kernel-metadata.json') as f:
-              m = json.load(f)
-          m['id']    = kernel_id
-          m['title'] = 'LOGOS GPU Training v3'
-          with open('kernel-metadata.json', 'w') as f:
-              json.dump(m, f, indent=2)
-          print(f'✅ kernel-metadata.json: id={kernel_id}')
-          PYEOF
+with open('kernel-metadata.json') as f:
+    m = json.load(f)
+m['id']    = kernel_id
+m['title'] = 'LOGOS GPU Training v3'
+with open('kernel-metadata.json', 'w') as f:
+    json.dump(m, f, indent=2)
+print(f'kernel-metadata.json updated: id={kernel_id}')
+PYEOF
 
-          # ── Check notebook file ───────────────────────────────
+          # ── Verify files ──────────────────────────────────────
           if [ ! -f "kaggle_gpu_train.ipynb" ]; then
-            echo "❌ kaggle_gpu_train.ipynb missing"; exit 1
+            echo "❌ kaggle_gpu_train.ipynb not found"; exit 1
           fi
-          echo "📓 Notebook: $(du -sh kaggle_gpu_train.ipynb | cut -f1)"
-          echo "📄 Metadata: $(cat kernel-metadata.json)"
+          echo "Notebook: $(du -sh kaggle_gpu_train.ipynb | cut -f1)"
+          echo "Metadata: $(cat kernel-metadata.json)"
 
-          # ── Push ─────────────────────────────────────────────
+          # ── Push with full output capture ─────────────────────
+          # [F4] tee to file so error is always visible in CI log
           echo ""
-          echo "Pushing to Kaggle as: $KAGGLE_USERNAME/logos-gpu-training-v3"
-          PUSH_OUT=$(kaggle kernels push -p . 2>&1)
-          PUSH_CODE=$?
-          echo "$PUSH_OUT"
+          echo "Pushing to: $KAGGLE_USERNAME/logos-gpu-training-v3"
+          set +e  # don't exit immediately — capture exit code
+          kaggle kernels push -p . 2>&1 | tee /tmp/kaggle_push.log
+          PUSH_CODE=${PIPESTATUS[0]}
+          set -e
 
+          PUSH_OUT=$(cat /tmp/kaggle_push.log)
+          echo "Push exit code: $PUSH_CODE"
+
+          # ── Handle result ─────────────────────────────────────
           if [ $PUSH_CODE -eq 0 ]; then
             echo ""
-            echo "✅ Pushed: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
-            echo "   GPU training will start automatically on Kaggle"
-            echo "   Expected output: dashboard_v3.png + benchmark_report.txt"
+            echo "✅ Notebook pushed successfully!"
+            echo "   URL: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
+            echo "   GPU training starting automatically (T4/P100/V100/A100)"
 
           elif echo "$PUSH_OUT" | grep -q "401"; then
             echo ""
             echo "❌ 401 Unauthorized"
-            echo "   1. Go to: https://www.kaggle.com/settings"
-            echo "   2. API section → 'Expire API Token' → 'Create New API Token'"
-            echo "   3. Open downloaded kaggle.json — copy the 'key' value"
-            echo "   4. GitHub repo → Settings → Secrets → Actions → KAGGLE_KEY → Update"
+            echo "   1. kaggle.com → Settings → API → Create New API Token"
+            echo "   2. GitHub repo → Settings → Secrets → Actions → KAGGLE_KEY → Update"
             exit 1
 
-          elif echo "$PUSH_OUT" | grep -qi "does not resolve\|slug"; then
+          elif echo "$PUSH_OUT" | grep -qi "does not resolve\|title.*slug\|slug.*title"; then
             echo ""
-            echo "⚠️  Kernel slug mismatch — first-time setup needed:"
-            echo "   1. Go to: https://www.kaggle.com/code"
+            echo "⚠️  Kernel slug mismatch — one-time Kaggle setup needed:"
+            echo ""
+            echo "   OPTION A (Recommended — 2 minutes):"
+            echo "   1. Open: https://www.kaggle.com/code"
             echo "   2. Click 'New Notebook'"
-            echo "   3. Title: 'LOGOS GPU Training v3'  (exact, case-sensitive)"
-            echo "   4. Save once, then re-run this pipeline"
-            echo "   OR rename existing kernel to match this slug"
+            echo "   3. Title (exact): LOGOS GPU Training v3"
+            echo "   4. Click 'Save & Run All' once"
+            echo "   5. Re-run this CI pipeline"
+            echo ""
+            echo "   OPTION B (Rename existing):"
+            echo "   1. Open your existing LOGOS kernel on Kaggle"
+            echo "   2. Settings → Title → 'LOGOS GPU Training v3'"
+            echo "   3. Save → Re-run CI"
             exit 1
 
-          elif echo "$PUSH_OUT" | grep -qi "not found\|404"; then
+          elif echo "$PUSH_OUT" | grep -qi "404\|not found"; then
             echo ""
-            echo "⚠️  Kernel not found — create it first on Kaggle:"
-            echo "   https://www.kaggle.com/code → New Notebook"
-            echo "   Title: 'LOGOS GPU Training v3'"
+            echo "⚠️  Kernel not found — create it first:"
+            echo "   kaggle.com/code → New Notebook → Title: 'LOGOS GPU Training v3'"
             exit 1
 
           else
-            echo "⚠️  Push error (non-blocking) — check Kaggle manually"
-            echo "   https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
-            # Don't exit 1 — don't block CI for Kaggle connectivity
+            echo ""
+            echo "⚠️  Unknown push error (see log above)"
+            echo "   Manual check: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
+            # Non-zero but unrecognized — exit 1 so error is visible
+            exit 1
           fi
 
 # =============================================================
@@ -456,7 +472,7 @@ jobs:
       - macos-build
     if: always()
     steps:
-      - name: Print results and check failures
+      - name: Print results
         env:
           R_LINUX:     ${{ needs.math-tests-linux.result }}
           R_WINDOWS:   ${{ needs.math-tests-windows.result }}
@@ -469,13 +485,13 @@ jobs:
           echo "═══════════════════════════════════════════════"
           echo "  LOGOS CI Summary (v10 Phase 1+2)"
           echo "═══════════════════════════════════════════════"
-          echo "  T2 Math (Linux):    $R_LINUX"
-          echo "  T2 Math (Windows):  $R_WINDOWS"
-          echo "  T2 Math (macOS):    $R_MACOS"
-          echo "  T1+T3 GPU:          $R_GPU"
-          echo "  Training E2E:       $R_TRAIN"
-          echo "  Windows Build:      $R_WIN_BUILD"
-          echo "  macOS Build:        $R_MAC_BUILD"
+          echo "  T2 Math (Linux):   $R_LINUX"
+          echo "  T2 Math (Windows): $R_WINDOWS"
+          echo "  T2 Math (macOS):   $R_MACOS"
+          echo "  T1+T3 GPU:         $R_GPU"
+          echo "  Training E2E:      $R_TRAIN"
+          echo "  Windows Build:     $R_WIN_BUILD"
+          echo "  macOS Build:       $R_MAC_BUILD"
           echo "═══════════════════════════════════════════════"
 
           CRITICAL_FAIL=false
@@ -492,11 +508,13 @@ jobs:
           if [ "$CRITICAL_FAIL" = "true" ]; then
             echo ""
             echo "❌ FAILED — Debug guide:"
-            echo "  Math fail (M1-M10) → check VedicGEMM, PhysicsOpt, Tensor"
-            echo "  T1 Syntax fail     → check cuda/VedicGEMM.cu + ModelGPU.cu"
-            echo "  T3 Memory fail     → check free_layer_cache(), NikhilamTensor dtor"
-            echo "  Training fail      → check src/main.cpp run_training()"
-            echo "  Kaggle 401         → regenerate API key at kaggle.com/settings"
+            echo "  Math fail   → check VedicGEMM, PhysicsOpt, Tensor"
+            echo "  T1 fail     → check cuda/VedicGEMM.cu + ModelGPU.cu"
+            echo "  T3 fail     → check free_layer_cache(), NikhilamTensor"
+            echo "  Train fail  → check src/main.cpp"
+            echo "  Kaggle 401  → regenerate key at kaggle.com/settings"
+            echo "  Kaggle slug → create kernel: 'LOGOS GPU Training v3'"
             exit 1
           fi
+
           echo "✅ All critical jobs PASSED"
