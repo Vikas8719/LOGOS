@@ -146,6 +146,7 @@ jobs:
     name: "Training Pipeline - CPU"
     runs-on: ubuntu-22.04
     needs: [math-tests-linux]
+    if: always()
     steps:
       - uses: actions/checkout@v4
 
@@ -197,6 +198,7 @@ jobs:
     name: "Windows Build"
     runs-on: windows-latest
     needs: [math-tests-windows]
+    if: always()
     steps:
       - uses: actions/checkout@v4
 
@@ -226,6 +228,7 @@ jobs:
     name: "macOS Build"
     runs-on: macos-14
     needs: [math-tests-macos]
+    if: always()
     steps:
       - uses: actions/checkout@v4
 
@@ -255,7 +258,7 @@ jobs:
     name: "Kaggle GPU Trigger"
     runs-on: ubuntu-22.04
     needs: [math-tests-linux]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
