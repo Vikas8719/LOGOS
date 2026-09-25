@@ -389,6 +389,25 @@ jobs:
           chmod 600 ~/.kaggle/kaggle.json
           echo "Kaggle API configured"
 
+          # Push notebook to Kaggle
+          echo "Pushing kaggle_gpu_train.ipynb (v3 — 100MB, full benchmark)..."
+          if kaggle kernels push -p . 2>&1; then
+            echo "✅ Notebook pushed successfully"
+            sleep 30
+            echo "Notebook v3 running on Kaggle GPU"
+            echo "  - 100MB TinyStories dataset (real text)"
+            echo "  - Auto GPU: T4/P100/V100/A100"
+            echo "  - Speed: tok/s, ms/step, M-tok/min"
+            echo "  - VRAM: peak, avg, INT8 savings"
+            echo "  - Physics: SHM v9 α_H annealing check"
+            echo "  - Feynman beam: ħ=0.3/1.0/1.5 comparison"
+            echo "  - Output: dashboard_v3.png + benchmark_report.txt"
+            echo "Monitor: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos"
+          else
+            echo "⚠️  Push failed - check kernel-metadata.json exists"
+            echo "Create kernel-metadata.json with your notebook slug first"
+          fi
+
 # =============================================================
 #  SUMMARY
 # =============================================================
