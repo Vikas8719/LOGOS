@@ -433,8 +433,97 @@ __global__ void free_energy_loss_kernel(
 }
 
 // ============================================================
-//  [P1-C] LEAPFROG LANGEVIN KERNEL
-//  Replaces: langevin_step_kernel (Euler-Maruyama, 1st order)
+//  [v9] HYBRID STOCHASTIC HAMILTONIAN MECHANICS KERNEL
+//  Replaces leapfrog_langevin_kernel as the primary optimizer.
+//
+//  Physics: combines two complementary forces on weight space:
+//
+//  1. Hamiltonian (Conservative) force:
+//     H(W, v) = L(W) + ½|v|²   (energy = loss + kinetic)
+//     Equations of motion:
+//       dW/dt = +∂H/∂v = v
+//       dv/dt = -∂H/∂W = -∇L(W)
+//     Integration: Störmer-Verlet (symplectic → energy conserving)
+//     Benefit: deterministic, fast convergence to basin floor
+//
+//  2. Langevin (Stochastic) correction:
+//     Adds friction + noise satisfying Fluctuation-Dissipation Thm:
+//       dv = -γv dt + √(2γkT) dW_Brownian
+//     FDT ensures equilibrium distribution ~ exp(-L/kT) (Boltzmann)
+//     Benefit: thermal exploration, avoids sharp minima overfitting
+//
+//  Combined (this kernel):
+//     v_{t+½} = β·v_t                        [H: momentum carry]
+//             - (lr·α_H/2)·∇L                [H: gradient half-kick]
+//             - (lr·α_L/2)·γ·v_t             [L: friction half-kick]
+//             + noise_scale·η                 [L: FDT thermal noise]
+//     W_{t+1} = W_t + lr · v_{t+½}           [full position step]
+//
+//  Annealing (done on host, passed as alpha_H/alpha_L):
+//     Step 0%:   α_H=0.3, α_L=0.7  → Explore (Langevin dominant)
+//     Step 50%:  α_H=0.6, α_L=0.4  → Balanced
+//     Step 100%: α_H=0.9, α_L=0.1  → Exploit (Hamiltonian dominant)
+//
+//  Memory: IDENTICAL to leapfrog_langevin_kernel (one velocity buffer)
+//  Compute: +2 FLOPs vs leapfrog (alpha_H, alpha_L multiplications)
+//           Negligible overhead, all fused in one kernel launch
+// ============================================================
+__global__ void shm_hybrid_kernel(
+    float* __restrict__       weights,
+    float* __restrict__       velocity,
+    const float* __restrict__ gradients,
+    float lr,
+    float mom_decay,      // β  — Hamiltonian momentum retention (≈0.9)
+    float friction,       // γ  — Langevin friction coefficient (≈0.1)
+    float alpha_H,        // Hamiltonian weight (0.3→0.9 over training)
+    float alpha_L,        // Langevin weight    (0.7→0.1 over training)
+    float noise_scale,    // √(γ·kT·lr·α_L) — FDT noise amplitude
+    unsigned int seed,
+    int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // ── Xorshift32 RNG (fast, good enough for Langevin noise) ──
+    unsigned int rng = seed ^ (unsigned int)(idx * 2654435769u);
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    // Uniform → approximately Gaussian via √3 scaling (CLT match)
+    float u       = (float)rng / 4294967296.0f;
+    float thermal = noise_scale * (u * 2.0f - 1.0f) * 1.7320508f;
+
+    float g = gradients[idx];
+    float v = velocity[idx];
+    float w = weights[idx];
+
+    // NaN/Inf guard
+    if (!isfinite(g)) g = 0.0f;
+
+    // ── Hybrid half-kick ───────────────────────────────────────
+    //
+    //  Hamiltonian contribution:
+    //    β·v_t          → momentum carry (builds up over steps)
+    //    -(α_H·lr/2)·∇L → deterministic gradient half-kick
+    //
+    //  Langevin contribution:
+    //    -(α_L·lr/2)·γ·v_t → friction dampens velocity (dissipation)
+    //    +thermal           → thermal noise (FDT fluctuation)
+    //
+    //  Combined: v_{t+½}
+    float ham_kick     = -(alpha_H * lr * 0.5f) * g;
+    float lang_friction = -(alpha_L * lr * 0.5f) * friction * v;
+
+    float v_half = mom_decay * v + ham_kick + lang_friction + thermal;
+
+    // ── Full position update ───────────────────────────────────
+    float w_new = w + lr * v_half;
+
+    // NaN/Inf guard on final weight
+    if (!isfinite(w_new)) w_new = w;
+
+    velocity[idx] = v_half;
+    weights[idx]  = w_new;
+}
+
 //
 //  Störmer-Verlet for stochastic Langevin dynamics:
 //    v_{t+½} = γ · v_t  -  (lr/2) · ∇L  +  noise_half

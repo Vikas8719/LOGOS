@@ -1,34 +1,37 @@
 // ============================================================
-//  LOGOS — cuda/train_gpu.cu  (v8 — Phase 1+2+3 Physics)
+//  LOGOS — cuda/train_gpu.cu  (v9 — Hybrid SHM Optimizer)
 //
-//  v6 retained: Full attention backward (10 kernels), streaming,
-//               grad_accum, int64_t, FFN bwd, LN bwd, all bug fixes
+//  v8 retained: Phase 1+2+3 (FreeEnergy, Leapfrog, Hyperbolic,
+//               Nikhilam KV, Feynman Beam Search)
 //
-//  PHASE 1 CHANGES (retained from v7):
-//  [P1-C] Leapfrog Langevin (Störmer-Verlet, 2nd order symplectic)
-//  [P1-B] Free Energy Loss F = CE - T·S
-//  [P1-A] Gunitasamuchayah GEMM verification
+//  v9 NEW — GPUSHMOpt: Hybrid Stochastic Hamiltonian Mechanics
 //
-//  PHASE 3 NEW — Inference only, ZERO training regression:
+//  Problem with GPULangevinOpt (v7/v8):
+//    pure Leapfrog Langevin adds SAME noise level at every step
+//    → late training: noise prevents tight loss convergence
+//    → early training: friction kills momentum too fast
 //
-//  [P3] generate_feynman() — Feynman Path Integral Beam Search
-//    Physics: treat each beam as a quantum path; select by amplitude
-//    Action:    S(path) = Σ_t  -log p(token_t | context)  [neg-log-prob]
-//    Amplitude: A(path) = exp(-S(path) / ħ)  [ħ = hbar, inv-temperature]
-//    Selection: expand all beams × top-K candidates, prune by amplitude
-//    Classical limit:   ħ → 0  → greedy (argmax) decoding
-//    Quantum limit:     ħ → ∞  → uniform random sampling
-//    Practical:         ħ ∈ [0.5, 2.0] → diverse, high-quality outputs
+//  Solution — GPUSHMOpt (this version):
+//    shm_hybrid_kernel = Hamiltonian symplectic + Langevin stochastic
 //
-//    vs standard beam search:
-//      Standard: score = log p(sequence) [additive log-probs]
-//      Feynman:  score = exp(-S/ħ)       [multiplicative amplitude]
-//                → naturally normalizes long vs short paths
-//                → equivalent to standard beam at ħ=1 (numerically)
-//                → ħ controls quantum fluctuation / exploration
+//    Early steps  (α_H=0.3, α_L=0.7):
+//      Langevin dominant → high noise, wide exploration, fast escape
+//      from bad initializations and saddle points
 //
-//  All v6/v7 training kernels UNCHANGED — Phase 3 is inference only.
-//  Memory overhead: beam_width × seq_len × D_model (no gradient buffers)
+//    Middle steps (α_H=0.6, α_L=0.4):
+//      Balanced → momentum builds direction, noise prevents overfitting
+//
+//    Late steps   (α_H=0.9, α_L=0.1):
+//      Hamiltonian dominant → sharp convergence like heavy-ball/Adam
+//      residual Langevin noise keeps solution in flat minimum
+//      (flat minima generalize better — Hochreiter & Schmidhuber 1997)
+//
+//    Same memory as pure Leapfrog (one velocity buffer per param)
+//    +2 FLOPs per parameter vs leapfrog (negligible overhead)
+//    Training loop: IDENTICAL — just optimizer class swapped
+//
+//  Logging: added alpha_H, alpha_L columns to training output
+//  All Phase 1+2+3 kernels: UNCHANGED
 // ============================================================
 #include "VedicGEMM.cuh"
 #include "ModelGPU.cuh"
@@ -47,22 +50,57 @@
 #include <cstdint>
 
 // ============================================================
-//  [P1-C] GPU LEAPFROG LANGEVIN OPTIMIZER
-//  Replaces Euler-Maruyama with Störmer-Verlet integration
+//  [v9] GPU HYBRID SHM OPTIMIZER
+//  Replaces GPULangevinOpt — same interface, better physics
+//
+//  Combines:
+//    Hamiltonian Mechanics → deterministic momentum (fast convergence)
+//    Langevin Dynamics     → stochastic noise (exploration, FDT)
+//
+//  Annealing:
+//    alpha_H: 0.3 → 0.9 (cosine, over total_steps)
+//    alpha_L: 0.7 → 0.1 (= 1 - alpha_H)
+//    temperature: T_start → T_end (cosine, same as before)
+//    friction: lower than pure Langevin (0.1 default vs 0.9 old)
+//              because Hamiltonian momentum already provides damping
+//
+//  Key differences from GPULangevinOpt:
+//    OLD: friction=0.9 (heavy damping), noise=√(γkT·lr/2) always
+//    NEW: friction=0.1 (light damping from Langevin part only)
+//         mom_decay=0.9 (heavy Hamiltonian momentum carry)
+//         noise=√(γkT·lr·α_L) (scales down as α_L decreases)
+//         alpha_H/alpha_L blend shifts from explore→exploit
 // ============================================================
-class GPULangevinOpt {
+class GPUSHMOpt {
 public:
-    float   lr, friction, temperature, T_start, T_end;
+    float   lr;
+    float   friction;      // γ — Langevin friction (≈0.1, lower than pure)
+    float   mom_decay;     // β — Hamiltonian momentum retention (≈0.9)
+    float   temperature, T_start, T_end;
+    float   alpha_H_start, alpha_H_end;   // Hamiltonian weight annealing
     int64_t total_steps;
     int64_t step = 0;
+
     std::vector<float*> d_velocity;
     std::vector<int>    sizes;
 
-    GPULangevinOpt(float lr_=2e-4f, float fric=0.9f,
-                   float T_s=0.05f, float T_e=1e-6f,
-                   int64_t steps=500000)
-        : lr(lr_), friction(fric), temperature(T_s),
-          T_start(T_s), T_end(T_e), total_steps(steps) {}
+    // Current annealed values (updated each step)
+    float alpha_H = 0.3f;
+    float alpha_L = 0.7f;
+
+    GPUSHMOpt(float lr_       = 2e-4f,
+              float friction_ = 0.1f,    // LOW friction — Hamiltonian carries momentum
+              float mom_decay_= 0.9f,    // HIGH decay   — Hamiltonian momentum
+              float T_s       = 0.05f,
+              float T_e       = 1e-6f,
+              float aH_start  = 0.3f,    // start Langevin-dominant
+              float aH_end    = 0.9f,    // end  Hamiltonian-dominant
+              int64_t steps   = 500000)
+        : lr(lr_), friction(friction_), mom_decay(mom_decay_),
+          temperature(T_s), T_start(T_s), T_end(T_e),
+          alpha_H_start(aH_start), alpha_H_end(aH_end),
+          total_steps(steps)
+    {}
 
     void init(const std::vector<GPUTensor*>& params) {
         for (auto* p : params) {
@@ -74,11 +112,19 @@ public:
         }
     }
 
+    // Cosine anneal both temperature and alpha_H simultaneously
     void anneal() {
         float r = total_steps > 0
             ? std::min(1.0f, (float)step / (float)total_steps) : 1.0f;
-        float c = 0.5f * (1.f + cosf(3.14159265f * r));
+        float c = 0.5f * (1.0f + cosf(3.14159265f * r));
+
+        // Temperature: T_start → T_end
         temperature = T_end + (T_start - T_end) * c;
+
+        // Hamiltonian weight: alpha_H_start → alpha_H_end
+        // (opposite cosine direction — more Hamiltonian as training progresses)
+        alpha_H = alpha_H_start + (alpha_H_end - alpha_H_start) * (1.0f - c);
+        alpha_L = 1.0f - alpha_H;
     }
 
     void update(std::vector<GPUTensor*>& params,
@@ -87,22 +133,25 @@ public:
     {
         anneal();
 
-        // [P1-C] Leapfrog noise: √(γ·kT·lr/2) — half-step thermal fluctuation
-        // OLD was: √(2γkT·lr) × 0.01  (full-step, extra dampener)
-        // NEW:     √(γ·kT·lr/2)        (half-step, no arbitrary dampener)
-        // At same T: new noise ≈ 0.5× old noise — more controlled exploration
-        float noise_scale = sqrtf(friction * temperature * lr * 0.5f);
+        // FDT-consistent noise: √(γ·kT·lr·α_L)
+        // As α_L → 0 (late training), noise → 0 automatically
+        // This is physically correct: less stochastic force when
+        // Hamiltonian dynamics dominate
+        float noise_scale = sqrtf(friction * temperature * lr * alpha_L);
+
+        float lr_scaled = lr * scale;
 
         for (int i = 0; i < (int)params.size(); ++i) {
             int sz = params[i]->size;
-            // [P1-C] leapfrog_langevin_kernel replaces langevin_step_kernel
-            // Kernel defined in VedicGEMM.cu (declared in VedicGEMM.cuh)
-            leapfrog_langevin_kernel<<<(sz+255)/256, 256>>>(
+            shm_hybrid_kernel<<<(sz+255)/256, 256>>>(
                 params[i]->data,
                 d_velocity[i],
                 grads[i]->data,
-                lr * scale,
+                lr_scaled,
+                mom_decay,
                 friction,
+                alpha_H,
+                alpha_L,
                 noise_scale,
                 (unsigned int)((step * 2654435769LL + i * 1234567LL) & 0xFFFFFFFFLL),
                 sz);
@@ -111,7 +160,14 @@ public:
         ++step;
     }
 
-    ~GPULangevinOpt() { for (auto* v : d_velocity) cudaFree(v); }
+    // For logging in train_gpu.cu
+    void get_state(float& out_T, float& out_aH, float& out_aL) const {
+        out_T  = temperature;
+        out_aH = alpha_H;
+        out_aL = alpha_L;
+    }
+
+    ~GPUSHMOpt() { for (auto* v : d_velocity) cudaFree(v); }
 };
 
 // ============================================================
@@ -556,8 +612,8 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v8 — Phase 1+2+3    ║\n");
-    printf("║  Free Energy Loss  |  Leapfrog Langevin  ║\n");
+    printf("║  LOGOS GPU Training v9 — Hybrid SHM     ║\n");
+    printf("║  Hamiltonian + Langevin  |  FreeEnergy   ║\n");
     printf("║  Hyperbolic Emb  |  Nikhilam KV INT8    ║\n");
     printf("║  Gunitasamuchayah  |  Feynman Inference  ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
@@ -613,10 +669,12 @@ void train_gpu(const std::string& dataset_path) {
            cfg.d_model,cfg.num_layers,cfg.num_heads,cfg.d_model/cfg.num_heads,
            cfg.max_seq_len,cfg.vocab_size,grad_accum);
 
-    // [P1] Physics mode announcement
-    printf("\n[Phase 1 Physics Active]\n");
-    printf("  ✦ Loss: Free Energy F = CE - T·S (Thermodynamic)\n");
-    printf("  ✦ Optimizer: Leapfrog Langevin (Störmer-Verlet, 2nd order)\n");
+    // [v9] Physics mode announcement — Hybrid SHM
+    printf("\n[v9 Hybrid SHM Optimizer Active]\n");
+    printf("  ✦ Hamiltonian: momentum_decay=0.9, symplectic integration\n");
+    printf("  ✦ Langevin:    friction=0.1, FDT-consistent noise\n");
+    printf("  ✦ Annealing:   α_H: 0.3→0.9 | α_L: 0.7→0.1 (cosine)\n");
+    printf("  ✦ Loss:        Free Energy F = CE - T·S (thermodynamic)\n");
     printf("  ✦ Verification: Gunitasamuchayah (every 1000 steps)\n\n");
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
@@ -634,8 +692,15 @@ void train_gpu(const std::string& dataset_path) {
     int64_t total_steps=EPOCHS*(batches_per_epoch/grad_accum);
     float   lr_init=(cfg.d_model>=256)?1e-4f:2e-4f;
 
-    // [P1-C] GPULangevinOpt now uses leapfrog_langevin_kernel internally
-    GPULangevinOpt optimizer(lr_init,0.9f,0.05f,1e-6f,total_steps);
+    // [v9] GPUSHMOpt replaces GPULangevinOpt
+    GPUSHMOpt optimizer(lr_init,
+                        /*friction=*/0.1f,
+                        /*mom_decay=*/0.9f,
+                        /*T_start=*/0.05f,
+                        /*T_end=*/1e-6f,
+                        /*aH_start=*/0.3f,
+                        /*aH_end=*/0.9f,
+                        total_steps);
     auto gpu_params=gpu_model.all_parameters();
     optimizer.init(gpu_params);
     auto gpu_grads=gpu_model.alloc_grad_buffers();
@@ -663,15 +728,16 @@ void train_gpu(const std::string& dataset_path) {
            (long long)batches_per_epoch,(long long)total_steps,lr_init);
     printf("[5/5] Training...\n\n"); fflush(stdout);
 
-    // Column headers for physics logging
-    printf("%-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n",
-           "Step","F(loss)","CE","Entropy","Smooth","GNorm","T","Vedic");
-    printf("---------|---------|---------|---------|---------|---------|---------|--------\n");
+    // Column headers for SHM physics logging
+    printf("%-8s | %-8s | %-8s | %-8s | %-8s | %-6s | %-6s | %-8s | %-8s\n",
+           "Step","F(loss)","CE","Entropy","GNorm","α_H","α_L","T","Vedic");
+    printf("---------|---------|---------|---------|---------|--------|--------|---------|--------\n");
     fflush(stdout);
 
     int64_t step=0;
     float   best_loss=999.f;
-    float   smooth=-1.f;
+    // [v9] Removed: smooth variable (was EMA of loss, now unused)
+    // alpha_H/alpha_L logged directly from optimizer.get_state()
     // [P1-A] Gunitasamuchayah tracking
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
@@ -727,7 +793,6 @@ void train_gpu(const std::string& dataset_path) {
             float avg_CE = batch_CE / valid_mb;
             float avg_S  = batch_S  / valid_mb;
             if (avg_F < best_loss) best_loss = avg_F;
-            smooth = smooth<0 ? avg_F : 0.95f*smooth + 0.05f*avg_F;
 
             if (grad_accum>1) {
                 float sc=1.0f/(float)grad_accum;
@@ -738,7 +803,7 @@ void train_gpu(const std::string& dataset_path) {
 
             float grad_norm=cuda_clip_gradients(gpu_grads,1.0f);
 
-            // [P1-C] Leapfrog optimizer step
+            // [v9] Hybrid SHM optimizer step
             optimizer.update(gpu_params,gpu_grads);
 
             // [P1-A] Gunitasamuchayah: verify lm_head GEMM every 1000 steps
@@ -765,9 +830,11 @@ void train_gpu(const std::string& dataset_path) {
             }
 
             if (step % 100 == 0) {
-                printf("%-8lld | %-8.4f | %-8.4f | %-8.4f | %-8.4f | %-8.3f | %-8.2e | %s\n",
+                float cur_T, cur_aH, cur_aL;
+                optimizer.get_state(cur_T, cur_aH, cur_aL);
+                printf("%-8lld | %-8.4f | %-8.4f | %-8.4f | %-8.3f | %-6.2f | %-6.2f | %-8.2e | %s\n",
                        (long long)step, avg_F, avg_CE, avg_S,
-                       smooth, grad_norm, optimizer.temperature, vedic_status);
+                       grad_norm, cur_aH, cur_aL, cur_T, vedic_status);
                 fflush(stdout);
             }
 
@@ -781,8 +848,8 @@ void train_gpu(const std::string& dataset_path) {
             }
             ++step;
         }
-        printf("Epoch %d done | Step=%lld | Smooth_F=%.4f\n",
-               epoch+1,(long long)step,smooth);
+        printf("Epoch %d done | Step=%lld | Best_F=%.4f | α_H=%.2f\n",
+               epoch+1,(long long)step,best_loss,optimizer.alpha_H);
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -795,9 +862,10 @@ void train_gpu(const std::string& dataset_path) {
     save_checkpoint(cpu_model,"logos_final",(int)step);
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v8 Phase 1+2+3)    ║\n");
+    printf("║  Training Complete! (v9 SHM)             ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
+    printf("║  Final α_H=%.2f α_L=%.2f (Hamiltonian)  ║\n",optimizer.alpha_H,optimizer.alpha_L);
     printf("║  Run --generate for Feynman beam decode  ║\n");
     printf("╚══════════════════════════════════════════╝\n");
 }
@@ -1122,8 +1190,8 @@ void generate_gpu(const std::string& ckpt_path,
 // ============================================================
 int main(int argc, char* argv[]) {
     printf("╔══════════════════════════════════════════╗\n"
-           "║  LOGOS GPU v8 — Phase 1+2+3 Physics      ║\n"
-           "║  Free Energy | Leapfrog | Feynman Beams  ║\n"
+           "║  LOGOS GPU v9 — Hybrid SHM Optimizer     ║\n"
+           "║  Hamiltonian + Langevin | Feynman Beams  ║\n"
            "╚══════════════════════════════════════════╝\n\n");
 
     std::string mode = (argc > 1) ? argv[1] : "--train";

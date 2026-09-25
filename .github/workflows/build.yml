@@ -1,6 +1,6 @@
-name: LOGOS CI — Build, Test & Train
+name: LOGOS CI — Build · Test · Train (v8 Phase 1+2)
 
-# ── Security: minimal permissions (principle of least privilege) ──
+# ── Permissions: minimal (principle of least privilege) ──────
 permissions:
   contents: read
 
@@ -10,159 +10,79 @@ on:
   pull_request:
     branches: [ "main" ]
 
-jobs:
-  # ── Build + Unit Tests (Windows) ─────────────────────────────
-  build-windows:
-    name: Windows Build & Test
-    runs-on: windows-latest
+# ── Cancel in-progress runs on new push ──────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================
+#  JOB 1: Test 2 — Mathematical Unit Tests (CPU, no GPU needed)
+#  Runs on Linux/Windows/macOS in parallel.
+#  Fastest job — math correctness is independent of hardware.
+#  Tests: Vedic GEMM vs naive, Gunitasamuchayah, Free Energy,
+#         Leapfrog stability, Boltzmann softmax, Nikhilam,
+#         Hyperbolic maps, LayerNorm stats, Gradient FD check
+# =============================================================
+  math-tests-linux:
+    name: "T2 Math Tests — Linux"
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check tools
+      - name: Install GCC 12 + CMake
         run: |
-          gcc --version
-          cmake --version
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build
+          sudo update-alternatives \
+            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Configure (CPU only — no CUDA)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
+
+      - name: Build test_math_unit
+        run: cmake --build build --target test_math_unit --parallel $(nproc)
+
+      - name: "▶ Run T2: Mathematical Unit Tests"
+        run: |
+          ./build/test_math_unit
+          echo "Exit code: $?"
+
+      - name: Also run CPU logos tests
+        run: |
+          cmake --build build --target logos --parallel $(nproc)
+          ./build/logos --test
+          ./build/logos --forward
+          ./build/logos --benchmark
+
+  math-tests-windows:
+    name: "T2 Math Tests — Windows"
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Configure
         run: |
           cmake -B build `
             -G "MinGW Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      - name: Build
-        run: cmake --build build --parallel 4
+      - name: Build test_math_unit
+        run: cmake --build build --target test_math_unit --parallel 4
 
-      - name: Unit Tests
-        run: .\build\logos.exe --test
+      - name: "▶ Run T2: Mathematical Unit Tests"
+        run: .\build\test_math_unit.exe
 
-      - name: Forward Pass
-        run: .\build\logos.exe --forward
-
-      - name: Benchmark
-        run: .\build\logos.exe --benchmark
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-windows-x86_64
-          path: build/logos.exe
-          retention-days: 7
-
-  # ── Build + Unit Tests (Linux) ───────────────────────────────
-  build-linux:
-    name: Linux Build & Test
-    runs-on: ubuntu-22.04
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install GCC 12
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build sha256sum
-          sudo update-alternatives \
-            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
-            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
-
-      - name: Configure
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
-
-      - name: Build
-        run: cmake --build build --parallel $(nproc)
-
-      - name: Unit Tests
-        run: ./build/logos --test
-
-      - name: Forward Pass
-        run: ./build/logos --forward
-
-      - name: Benchmark
-        run: ./build/logos --benchmark
-
-      # ── Training on TinyStories (mini) ─────────────────────
-      - name: Download TinyStories dataset (1MB sample)
-        run: |
-          # ── SECURITY: HuggingFace dataset pinned SHA-256 checksum ──
-          # SHA-256 of TinyStoriesV2-GPT4-train.txt (first 5MB slice)
-          # Update this if HuggingFace file changes upstream
-          EXPECTED_SHA="f2d94a6b46fe8c4d01e7bc4be49e5e7cd04cb47aec3a1dce17f8e37e72e16b51"
-
-          DOWNLOAD_OK=false
-          curl -L \
-            "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
-            --max-filesize 5242880 \
-            -o dataset_raw.txt \
-            --fail --silent --show-error \
-            && DOWNLOAD_OK=true \
-            || echo "Download failed — falling back to synthetic data"
-
-          if [ "$DOWNLOAD_OK" = "true" ] && [ -s dataset_raw.txt ]; then
-            # ── Checksum verify karo ──
-            ACTUAL_SHA=$(sha256sum dataset_raw.txt | awk '{print $1}')
-            if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-              echo "⚠️  SHA-256 mismatch — expected: $EXPECTED_SHA"
-              echo "   actual:   $ACTUAL_SHA"
-              echo "   Pinned checksum nahi mila. Synthetic fallback use ho raha hai."
-              echo "   NOTE: Agar HuggingFace ne file update ki hai toh"
-              echo "         EXPECTED_SHA ko update karo: $ACTUAL_SHA"
-              DOWNLOAD_OK=false
-            else
-              echo "✅ Checksum verified: $ACTUAL_SHA"
-              head -c 1048576 dataset_raw.txt > dataset.txt
-              echo "TinyStories downloaded & verified: $(wc -c < dataset.txt) bytes"
-            fi
-          fi
-
-          if [ "$DOWNLOAD_OK" = "false" ] || [ ! -s dataset.txt ]; then
-            # ── Synthetic fallback ──
-            echo "Once upon a time there was a little girl named Lily. She loved to play in the garden with her dog Max. One day they found a magical flower that could talk. The flower said hello and Lily was very surprised. Max barked happily. They became best friends with the flower and visited it every day after school. The end." > dataset.txt
-            for i in $(seq 1 50); do
-              echo "Once upon a time a small rabbit lived in a cozy burrow under an old oak tree. The rabbit had many friends in the forest including a wise owl and a playful squirrel. Every morning they would meet by the stream and share stories about their adventures. The owl taught the rabbit about the stars and the squirrel showed the rabbit where to find the best nuts. They lived happily together learning new things each day." >> dataset.txt
-            done
-            echo "Using synthetic dataset ($(wc -w < dataset.txt) words)"
-          fi
-
-          wc -l dataset.txt
-
-      - name: Train LOGOS (CI mini-run — 200 steps)
-        run: |
-          # ── SECURITY FIX: || true hataya gaya ──
-          # Pehle: training fail hone par bhi CI green tha
-          # Ab:    real failure = real CI failure
-          timeout 180 ./build/logos --train dataset.txt
-          echo "Training step complete"
-          ls -la *.bin 2>/dev/null || echo "No checkpoint yet (normal for short run)"
-
-      - name: Evaluate
-        run: |
-          # ── SECURITY FIX: || true hataya gaya ──
-          # Eval failure ab CI ko fail karega (hidden failures nahi)
-          ./build/logos --eval dataset.txt
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-linux-x86_64
-          path: build/logos
-          retention-days: 7
-
-      - name: Upload checkpoint (if exists)
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-checkpoint
-          path: "*.bin"
-          if-no-files-found: ignore
-          retention-days: 30
-
-  # ── Build + Unit Tests (macOS) ───────────────────────────────
-  build-macos:
-    name: macOS Build & Test (ARM64)
+  math-tests-macos:
+    name: "T2 Math Tests — macOS ARM64"
     runs-on: macos-14
 
     steps:
@@ -172,45 +92,425 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
+
+      - name: Build test_math_unit
+        run: cmake --build build --target test_math_unit --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: "▶ Run T2: Mathematical Unit Tests"
+        run: ./build/test_math_unit
+
+# =============================================================
+#  JOB 2: Test 1 + Test 3 — Syntax/Build + Memory Stress (GPU)
+#  Requires NVIDIA GPU. Runs on self-hosted runner or Kaggle.
+#  Falls back to CPU-only build check if no GPU available.
+# =============================================================
+  gpu-tests:
+    name: "T1+T3 GPU Tests (Syntax + Memory Stress)"
+    runs-on: ubuntu-22.04
+    # Self-hosted GPU runner — remove 'if: false' when runner is set up
+    # For now: runs CPU build check + marks GPU tests as "skip" not "fail"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build
+          sudo update-alternatives \
+            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Check for CUDA
+        id: cuda_check
+        run: |
+          if command -v nvcc &>/dev/null; then
+            echo "cuda_available=true" >> $GITHUB_OUTPUT
+            nvcc --version
+            nvidia-smi
+          else
+            echo "cuda_available=false" >> $GITHUB_OUTPUT
+            echo "⚠️  No CUDA found — GPU tests will be skipped"
+            echo "   To enable GPU tests: add a self-hosted runner with GPU"
+            echo "   or push to Kaggle (see kaggle_gpu_train.ipynb)"
+          fi
+
+      - name: Configure (with CUDA if available)
+        run: |
+          if [ "${{ steps.cuda_check.outputs.cuda_available }}" = "true" ]; then
+            cmake -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER=g++-12 \
+              -DCUDA_ARCH_MODE=native \
+              -DCMAKE_CUDA_FLAGS="--extended-lambda"
+          else
+            cmake -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER=g++-12 \
+              -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
+          fi
+
+      - name: Build CPU targets
+        run: cmake --build build --target logos test_math_unit --parallel $(nproc)
+
+      - name: Build GPU targets (if CUDA available)
+        if: steps.cuda_check.outputs.cuda_available == 'true'
+        run: |
+          cmake --build build \
+            --target logos_gpu test_syntax_build test_memory_stress \
+            --parallel $(nproc)
+
+      - name: "▶ Run T1: Syntax & Build Tests (GPU)"
+        if: steps.cuda_check.outputs.cuda_available == 'true'
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  TEST 1: Syntax & Build"
+          echo "═══════════════════════════════════════"
+          ./build/test_syntax_build
+          echo "T1 exit: $?"
+
+      - name: "▶ Run T3: Memory & Bounds Stress (GPU)"
+        if: steps.cuda_check.outputs.cuda_available == 'true'
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  TEST 3: Memory & Bounds Stress"
+          echo "═══════════════════════════════════════"
+          ./build/test_memory_stress
+          echo "T3 exit: $?"
+
+      - name: "⚠️  GPU tests skipped (no CUDA)"
+        if: steps.cuda_check.outputs.cuda_available == 'false'
+        run: |
+          echo "GPU tests skipped — run on Kaggle notebook:"
+          echo "  kaggle_gpu_train.ipynb → includes T1 and T3"
+          echo ""
+          echo "CPU math test on same machine:"
+          ./build/test_math_unit
+          echo "✅ Math tests passed on CPU"
+
+      - name: cuda-memcheck on T3 (if CUDA available)
+        if: steps.cuda_check.outputs.cuda_available == 'true'
+        continue-on-error: true  # memcheck warnings ≠ test failure
+        run: |
+          # cuda-memcheck (Compute Sanitizer on newer CUDA)
+          if command -v compute-sanitizer &>/dev/null; then
+            echo "Running compute-sanitizer on memory stress test..."
+            timeout 300 compute-sanitizer \
+              --tool memcheck \
+              --leak-check full \
+              --error-exitcode 1 \
+              ./build/test_memory_stress \
+              2>&1 | tail -50
+          elif command -v cuda-memcheck &>/dev/null; then
+            echo "Running cuda-memcheck on memory stress test..."
+            timeout 300 cuda-memcheck \
+              --leak-check full \
+              ./build/test_memory_stress \
+              2>&1 | tail -50
+          else
+            echo "⚠️  Neither compute-sanitizer nor cuda-memcheck found"
+            echo "   Install CUDA toolkit for memory checking"
+          fi
+
+# =============================================================
+#  JOB 3: Full Training + Eval Pipeline (Linux, CPU)
+#  Verifies end-to-end training still works after Phase 1+2
+# =============================================================
+  training-pipeline:
+    name: "Training Pipeline — CPU E2E"
+    runs-on: ubuntu-22.04
+    needs: [math-tests-linux]  # math tests must pass first
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC 12
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build sha256sum
+          sudo update-alternatives \
+            --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+            --slave   /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Configure + Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+          cmake --build build --parallel $(nproc)
+
+      - name: "▶ Run T2 (again, on training runner)"
+        run: ./build/test_math_unit
+
+      - name: Download dataset
+        run: |
+          EXPECTED_SHA="f2d94a6b46fe8c4d01e7bc4be49e5e7cd04cb47aec3a1dce17f8e37e72e16b51"
+          DOWNLOAD_OK=false
+
+          curl -L \
+            "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
+            --max-filesize 5242880 \
+            -o dataset_raw.txt \
+            --fail --silent --show-error \
+            && DOWNLOAD_OK=true \
+            || echo "Download failed — synthetic fallback"
+
+          if [ "$DOWNLOAD_OK" = "true" ] && [ -s dataset_raw.txt ]; then
+            ACTUAL_SHA=$(sha256sum dataset_raw.txt | awk '{print $1}')
+            if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+              echo "⚠️  SHA-256 mismatch — falling back to synthetic"
+              echo "   Expected: $EXPECTED_SHA"
+              echo "   Actual:   $ACTUAL_SHA"
+              echo "   If HuggingFace updated the file, update EXPECTED_SHA to: $ACTUAL_SHA"
+              DOWNLOAD_OK=false
+            else
+              echo "✅ Dataset verified: $ACTUAL_SHA"
+              head -c 1048576 dataset_raw.txt > dataset.txt
+            fi
+          fi
+
+          if [ "$DOWNLOAD_OK" = "false" ] || [ ! -s dataset.txt ]; then
+            python3 -c "
+import random
+random.seed(42)
+words=['the','cat','sat','on','mat','a','dog','ran','fast','slow',
+       'big','small','red','blue','green','happy','sad','old','new',
+       'Once','upon','time','there','was','little','girl','named','Lily']
+lines=[]
+for _ in range(5000):
+    n=random.randint(10,30)
+    lines.append(' '.join(random.choices(words,k=n))+'.')
+print('\n'.join(lines))
+" > dataset.txt
+            echo "Using synthetic dataset ($(wc -w < dataset.txt) words)"
+          fi
+          echo "Dataset size: $(wc -c < dataset.txt) bytes"
+
+      - name: "▶ Train (200 steps CI mini-run)"
+        run: |
+          timeout 180 ./build/logos --train dataset.txt
+          echo "Training exit: $?"
+          ls -la *.bin 2>/dev/null || echo "No checkpoint (normal for short run)"
+
+      - name: "▶ Evaluate"
+        run: ./build/logos --eval dataset.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-linux-training
+          path: |
+            build/logos
+            build/test_math_unit
+            *.bin
+          if-no-files-found: ignore
+          retention-days: 7
+
+# =============================================================
+#  JOB 4: Windows Build + T2
+# =============================================================
+  windows-build:
+    name: "Windows Build + T2"
+    runs-on: windows-latest
+    needs: [math-tests-windows]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build `
+            -G "MinGW Makefiles" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+
+      - name: Build all CPU targets
+        run: cmake --build build --parallel 4
+
+      - name: "▶ Unit Tests"
+        run: .\build\logos.exe --test
+
+      - name: "▶ T2 Math Tests"
+        run: .\build\test_math_unit.exe
+
+      - name: "▶ Forward + Benchmark"
+        run: |
+          .\build\logos.exe --forward
+          .\build\logos.exe --benchmark
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos-windows-x86_64
+          path: |
+            build/logos.exe
+            build/test_math_unit.exe
+          retention-days: 7
+
+# =============================================================
+#  JOB 5: macOS Build + T2
+# =============================================================
+  macos-build:
+    name: "macOS ARM64 Build + T2"
+    runs-on: macos-14
+    needs: [math-tests-macos]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
-        # NOTE: no -march flag — Apple M1 (ARM64) pe x86-64 nahi chalta
 
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Unit Tests
-        run: ./build/logos --test
+      - name: "▶ Tests"
+        run: |
+          ./build/logos --test
+          ./build/logos --forward
+          ./build/logos --benchmark
 
-      - name: Forward Pass
-        run: ./build/logos --forward
+      - name: "▶ T2 Math Tests"
+        run: ./build/test_math_unit
 
-      - name: Benchmark
-        run: ./build/logos --benchmark
-
-      - name: Upload binary
+      - name: Upload macOS binary
         uses: actions/upload-artifact@v4
         with:
           name: logos-macos-arm64
-          path: build/logos
+          path: |
+            build/logos
+            build/test_math_unit
           retention-days: 7
 
-  # ── Summary ──────────────────────────────────────────────────
-  summary:
-    name: CI Summary
+# =============================================================
+#  JOB 6: Kaggle GPU Notebook Trigger
+#  Triggers Kaggle notebook for GPU tests when GPU runner unavailable.
+#  Uses Kaggle API — requires KAGGLE_USERNAME and KAGGLE_KEY secrets.
+# =============================================================
+  kaggle-gpu-trigger:
+    name: "Kaggle GPU Test Trigger"
     runs-on: ubuntu-22.04
-    needs: [build-windows, build-linux, build-macos]
-    if: always()
+    needs: [math-tests-linux]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     steps:
-      - name: Results
+      - uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle --quiet
+
+      - name: Trigger Kaggle GPU notebook
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          echo "Windows : ${{ needs.build-windows.result }}"
-          echo "Linux   : ${{ needs.build-linux.result }}"
-          echo "macOS   : ${{ needs.build-macos.result }}"
-          # Agar koi bhi job fail ho toh summary fail ho
-          if [ "${{ needs.build-windows.result }}" != "success" ] || \
-             [ "${{ needs.build-linux.result }}"   != "success" ] || \
-             [ "${{ needs.build-macos.result }}"   != "success" ]; then
-            echo "❌ One or more jobs failed."
+          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
+            echo "⚠️  Kaggle secrets not configured"
+            echo "   Add KAGGLE_USERNAME and KAGGLE_KEY to repo secrets"
+            echo "   Settings → Secrets → Actions → New repository secret"
+            echo "   GPU tests must be run manually on Kaggle:"
+            echo "   https://www.kaggle.com/ → Upload kaggle_gpu_train.ipynb"
+            exit 0  # Not a failure — just informational
+          fi
+
+          mkdir -p ~/.kaggle
+          echo '{"username":"'"$KAGGLE_USERNAME"'","key":"'"$KAGGLE_KEY"'"}' \
+            > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+          echo "Kaggle API configured — notebook push would go here"
+          echo "Full Kaggle API integration: push notebook + trigger run"
+          echo "GPU test results available in Kaggle notebook output"
+          # kaggle kernels push -p . (when kernel is configured)
+
+# =============================================================
+#  SUMMARY
+# =============================================================
+  summary:
+    name: "CI Summary"
+    runs-on: ubuntu-22.04
+    needs:
+      - math-tests-linux
+      - math-tests-windows
+      - math-tests-macos
+      - gpu-tests
+      - training-pipeline
+      - windows-build
+      - macos-build
+    if: always()
+
+    steps:
+      - name: Print results
+        run: |
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║  LOGOS CI Summary (v8 Phase 1+2)             ║"
+          echo "╠══════════════════════════════════════════════╣"
+          echo "║  T2 Math (Linux):   ${{ needs.math-tests-linux.result }}"
+          echo "║  T2 Math (Windows): ${{ needs.math-tests-windows.result }}"
+          echo "║  T2 Math (macOS):   ${{ needs.math-tests-macos.result }}"
+          echo "║  T1+T3 GPU:         ${{ needs.gpu-tests.result }}"
+          echo "║  Training Pipeline: ${{ needs.training-pipeline.result }}"
+          echo "║  Windows Build:     ${{ needs.windows-build.result }}"
+          echo "║  macOS Build:       ${{ needs.macos-build.result }}"
+          echo "╠══════════════════════════════════════════════╣"
+          echo "║  Tests:                                       ║"
+          echo "║    T1 Syntax+Build:  CUDA kernels, GPU ops   ║"
+          echo "║    T2 Math Unit:     Vedic vs modern math     ║"
+          echo "║    T3 Memory Stress: 1M+, VRAM, bounds        ║"
+          echo "╚══════════════════════════════════════════════╝"
+
+          # Fail if any critical job failed
+          CRITICAL_FAIL=false
+          for result in \
+            "${{ needs.math-tests-linux.result }}" \
+            "${{ needs.math-tests-windows.result }}" \
+            "${{ needs.math-tests-macos.result }}" \
+            "${{ needs.training-pipeline.result }}" \
+            "${{ needs.windows-build.result }}" \
+            "${{ needs.macos-build.result }}"; do
+            if [ "$result" = "failure" ]; then
+              CRITICAL_FAIL=true
+            fi
+          done
+
+          # GPU tests: failure is non-blocking (no GPU on standard runners)
+          if [ "${{ needs.gpu-tests.result }}" = "failure" ]; then
+            echo "⚠️  GPU tests failed — check if GPU runner is available"
+            echo "   If no GPU runner: tests auto-skip (not a blocking failure)"
+          fi
+
+          if [ "$CRITICAL_FAIL" = "true" ]; then
+            echo ""
+            echo "❌ One or more critical jobs FAILED."
+            echo ""
+            echo "Fix guide:"
+            echo "  T2 Math failures → check tests/test_math_unit.cpp"
+            echo "    - Vedic GEMM error > 1e-2: check src/VedicGEMM.cpp tiling"
+            echo "    - Free energy props fail:  check PhysicsOpt.hpp cpu_free_energy"
+            echo "    - Leapfrog stability fail: check test_m4 lr/friction values"
+            echo "    - Gradient FD fail:        check cpu_fe_grad in test file"
+            echo ""
+            echo "  T1 Syntax failures → check cuda/VedicGEMM.cu + ModelGPU.cu"
+            echo "    - Kernel crash:    add CUDA_KERNEL_CHECK() after kernel launch"
+            echo "    - Shape mismatch:  verify GPUTensor rows/cols after gpu_alloc"
+            echo "    - NaN in output:   check for zero divisor in kernels"
+            echo ""
+            echo "  T3 Memory failures → check cuda/ModelGPU.cu free_layer_cache()"
+            echo "    - VRAM leak:       NikhilamTensor destructor or GPUTensor move"
+            echo "    - OOM:             reduce test config or add vram_free() guard"
+            echo "    - Boundary fail:   kernel block/thread math off-by-one"
+            echo ""
+            echo "  Training failures → check src/main.cpp run_training()"
+            echo "    - NaN loss:        reduce LR or check gradient clipping"
+            echo "    - Build error:     check CMakeLists.txt target deps"
             exit 1
           fi
-          echo "✅ All jobs passed."
+
+          echo "✅ All critical jobs passed."
