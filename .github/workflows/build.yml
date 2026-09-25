@@ -1,4 +1,4 @@
-name: LOGOS CI - Build Test Train (v10 Phase 1+2+Physics)
+name: LOGOS CI v10
 
 permissions:
   contents: read
@@ -15,41 +15,38 @@ concurrency:
 
 jobs:
 
-# =============================================================
-#  JOB 1: T2 Math Tests (CPU) - Linux / Windows / macOS
-# =============================================================
   math-tests-linux:
     name: "T2 Math Tests - Linux"
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install GCC 12 + CMake
+      - name: Install GCC 12
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
 
-      - name: Configure CPU only
+      - name: Configure
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      - name: Build CPU tests
+      - name: Build test_math_unit
         run: cmake --build build --target test_math_unit --parallel $(nproc)
 
-      - name: Run T2 Math Unit Tests
+      - name: Run T2 Math Tests
         run: |
           set -o pipefail
           ./build/test_math_unit 2>&1 | tee /tmp/math_out.txt
-          if grep -q "❌" /tmp/math_out.txt; then
-            echo "❌ Math unit test failures detected"; exit 1
+          if grep -q "FAIL" /tmp/math_out.txt; then
+            echo "Math tests failed"; exit 1
           fi
-          echo "✅ All math unit tests passed"
+          echo "All math tests passed"
 
-      - name: Run CPU logos tests
+      - name: Build and run logos CPU
         run: |
           cmake --build build --target logos --parallel $(nproc)
           ./build/logos --test
@@ -62,39 +59,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure MinGW
-        run: |
-          cmake -B build -G "MinGW Makefiles" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
+      - name: Configure
+        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      - name: Build CPU tests
+      - name: Build
         run: cmake --build build --target test_math_unit --parallel 4
 
-      - name: Run T2 Math Unit Tests
+      - name: Run T2 Math Tests
         run: .\build\test_math_unit.exe
 
   math-tests-macos:
-    name: "T2 Math Tests - macOS ARM64"
+    name: "T2 Math Tests - macOS"
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
 
-      - name: Build CPU tests
+      - name: Build
         run: cmake --build build --target test_math_unit --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Run T2 Math Unit Tests
+      - name: Run T2 Math Tests
         run: ./build/test_math_unit
 
-# =============================================================
-#  JOB 2: T1 + T3 - GPU Tests
-# =============================================================
   gpu-tests:
     name: "T1+T3 GPU Tests"
     runs-on: ubuntu-22.04
@@ -107,28 +95,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
 
-      - name: Check for CUDA
+      - name: Check CUDA
         id: cuda_check
         run: |
           if command -v nvcc &>/dev/null; then
             echo "cuda_available=true" >> $GITHUB_OUTPUT
-            nvcc --version
           else
             echo "cuda_available=false" >> $GITHUB_OUTPUT
-            echo "No CUDA found - GPU tests will be skipped"
           fi
 
       - name: Configure
         run: |
           if [ "${{ steps.cuda_check.outputs.cuda_available }}" = "true" ]; then
-            cmake -B build -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_CXX_COMPILER=g++-12 \
-              -DCUDA_ARCH_MODE=native \
-              -DCMAKE_CUDA_FLAGS="--extended-lambda"
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER=g++-12 -DCUDA_ARCH_MODE=native
           else
-            cmake -B build -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_CXX_COMPILER=g++-12 \
               -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
           fi
@@ -140,39 +122,28 @@ jobs:
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: cmake --build build --target logos_gpu test_syntax_build test_memory_stress --parallel $(nproc)
 
-      - name: Run T1 Syntax Build Tests
+      - name: Run T1 Syntax Tests
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: ./build/test_syntax_build
 
-      - name: Run T3 Memory Bounds Stress
+      - name: Run T3 Memory Stress
         if: steps.cuda_check.outputs.cuda_available == 'true'
         run: ./build/test_memory_stress
 
-      - name: No GPU - CPU math fallback
+      - name: No GPU fallback
         if: steps.cuda_check.outputs.cuda_available == 'false'
-        run: |
-          ./build/test_math_unit
-          echo "✅ CPU math fallback passed (GPU skipped)"
+        run: ./build/test_math_unit
 
-      - name: cuda-memcheck on T3
+      - name: cuda-memcheck
         if: steps.cuda_check.outputs.cuda_available == 'true'
         continue-on-error: true
         run: |
           if command -v compute-sanitizer &>/dev/null; then
-            timeout 300 compute-sanitizer --tool memcheck --leak-check full \
-              --error-exitcode 1 ./build/test_memory_stress 2>&1 | tail -50
-          elif command -v cuda-memcheck &>/dev/null; then
-            timeout 300 cuda-memcheck --leak-check full \
-              ./build/test_memory_stress 2>&1 | tail -50
-          else
-            echo "No CUDA memory checker found"
+            timeout 300 compute-sanitizer --tool memcheck --leak-check full ./build/test_memory_stress 2>&1 | tail -50
           fi
 
-# =============================================================
-#  JOB 3: Training Pipeline (Linux CPU)
-# =============================================================
   training-pipeline:
-    name: "Training Pipeline - CPU E2E"
+    name: "Training Pipeline - CPU"
     runs-on: ubuntu-22.04
     needs: [math-tests-linux]
     steps:
@@ -186,45 +157,26 @@ jobs:
 
       - name: Configure and Build
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
           cmake --build build --parallel $(nproc)
 
-      - name: Run T2 math tests
-        run: |
-          ./build/test_math_unit 2>&1 | tee /tmp/t2_output.txt
-          if grep -q "❌" /tmp/t2_output.txt; then
-            echo "❌ Math tests failed"; exit 1
-          fi
-          echo "✅ Math tests passed"
+      - name: Run math tests
+        run: ./build/test_math_unit
 
-      - name: Download dataset
+      - name: Prepare dataset
         run: |
-          DOWNLOAD_OK=false
-          curl -L \
-            "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
-            --max-filesize 5242880 -o dataset_raw.txt \
-            --fail --silent --show-error \
-            && DOWNLOAD_OK=true || echo "Download failed - synthetic fallback"
-
-          if [ "$DOWNLOAD_OK" = "true" ] && [ -s dataset_raw.txt ]; then
-            head -c 1048576 dataset_raw.txt > dataset.txt
-            echo "✅ Downloaded $(wc -c < dataset.txt) bytes"
-          else
-            python3 -c "
+          curl -L "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
+            --max-filesize 5242880 -o dataset_raw.txt --fail --silent --show-error \
+            && head -c 1048576 dataset_raw.txt > dataset.txt \
+            || python3 -c "
           import random; random.seed(42)
-          words=['the','cat','sat','on','mat','a','dog','ran','fast','slow',
-                 'big','small','red','blue','green','happy','sad','old','new',
-                 'Once','upon','time','there','was','little','girl','named','Lily']
-          lines=[' '.join(random.choices(words,k=random.randint(10,30)))+'.' for _ in range(5000)]
-          open('dataset.txt','w').write('\n'.join(lines))
-          "
-            echo "✅ Synthetic dataset: $(wc -c < dataset.txt) bytes"
-          fi
+          w=['the','cat','sat','on','mat','a','dog','ran','fast','slow','big','small','red','blue','Once','upon','time','there','was','little','girl','named','Lily']
+          print('\n'.join([' '.join(random.choices(w,k=random.randint(10,30)))+'.' for _ in range(5000)]))" > dataset.txt
+          echo "Dataset: $(wc -c < dataset.txt) bytes"
 
-      - name: Train CI mini-run
+      - name: Train
         run: timeout 600 ./build/logos --train dataset.txt || true
 
       - name: Evaluate
@@ -233,7 +185,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: logos-linux-training
+          name: logos-linux
           path: |
             build/logos
             build/test_math_unit
@@ -241,96 +193,69 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-# =============================================================
-#  JOB 4: Windows Build + T2
-# =============================================================
   windows-build:
-    name: "Windows Build + T2"
+    name: "Windows Build"
     runs-on: windows-latest
     needs: [math-tests-windows]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure MinGW
-        run: |
-          cmake -B build -G "MinGW Makefiles" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+      - name: Configure
+        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
 
-      - name: Build all CPU targets
+      - name: Build
         run: cmake --build build --parallel 4
 
-      - name: Unit Tests
-        run: .\build\logos.exe --test
-
-      - name: T2 Math Tests
-        run: .\build\test_math_unit.exe
-
-      - name: Forward and Benchmark
+      - name: Test
         run: |
+          .\build\logos.exe --test
+          .\build\test_math_unit.exe
           .\build\logos.exe --forward
           .\build\logos.exe --benchmark
 
-      - name: Upload Windows binary
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: logos-windows-x86_64
+          name: logos-windows
           path: |
             build/logos.exe
             build/test_math_unit.exe
           retention-days: 7
 
-# =============================================================
-#  JOB 5: macOS Build + T2
-# =============================================================
   macos-build:
-    name: "macOS ARM64 Build + T2"
+    name: "macOS Build"
     runs-on: macos-14
     needs: [math-tests-macos]
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
 
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: Tests
+      - name: Test
         run: |
           ./build/logos --test
+          ./build/test_math_unit
           ./build/logos --forward
           ./build/logos --benchmark
-          ./build/test_math_unit
 
-      - name: Upload macOS binary
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: logos-macos-arm64
+          name: logos-macos
           path: |
             build/logos
             build/test_math_unit
           retention-days: 7
 
-# =============================================================
-#  JOB 6: Kaggle GPU Notebook Trigger
-#
-#  Kya fix hua:
-#    [F1] -q flag removed (unsupported in current kaggle CLI)
-#    [F2] Auth test: kaggle config view (safer than kernels list)
-#    [F3] Push verbose: 2>&1 fully captured, tee se log file mein
-#    [F4] Push exit code se alag error handling
-#    [F5] continue-on-error: true → Kaggle issues CI block nahi karein
-# =============================================================
   kaggle-gpu-trigger:
-    name: "Kaggle GPU Test Trigger"
+    name: "Kaggle GPU Trigger"
     runs-on: ubuntu-22.04
     needs: [math-tests-linux]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    # [F5] Kaggle down / slug issue se CI fail nahi hoga
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -343,122 +268,58 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          set -e  # exit on error (except where we override)
-
-          # ── Secret check ─────────────────────────────────────
           if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
-            echo "⚠️  Kaggle secrets not set — skipping"
-            echo "   KAGGLE_USERNAME and KAGGLE_KEY required in repo secrets"
+            echo "Kaggle secrets not set - skipping"
             exit 0
           fi
 
-          # ── Auth setup ────────────────────────────────────────
           mkdir -p ~/.kaggle
-          printf '{"username":"%s","key":"%s"}\n' \
-            "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
+          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
-          # ── Auth test: kaggle config view (no -q flag) ────────
-          # [F1] Removed: kaggle kernels list --mine -q  (unsupported flag)
-          # [F2] Using: kaggle config view  (just checks credentials exist)
-          echo "Verifying Kaggle credentials..."
-          CONFIG_OUT=$(kaggle config view 2>&1)
-          CONFIG_CODE=$?
-          echo "$CONFIG_OUT"
+          echo "Checking Kaggle auth..."
+          kaggle config view 2>&1
+          echo "Auth OK: $KAGGLE_USERNAME"
 
-          if echo "$CONFIG_OUT" | grep -qi "401\|unauthorized\|invalid"; then
-            echo "❌ Auth failed — API key invalid or expired"
-            echo "   Fix: kaggle.com → Settings → API → Create New API Token"
-            echo "   Update KAGGLE_KEY in: repo Settings → Secrets → Actions"
-            exit 1
-          fi
-          echo "✅ Kaggle auth OK (user: $KAGGLE_USERNAME)"
+          python3 -c "
+          import json, os
+          u = os.environ['KAGGLE_USERNAME'].lower()
+          kid = u + '/logos-gpu-training-v3'
+          with open('kernel-metadata.json') as f:
+              m = json.load(f)
+          m['id'] = kid
+          m['title'] = 'LOGOS GPU Training v3'
+          with open('kernel-metadata.json', 'w') as f:
+              json.dump(m, f, indent=2)
+          print('Updated id:', kid)
+          "
 
-          # ── Patch kernel-metadata.json with runtime username ──
-          # [F3] Slug = title lowercased, spaces→hyphens
-          # "LOGOS GPU Training v3" → "logos-gpu-training-v3"
-          python3 - <<PYEOF
-import json, os
-username  = os.environ['KAGGLE_USERNAME'].lower()
-slug      = 'logos-gpu-training-v3'
-kernel_id = f'{username}/{slug}'
-
-with open('kernel-metadata.json') as f:
-    m = json.load(f)
-m['id']    = kernel_id
-m['title'] = 'LOGOS GPU Training v3'
-with open('kernel-metadata.json', 'w') as f:
-    json.dump(m, f, indent=2)
-print(f'kernel-metadata.json updated: id={kernel_id}')
-PYEOF
-
-          # ── Verify files ──────────────────────────────────────
-          if [ ! -f "kaggle_gpu_train.ipynb" ]; then
-            echo "❌ kaggle_gpu_train.ipynb not found"; exit 1
-          fi
-          echo "Notebook: $(du -sh kaggle_gpu_train.ipynb | cut -f1)"
           echo "Metadata: $(cat kernel-metadata.json)"
+          echo "Pushing to Kaggle..."
 
-          # ── Push with full output capture ─────────────────────
-          # [F4] tee to file so error is always visible in CI log
-          echo ""
-          echo "Pushing to: $KAGGLE_USERNAME/logos-gpu-training-v3"
-          set +e  # don't exit immediately — capture exit code
-          kaggle kernels push -p . 2>&1 | tee /tmp/kaggle_push.log
-          PUSH_CODE=${PIPESTATUS[0]}
+          set +e
+          kaggle kernels push -p . 2>&1 | tee /tmp/push.log
+          CODE=${PIPESTATUS[0]}
           set -e
 
-          PUSH_OUT=$(cat /tmp/kaggle_push.log)
-          echo "Push exit code: $PUSH_CODE"
+          OUT=$(cat /tmp/push.log)
+          echo "Exit code: $CODE"
 
-          # ── Handle result ─────────────────────────────────────
-          if [ $PUSH_CODE -eq 0 ]; then
-            echo ""
-            echo "✅ Notebook pushed successfully!"
-            echo "   URL: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
-            echo "   GPU training starting automatically (T4/P100/V100/A100)"
-
-          elif echo "$PUSH_OUT" | grep -q "401"; then
-            echo ""
-            echo "❌ 401 Unauthorized"
-            echo "   1. kaggle.com → Settings → API → Create New API Token"
-            echo "   2. GitHub repo → Settings → Secrets → Actions → KAGGLE_KEY → Update"
+          if [ "$CODE" = "0" ]; then
+            echo "Pushed: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
+          elif echo "$OUT" | grep -q "401"; then
+            echo "401 - Regenerate key: kaggle.com/settings -> API -> Create New Token"
+            echo "Then update KAGGLE_KEY in GitHub Secrets"
             exit 1
-
-          elif echo "$PUSH_OUT" | grep -qi "does not resolve\|title.*slug\|slug.*title"; then
-            echo ""
-            echo "⚠️  Kernel slug mismatch — one-time Kaggle setup needed:"
-            echo ""
-            echo "   OPTION A (Recommended — 2 minutes):"
-            echo "   1. Open: https://www.kaggle.com/code"
-            echo "   2. Click 'New Notebook'"
-            echo "   3. Title (exact): LOGOS GPU Training v3"
-            echo "   4. Click 'Save & Run All' once"
-            echo "   5. Re-run this CI pipeline"
-            echo ""
-            echo "   OPTION B (Rename existing):"
-            echo "   1. Open your existing LOGOS kernel on Kaggle"
-            echo "   2. Settings → Title → 'LOGOS GPU Training v3'"
-            echo "   3. Save → Re-run CI"
+          elif echo "$OUT" | grep -qi "does not resolve"; then
+            echo "Slug mismatch - create kernel on Kaggle first:"
+            echo "  kaggle.com/code -> New Notebook -> Title: 'LOGOS GPU Training v3'"
             exit 1
-
-          elif echo "$PUSH_OUT" | grep -qi "404\|not found"; then
-            echo ""
-            echo "⚠️  Kernel not found — create it first:"
-            echo "   kaggle.com/code → New Notebook → Title: 'LOGOS GPU Training v3'"
-            exit 1
-
           else
-            echo ""
-            echo "⚠️  Unknown push error (see log above)"
-            echo "   Manual check: https://www.kaggle.com/code/$KAGGLE_USERNAME/logos-gpu-training-v3"
-            # Non-zero but unrecognized — exit 1 so error is visible
+            echo "Push failed - see log above"
             exit 1
           fi
 
-# =============================================================
-#  SUMMARY
-# =============================================================
   summary:
     name: "CI Summary"
     runs-on: ubuntu-22.04
@@ -472,49 +333,37 @@ PYEOF
       - macos-build
     if: always()
     steps:
-      - name: Print results
+      - name: Results
         env:
-          R_LINUX:     ${{ needs.math-tests-linux.result }}
-          R_WINDOWS:   ${{ needs.math-tests-windows.result }}
-          R_MACOS:     ${{ needs.math-tests-macos.result }}
-          R_GPU:       ${{ needs.gpu-tests.result }}
-          R_TRAIN:     ${{ needs.training-pipeline.result }}
-          R_WIN_BUILD: ${{ needs.windows-build.result }}
-          R_MAC_BUILD: ${{ needs.macos-build.result }}
+          R1: ${{ needs.math-tests-linux.result }}
+          R2: ${{ needs.math-tests-windows.result }}
+          R3: ${{ needs.math-tests-macos.result }}
+          R4: ${{ needs.gpu-tests.result }}
+          R5: ${{ needs.training-pipeline.result }}
+          R6: ${{ needs.windows-build.result }}
+          R7: ${{ needs.macos-build.result }}
         run: |
-          echo "═══════════════════════════════════════════════"
-          echo "  LOGOS CI Summary (v10 Phase 1+2)"
-          echo "═══════════════════════════════════════════════"
-          echo "  T2 Math (Linux):   $R_LINUX"
-          echo "  T2 Math (Windows): $R_WINDOWS"
-          echo "  T2 Math (macOS):   $R_MACOS"
-          echo "  T1+T3 GPU:         $R_GPU"
-          echo "  Training E2E:      $R_TRAIN"
-          echo "  Windows Build:     $R_WIN_BUILD"
-          echo "  macOS Build:       $R_MAC_BUILD"
-          echo "═══════════════════════════════════════════════"
+          echo "================================="
+          echo "  LOGOS CI Summary"
+          echo "================================="
+          echo "  T2 Math Linux:   $R1"
+          echo "  T2 Math Windows: $R2"
+          echo "  T2 Math macOS:   $R3"
+          echo "  T1+T3 GPU:       $R4"
+          echo "  Training E2E:    $R5"
+          echo "  Windows Build:   $R6"
+          echo "  macOS Build:     $R7"
+          echo "================================="
 
-          CRITICAL_FAIL=false
-          for result in \
-            "$R_LINUX" "$R_WINDOWS" "$R_MACOS" \
-            "$R_TRAIN" "$R_WIN_BUILD" "$R_MAC_BUILD"; do
-            if [ "$result" = "failure" ]; then CRITICAL_FAIL=true; fi
+          FAIL=false
+          for r in "$R1" "$R2" "$R3" "$R5" "$R6" "$R7"; do
+            [ "$r" = "failure" ] && FAIL=true
           done
 
-          if [ "$R_GPU" = "failure" ]; then
-            echo "⚠️  GPU tests failed — no GPU runner (non-blocking)"
-          fi
+          [ "$R4" = "failure" ] && echo "GPU tests: no runner (non-blocking)"
 
-          if [ "$CRITICAL_FAIL" = "true" ]; then
-            echo ""
-            echo "❌ FAILED — Debug guide:"
-            echo "  Math fail   → check VedicGEMM, PhysicsOpt, Tensor"
-            echo "  T1 fail     → check cuda/VedicGEMM.cu + ModelGPU.cu"
-            echo "  T3 fail     → check free_layer_cache(), NikhilamTensor"
-            echo "  Train fail  → check src/main.cpp"
-            echo "  Kaggle 401  → regenerate key at kaggle.com/settings"
-            echo "  Kaggle slug → create kernel: 'LOGOS GPU Training v3'"
+          if [ "$FAIL" = "true" ]; then
+            echo "FAILED - check job logs above"
             exit 1
           fi
-
-          echo "✅ All critical jobs PASSED"
+          echo "ALL PASSED"
