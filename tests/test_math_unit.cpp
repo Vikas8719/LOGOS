@@ -155,9 +155,8 @@ static std::vector<float> cpu_expmap(const std::vector<float>& v) {
     float norm_sq = 0.f;
     for (float x : v) norm_sq += x*x;
     float norm = std::sqrt(norm_sq + 1e-12f);
-    float factor = norm > 1e-7f
-        ? std::tanh(norm*0.5f) / norm
-        : 0.5f;
+    float mapped_norm = std::min(std::tanh(norm*0.5f), 1.0f - 1e-6f);
+    float factor = norm > 1e-7f ? mapped_norm / norm : 0.5f;
     std::vector<float> out(v.size());
     for (int i=0; i<(int)v.size(); ++i) out[i] = factor * v[i];
     return out;
@@ -220,8 +219,8 @@ static void test_m1_vedic_gemm() {
 // ============================================================
 static void test_m2_gunitasamuchayah() {
     std::cout << "\n[M2] Gunitasamuchayah (Product of Sums)\n";
-    // Vedic sutram: sum(A@B) = dot(row_sums(A), col_sums(B)) / K (approx)
-    // Exact when rows of A and cols of B are orthogonal mean-zero
+    // For C = A @ B, sum(C) is the dot product of A's column sums
+    // and B's row sums. This preserves the shared K dimension exactly.
 
     auto test_case = [&](const char* name,
                          const std::vector<float>& A,
@@ -232,12 +231,18 @@ static void test_m2_gunitasamuchayah() {
         // sum(C)
         float sum_C = std::accumulate(C.begin(), C.end(), 0.f);
 
-        // sum of row sums of A
-        float sum_rs = std::accumulate(A.begin(), A.end(), 0.f);
-        // sum of col sums of B
-        float sum_cs = std::accumulate(B.begin(), B.end(), 0.f);
+        std::vector<float> a_col_sums(K, 0.f);
+        std::vector<float> b_row_sums(K, 0.f);
+        for (int i = 0; i < M; ++i)
+            for (int k = 0; k < K; ++k)
+                a_col_sums[k] += A[i*K + k];
+        for (int k = 0; k < K; ++k)
+            for (int j = 0; j < N; ++j)
+                b_row_sums[k] += B[k*N + j];
 
-        float vedic_pred = sum_rs * sum_cs / K;
+        float vedic_pred = 0.f;
+        for (int k = 0; k < K; ++k)
+            vedic_pred += a_col_sums[k] * b_row_sums[k];
         float rel_err = std::abs(sum_C - vedic_pred) / (std::abs(sum_C) + 1e-6f);
 
         std::cout << "    " << name << ": sum_C=" << sum_C
@@ -261,7 +266,7 @@ static void test_m2_gunitasamuchayah() {
         test_case("All-ones (exact)", A, B, M, K, N, 1e-4f);
     }
 
-    // Case 3: Zero-mean random (Gunitasamuchayah most accurate here)
+    // Case 3: Random values; the shared-K checksum remains exact.
     {
         int M=16,K=32,N=16;
         std::mt19937 rng(123);
@@ -269,7 +274,7 @@ static void test_m2_gunitasamuchayah() {
         std::vector<float> A(M*K), B(K*N);
         for (float& x : A) x = nd(rng);
         for (float& x : B) x = nd(rng);
-        test_case("Zero-mean random", A, B, M, K, N, 0.5f);  // statistical
+        test_case("Zero-mean random", A, B, M, K, N, 1e-5f);
     }
 
     // Direct identity: double complement = original
@@ -367,15 +372,13 @@ static void test_m4_leapfrog_stability() {
     float E1_euler = 0.5f*W_euler*W_euler + 0.5f*V_euler*V_euler;
     float euler_drift = std::abs(E1_euler - E0_euler) / E0_euler;
 
-    // Leapfrog (Störmer-Verlet)
+    // Leapfrog (Störmer-Verlet) with both half-kicks for each full step.
     float W_lf = 1.0f, V_lf = 0.0f;
     float E0_lf = 0.5f*W_lf*W_lf + 0.5f*V_lf*V_lf;
     for (int i=0; i<steps; ++i) {
-        float v_half = friction*V_lf - (lr*0.5f)*W_lf;  // half-kick
-        W_lf = W_lf + lr*v_half;                          // full drift
-        V_lf = v_half;                                    // store v_{t+1/2}
-        // next step's half-kick using new grad:
-        // (In practice: next iter does: v_half = friction*V_lf - lr/2 * grad_new)
+        V_lf -= (lr * 0.5f) * W_lf;
+        W_lf += lr * V_lf;
+        V_lf -= (lr * 0.5f) * W_lf;
     }
     float E1_lf = 0.5f*W_lf*W_lf + 0.5f*V_lf*V_lf;
     float lf_drift = std::abs(E1_lf - E0_lf) / E0_lf;
