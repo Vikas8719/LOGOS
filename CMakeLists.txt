@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(LOGOS VERSION 0.8.0 LANGUAGES CXX)
+project(LOGOS VERSION 0.10.0 LANGUAGES CXX)
+# v0.10.0 — 6 Physics Components + M11-M16 Tests
+# Build fixes:
+#   test_syntax_build: src/main.cpp REMOVED (duplicate main), Checkpoint.cpp ADDED
+#   logos_gpu:         src/Checkpoint.cpp ADDED (save_checkpoint/load_checkpoint)
+#   test_math_unit:    now includes Attention.hpp + LayerNorm.hpp + FeedForward.hpp
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,6 +84,7 @@ if(CMAKE_CUDA_COMPILER)
         cuda/train_gpu.cu
         cuda/VedicGEMM.cu
         cuda/ModelGPU.cu
+        src/Checkpoint.cpp      # FIX: save_checkpoint / load_checkpoint
     )
     target_include_directories(logos_gpu PRIVATE include cuda)
     target_compile_options(logos_gpu PRIVATE ${LOGOS_CUDA_FLAGS})
@@ -89,16 +95,17 @@ if(CMAKE_CUDA_COMPILER)
 
     # ── TEST 1: Syntax & Build Test ───────────────────────────
     # Tests: CUDA device, GPUTensor RAII, all kernels, full pipeline
+    # FIX: src/main.cpp REMOVED (duplicate main) — test has its own main()
+    # FIX: src/Checkpoint.cpp ADDED — provides save_checkpoint / load_checkpoint
     add_executable(test_syntax_build
         tests/test_syntax_build.cu
         cuda/VedicGEMM.cu
         cuda/ModelGPU.cu
-        src/main.cpp        # pulls in LOGOSModel (CPU)
+        src/Checkpoint.cpp
     )
     target_include_directories(test_syntax_build PRIVATE include cuda tests)
     target_compile_options(test_syntax_build PRIVATE ${LOGOS_CUDA_FLAGS})
     target_link_libraries(test_syntax_build PRIVATE ${LOGOS_CUDA_LIBRARIES})
-    # Exclude main.cpp's main() — test has its own
     target_compile_definitions(test_syntax_build PRIVATE
         LOGOS_TEST_BUILD=1
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
