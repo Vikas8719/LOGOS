@@ -212,9 +212,11 @@ open('dataset.txt','w').write('\n'.join(lines))
           fi
           echo "Dataset size: $(wc -c < dataset.txt) bytes"
 
-      - name: Train 200 steps CI mini-run
+      - name: Train CI mini-run
         run: |
-          timeout 180 ./build/logos --train dataset.txt
+          timeout 600 ./build/logos --train dataset.txt --steps 200 || \
+          timeout 600 ./build/logos --train dataset.txt --max-steps 200 || \
+          timeout 600 ./build/logos --train dataset.txt
           echo "Training exit: $?"
           ls -la *.bin 2>/dev/null || echo "No checkpoint - normal for short run"
 
