@@ -1,26 +1,63 @@
 #pragma once
 // ============================================================
-//  LOGOS — cuda/VedicGEMM.cuh  (v7 — Phase 1 Physics)
+//  LOGOS — cuda/VedicGEMM.cuh  (v9 — Hybrid SHM Optimizer)
 //
-//  v4 fixes retained (RAII, exceptions, CUDA_CHECK, validation)
+//  v7 Phase 1 retained (Gunitasamuchayah, FreeEnergy, Leapfrog)
 //
-//  PHASE 1 NEW:
-//  [P1-A] Gunitasamuchayah verification — O(M+K+N) GEMM checksum
-//         Vedic sutram: "Gunitasamuchayah Samuchayagunitah"
-//         (Product of sums = Sum of products)
-//         sum(C) ≈ sum_rows(A) · sum_cols(B)
-//         Use: call every 1000 steps to catch NaN/divergence early
+//  v9 NEW — Hybrid Stochastic Hamiltonian Mechanics (SHM):
 //
-//  [P1-B] Free Energy Loss struct — F = U - T*S
-//         U = cross-entropy (already computed)
-//         S = Shannon entropy of softmax distribution
-//         T = Langevin temperature (annealed, from optimizer)
-//         Gradient: dF/dlogit = dCE/dlogit + T * d(-S)/dlogit
+//  Problem with pure Langevin:
+//    - Adds thermal noise EVERY step regardless of gradient quality
+//    - Late training: noise prevents tight convergence (high variance)
+//    - Early training: friction dampens momentum too fast (slow escape)
 //
-//  [P1-C] Leapfrog Langevin kernel signature — symplectic integration
-//         Half-kick → Full-drift → (next step: half-kick again)
-//         Physically: Störmer-Verlet for stochastic systems
-//         Same memory, better long-step stability than Euler-Maruyama
+//  Problem with pure Hamiltonian (HMC):
+//    - Deterministic: can get stuck in sharp local minima
+//    - High memory: needs full trajectory (L leapfrog steps per update)
+//
+//  Solution — Hybrid SHM (this implementation):
+//    Each parameter update = Hamiltonian step + Langevin correction
+//
+//    Hamiltonian part (deterministic, energy-conserving):
+//      v_H = momentum accumulation (like Adam/heavy-ball)
+//      Conservative force: F_H = -∇L  (gradient descent)
+//      Symplectic integration: Störmer-Verlet (same as Leapfrog)
+//
+//    Langevin part (stochastic, thermal exploration):
+//      Dissipation: -γ_L · v   (friction dampens velocity)
+//      Fluctuation: √(2γ_L kT) · η  (noise satisfies FDT)
+//      Fluctuation-Dissipation Theorem (FDT): D = γkT/m
+//
+//    Combined update per step:
+//      v_{t+½} = β·v_t                    [Hamiltonian momentum]
+//               - (α_H/2)·∇L              [Hamiltonian half-kick]
+//               - (α_L/2)·γ·v_t           [Langevin friction half-kick]
+//               + noise_scale·η            [Langevin thermal noise]
+//      W_{t+1} = W_t + lr · v_{t+½}       [full position update]
+//
+//    where:
+//      α_H  = hamiltonian_weight  ∈ [0,1]  (how much Hamiltonian)
+//      α_L  = 1 - α_H             ∈ [0,1]  (how much Langevin)
+//      β    = momentum_decay ≈ 0.9          (Hamiltonian momentum retention)
+//      γ    = friction ≈ 0.1                (Langevin friction, LOWER than pure)
+//      noise_scale = √(γ·kT·lr·α_L)        (FDT-correct noise amplitude)
+//
+//    Annealing schedule (auto, cosine):
+//      Early (step=0):    α_H=0.3, α_L=0.7  → Langevin-dominant (explore)
+//      Middle (step=50%): α_H=0.6, α_L=0.4  → balanced
+//      Late (step=100%):  α_H=0.9, α_L=0.1  → Hamiltonian-dominant (exploit)
+//
+//    Why this is better:
+//      ✦ Early: Langevin noise helps escape bad initializations fast
+//      ✦ Late:  Hamiltonian momentum drives to sharp, precise minima
+//      ✦ FDT ensures noise is always physically consistent
+//      ✦ Same memory as pure Leapfrog (one velocity buffer per param)
+//      ✦ Same kernel call signature → drop-in in train_gpu.cu
+//
+//  [P1-A] Gunitasamuchayah — unchanged
+//  [P1-B] FreeEnergy Loss  — unchanged
+//  [P1-C] leapfrog_langevin_kernel — REPLACED by shm_hybrid_kernel
+//  [NEW]  shm_hybrid_kernel — Hamiltonian + Langevin fused kernel
 // ============================================================
 #include <cuda_runtime.h>
 #include <vector>
@@ -141,28 +178,54 @@ void cuda_free_energy_loss(
     float temperature,              // current Langevin T
     FreeEnergyResult& out_result);  // host-side result (filled after sync)
 
-// ── [P1-C] Leapfrog Langevin kernel (replaces langevin_step_kernel) ──
-// Störmer-Verlet integration for stochastic Hamiltonian system:
-//   Phase 1 (half-kick):  v_{t+½} = γ·v_t - (lr/2)·∇L + noise_half
-//   Phase 2 (full drift): W_{t+1} = W_t + lr · v_{t+½}
-//
-// Compared to Euler-Maruyama (old):
-//   OLD: v = γv - lr·g + noise  →  W += v   (1st order)
-//   NEW: v = γv - lr/2·g + n   →  W += v    (2nd order symplectic)
-//        next step: v = γv - lr/2·g_new + n  (complete the Verlet cycle)
-//
-// noise split: noise_half = √(γkT·lr/2)·η  (half-step thermal noise)
-// This gives better energy conservation and longer stable step sizes.
-// Single backward pass still — g_new comes from NEXT iteration's backward.
-// Declared here; defined in VedicGEMM.cu (replaces old langevin_step_kernel)
+// ── [P1-C / v9] leapfrog_langevin_kernel — KEPT for backward compat ──
+// Deprecated in v9 — use shm_hybrid_kernel instead
+// Still declared so older code that references it compiles
 __global__ void leapfrog_langevin_kernel(
-    float* __restrict__       weights,    // W_t  → W_{t+1}  (in-place)
-    float* __restrict__       velocity,   // v_t  → v_{t+½}  (in-place)
-    const float* __restrict__ gradients,  // ∇L at W_t
-    float lr,           // full learning rate (dt)
-    float friction,     // γ (momentum retention, 0.9)
-    float noise_scale,  // √(γkT·lr/2) — half-step thermal noise
-    unsigned int seed,  // per-step seed for noise RNG
+    float* __restrict__       weights,
+    float* __restrict__       velocity,
+    const float* __restrict__ gradients,
+    float lr,
+    float friction,
+    float noise_scale,
+    unsigned int seed,
+    int size);
+
+// ── [v9 NEW] shm_hybrid_kernel — Hybrid Stochastic Hamiltonian ───────
+//
+//  Fused kernel: Hamiltonian symplectic + Langevin stochastic in one pass
+//
+//  Update equations (per parameter i):
+//    noise     = noise_scale * η_i            [thermal fluctuation, FDT]
+//    v_{t+½}   = mom_decay · v_t              [Hamiltonian momentum carry]
+//              - (lr · alpha_H / 2) · ∇L_i   [Hamiltonian gradient half-kick]
+//              - (lr · alpha_L / 2) · γ · v_t [Langevin friction half-kick]
+//              + noise                         [Langevin thermal noise]
+//    W_{t+1}   = W_t + lr · v_{t+½}          [position full-step]
+//
+//  Parameters:
+//    weights    [in/out] W_t → W_{t+1}
+//    velocity   [in/out] v_t → v_{t+½}
+//    gradients  [in]     ∇L at W_t (from backward pass)
+//    lr         learning rate (full step size)
+//    mom_decay  β = Hamiltonian momentum decay (≈0.9, like Adam β₁)
+//    friction   γ = Langevin friction coefficient (≈0.1, lower than pure)
+//    alpha_H    Hamiltonian weight ∈ [0,1] (annealed 0.3→0.9)
+//    alpha_L    Langevin weight   ∈ [0,1] (annealed 0.7→0.1, = 1-alpha_H)
+//    noise_scale √(γ·kT·lr·alpha_L) — FDT-consistent thermal amplitude
+//    seed       per-step RNG seed (xorshift32, reproducible)
+//    size       number of parameters in this tensor
+__global__ void shm_hybrid_kernel(
+    float* __restrict__       weights,
+    float* __restrict__       velocity,
+    const float* __restrict__ gradients,
+    float lr,
+    float mom_decay,
+    float friction,
+    float alpha_H,
+    float alpha_L,
+    float noise_scale,
+    unsigned int seed,
     int size);
 
 // ── Config validation (v4, retained) ─────────────────────────
