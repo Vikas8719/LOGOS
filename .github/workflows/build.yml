@@ -202,14 +202,18 @@ jobs:
     if: always()
     steps:
       - name: Results
+        env:
+          WINDOWS_RESULT: ${{ needs['build-windows'].result }}
+          LINUX_RESULT: ${{ needs['build-linux'].result }}
+          MACOS_RESULT: ${{ needs['build-macos'].result }}
         run: |
-          echo "Windows : ${{ needs.build-windows.result }}"
-          echo "Linux   : ${{ needs.build-linux.result }}"
-          echo "macOS   : ${{ needs.build-macos.result }}"
+          echo "Windows : $WINDOWS_RESULT"
+          echo "Linux   : $LINUX_RESULT"
+          echo "macOS   : $MACOS_RESULT"
           # Agar koi bhi job fail ho toh summary fail ho
-          if [ "${{ needs.build-windows.result }}" != "success" ] || \
-             [ "${{ needs.build-linux.result }}"   != "success" ] || \
-             [ "${{ needs.build-macos.result }}"   != "success" ]; then
+          if [ "$WINDOWS_RESULT" != "success" ] || \
+             [ "$LINUX_RESULT"   != "success" ] || \
+             [ "$MACOS_RESULT"   != "success" ]; then
             echo "❌ One or more jobs failed."
             exit 1
           fi
