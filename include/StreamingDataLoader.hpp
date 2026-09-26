@@ -1,23 +1,5 @@
 #pragma once
 // ============================================================
-//  LOGOS — include/StreamingDataLoader.hpp  (Bug 6 Fix)
-//
-//  BUG 6 FIX: Huge data compatibility
-//
-//  Problems fixed:
-//  1. Tokenizer sirf 50MB padh raha tha lekin ds_size full file se
-//     → Vocab ab actual_text_size par base hoga, not raw file size
-//  2. Dataset fully RAM mein load ho raha tha
-//     → True streaming: file kabhi fully load nahi hoti
-//  3. Batch size fixed=1, no gradient accumulation
-//     → grad_accum_steps parameter add kiya
-//  4. int indexing — 200MB+ datasets par step counter overflow
-//     → int64_t / size_t everywhere
-//  5. total_batches() streaming mode mein sirf 1 chunk estimate karta tha
-//     → ab actual file scan se accurate count milta hai
-//  6. No prefetching — CPU tokenization stalls GPU
-//     → Background thread mein next chunk prefetch
-// ============================================================
 #include "Tokenizer.hpp"
 #include <vector>
 #include <string>
@@ -451,3 +433,92 @@ inline std::vector<DataShard> shards_from_dir(
         });
     return result;
 }
+
+// ── UnifiedDataLoader ─────────────────────────────────────────
+// FIX: StreamingDataLoader had a different interface from DataLoader,
+// so it was included but never actually used in the training loop.
+//
+// UnifiedDataLoader wraps BOTH behind ONE interface identical to what
+// main.cpp's training loop expects:
+//   - next_batch(input_ids, target_ids) → bool
+//   - total_batches() → int
+//   - current_pos (resettable by caller for new epoch)
+//
+// Selection policy (matches previous DataLoader heuristic):
+//   file_size < 64 MB  → DataLoader   (in-memory, fast random access)
+//   file_size >= 64 MB → StreamingDataLoader (chunk streaming, prefetch)
+//
+// main.cpp training loop uses UnifiedDataLoader; no code change needed
+// in the loop itself — only the construction site changes.
+#include "DataLoader.hpp"
+
+class UnifiedDataLoader {
+public:
+    int current_pos = 0;   // exposed for epoch-reset compat with main.cpp
+    int seq_len;
+
+    explicit UnifiedDataLoader(const std::string& file,
+                               Tokenizer& tok,
+                               int seq_len_    = 128,
+                               int grad_accum  = 1)
+        : seq_len(seq_len_)
+    {
+        int64_t file_bytes = scan_dataset_size(file);
+        constexpr int64_t STREAM_THRESHOLD = 64LL * 1024 * 1024;  // 64 MB
+
+        if (file_bytes >= STREAM_THRESHOLD) {
+            std::cout << "UnifiedDataLoader: " << file_bytes/1024/1024
+                      << " MB → StreamingDataLoader (prefetch, chunk-mode)\n";
+            stream_.reset(new StreamingDataLoader(file, tok, seq_len_, grad_accum));
+            use_stream_ = true;
+        } else {
+            std::cout << "UnifiedDataLoader: " << file_bytes/1024
+                      << " KB → DataLoader (in-memory)\n";
+            direct_.reset(new DataLoader(file, tok, seq_len_));
+            use_stream_ = false;
+        }
+
+        // Expose actual text size for vocab/config scaling decisions
+        actual_text_size_ = file_bytes;
+    }
+
+    bool next_batch(std::vector<int>& input_ids, std::vector<int>& target_ids) {
+        bool ok;
+        if (use_stream_) {
+            ok = stream_->next_batch(input_ids, target_ids);
+            // Mirror current_pos so callers that read it get a rough value
+            current_pos = (int)(stream_->total_tokens_seen % INT_MAX);
+        } else {
+            ok = direct_->next_batch(input_ids, target_ids);
+            current_pos = direct_->current_pos;
+        }
+        return ok;
+    }
+
+    // Reset for next epoch — mirrors DataLoader contract
+    void reset() {
+        if (use_stream_) {
+            // StreamingDataLoader rewinds on next epoch automatically;
+            // after next_batch() returns false, next call restarts.
+            // No explicit API needed — just let it return false once.
+        } else {
+            direct_->current_pos = 0;
+            current_pos          = 0;
+        }
+    }
+
+    int total_batches() const {
+        if (use_stream_)
+            return (int)std::min(stream_->total_batches_per_epoch(),
+                                 (int64_t)INT_MAX);
+        return direct_->total_batches();
+    }
+
+    int64_t actual_text_size() const { return actual_text_size_; }
+
+private:
+    bool use_stream_ = false;
+    int64_t actual_text_size_ = 0;
+    std::unique_ptr<StreamingDataLoader> stream_;
+    std::unique_ptr<DataLoader>          direct_;
+};

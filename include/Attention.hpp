@@ -1,22 +1,4 @@
 #pragma once
-// ============================================================
-//  LOGOS — Attention.hpp
-//  Multi-Head Self-Attention + Boltzmann Softmax
-//
-//  BUG 7 FIX: ODR (One Definition Rule) violation resolve kiya
-//    Pehle: AttentionHead, MultiHeadAttention, boltzmann_softmax,
-//           causal_mask — DONO .hpp aur Attention.cpp mein define the.
-//           Agar koi dono include karta → ODR violation → linker error.
-//    Ab:    .hpp = SINGLE SOURCE OF TRUTH (header-only implementation)
-//           Attention.cpp = DEAD FILE (clearly marked, not compiled)
-//           CMakeLists.txt sirf main.cpp compile karta hai → .hpp hi use hoti hai.
-//
-//  BUG 7 FIX: causal_mask() cache yahan bhi add kiya
-//    Pehle: .hpp mein cache nahi tha (Attention.cpp mein tha — dead code)
-//           Har forward() call pe nayi mask banti thi → O(seq²) per step
-//    Ab:    inline static map se cached mask → same mask reuse
-//           thread-safe nahi (single-threaded CPU training) — OK for now
-//
 //  Physics: Softmax(QKᵀ/√d) ≡ Boltzmann distribution
 //    P(state_i) = exp(-E_i/T) / Σ exp(-E_j/T)
 //    Energy E = -attention_score, Temperature T = √d_k

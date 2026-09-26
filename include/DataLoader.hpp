@@ -1,41 +1,5 @@
 #pragma once
 // ============================================================
-//  LOGOS — DataLoader.hpp
-//
-//  BUG 9 FIX: Large dataset OOM prevention — streaming mode
-//    Pehle: poori dataset std::string mein load hoti thi, phir
-//           poori tokenize hoti thi → all_tokens vector.
-//           50MB TinyStories → ~50MB string + ~200MB tokens = ~250MB RAM
-//           Large corpora pe OOM crash.
-//    Ab:    File size check → 64MB se bade datasets streaming mode mein:
-//           Sirf 1MB chunk ek waqt mein pad ke tokenize karo.
-//           Peak RAM: ~10MB (chunk buffer only).
-//           Small datasets (<64MB) pehle ki tarah in-memory.
-//
-//  BUG 10 FIX: next_batch() ka epoch-end reset logic galat tha
-//    Pehle:
-//      if (current_pos + seq_len + 1 >= all_tokens.size()) {
-//          current_pos = 0;   // Reset kiya...
-//          return false;      // ...lekin false return kiya
-//      }
-//      // Caller (main.cpp):
-//      loader.current_pos = 0;  // Manual reset — DUPLICATE, useless
-//    Problems:
-//      1. Internal reset + caller reset = double reset (confusing)
-//      2. Internal reset = silently discards end of dataset on next call
-//         (false return ke baad phir call karo → pos=0 se shuru,
-//          woh ek batch jo boundary pe tha → skip ho jaata hai)
-//      3. Caller ko reset karna ZAROOR tha — agar wo bhool jaata toh
-//         next epoch sirf ek batch ke baad end ho jaati silently.
-//    Fix:
-//      - next_batch() mein current_pos = 0 HATA DIYA on epoch end
-//      - False return sirf boundary signal hai — state disturb mat karo
-//      - Caller hi reset karega explicitly (clear contract)
-//      - main.cpp mein "loader.current_pos = 0" SAHI aur ZARURI hai
-//      - DataLoader ab STATELESS epoch management: caller drives epochs
-//
-//  BUG 11 FIX (carry forward): batch_size parameter removed — was unused
-// ============================================================
 #include "Tensor.hpp"
 #include "Tokenizer.hpp"
 #include <vector>

@@ -22,7 +22,9 @@ inline EvalResult evaluate(LOGOSModel& model, DataLoader& loader,
     std::vector<int> input_ids, target_ids;
 
     while (loader.next_batch(input_ids, target_ids) && batches < max_batches) {
-        Tensor logits = model.forward(input_ids);
+        // [WIRED] is_training=false → deterministic eval (no FeynmanDropout
+        // noise, ReynoldsBatchNorm uses running stats instead of updating them)
+        Tensor logits = model.forward(input_ids, /*is_training=*/false);
         int seq = logits.rows(), vocab = logits.cols();
         for (int i = 0; i < seq && i < (int)target_ids.size(); ++i) {
             int target = target_ids[i];

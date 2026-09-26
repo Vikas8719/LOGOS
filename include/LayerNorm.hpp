@@ -1,14 +1,4 @@
 #pragma once
-// ============================================================
-//  LOGOS — LayerNorm.hpp
-//  Layer Normalization: y = γ × (x - μ) / (σ + ε) + β
-//
-//  BUG 7 FIX: ODR violation resolve kiya
-//    Pehle: LayerNorm dono .hpp aur LayerNorm.cpp mein define thi
-//           → duplicate definition → ODR violation risk
-//    Ab:    .hpp = SINGLE SOURCE OF TRUTH
-//           LayerNorm.cpp = DEAD FILE (clearly marked)
-//
 //  IMPROVEMENT (from LayerNorm.cpp — now live here):
 //    Welford's online algorithm for mean + variance in one pass
 //    Pehle .hpp: 2 separate loops (mean, then variance)

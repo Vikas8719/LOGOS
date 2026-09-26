@@ -1,11 +1,4 @@
 #pragma once
-// ============================================================
-//  LOGOS — PhysicsOpt.hpp  (v9 — Hybrid SHM Optimizer)
-//
-//  v7 Leapfrog Langevin retained (CPU reference, GPU uses shm_hybrid_kernel)
-//
-//  v9 NEW: HybridSHMOptimizer — CPU reference for Kaggle notebooks
-//
 //  Hybrid Stochastic Hamiltonian Mechanics:
 //    Same physics as GPU shm_hybrid_kernel (VedicGEMM.cu)
 //    Used in main.cpp / Kaggle / unit tests

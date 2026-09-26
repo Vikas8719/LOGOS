@@ -1,31 +1,3 @@
-// ============================================================
-//  LOGOS — cuda/VedicGEMM.cu  (v7 — Phase 1 Physics)
-//
-//  v4 fixes retained:
-//    RAII GPUTensor, CUDA_CHECK exceptions, KERNEL_CHECK,
-//    validate_model_config, grad clipping
-//
-//  PHASE 1 ADDITIONS:
-//
-//  [P1-A] Gunitasamuchayah GEMM Verification
-//    Kernel:  row_sum_kernel  — sum each row of A → d_row_sums (M,)
-//             col_sum_kernel  — sum each col of B → d_col_sums (N,)
-//             dot_kernel      — dot(d_row_sums, d_col_sums) via reduction
-//    Host:    cuda_vedic_verify() — computes sum(C) and Vedic prediction,
-//             returns VedicVerifyResult { checksum_C, checksum_vedic,
-//             relative_error, pass }
-//    Cost:    O(M*K + K*N) — ~1000x cheaper than recomputing GEMM
-//    Usage:   Every 1000 training steps in train_gpu.cu
-//
-//  [P1-B] Free Energy Loss
-//    Kernel:  free_energy_loss_kernel — fused CE + entropy + F gradient
-//    F = CE - T * S
-//    dF/dlogit[i] = (p[i] - y[i])/seq                    [CE term]
-//                 + T * p[i] * (log(p[i] + ε) + S) / seq [entropy term]
-//    Host:    cuda_free_energy_loss() — fills d_loss_buf, d_grad_out,
-//             FreeEnergyResult (CE, S, F, T)
-//    Backward: same gradient buffer as CE — drop-in replacement
-//
 //  [P1-C] Leapfrog Langevin kernel
 //    Replaces: langevin_step_kernel (Euler-Maruyama, 1st order)
 //    New:      leapfrog_langevin_kernel (Störmer-Verlet, 2nd order)

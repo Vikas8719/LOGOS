@@ -19,6 +19,7 @@
 #include "Attention.hpp"
 #include "FeedForward.hpp"
 #include "LayerNorm.hpp"
+#include "PhysicsConfig.hpp"
 #include <numeric>
 
 // ── Divergence-free projection (∇·u = 0) ─────────────────────
@@ -40,23 +41,47 @@ inline Tensor divergence_free(const Tensor& U) {
 struct TransformerBlock {
     MultiHeadAttention mha;
     FeedForward        ffn;
-    LayerNorm          ln1, ln2;
+    // [WIRED] was plain LayerNorm — ReynoldsBatchNorm (LayerNorm.hpp) was
+    // defined but never instantiated anywhere. It's a superset behaviourally:
+    // when PhysicsConfig::use_reynolds_norm is false we pin Re_crit huge so
+    // laminar_weight()≈1 and it degenerates to plain LayerNorm exactly.
+    ReynoldsBatchNorm  ln1, ln2;
 
-    TransformerBlock(int d_model_, int num_heads_)
+    TransformerBlock(int d_model_, int num_heads_, const PhysicsConfig& phys = {})
         : mha(d_model_, num_heads_),
-          ffn(d_model_),
+          ffn(d_model_, 0, phys.dropout_p, phys.dropout_hbar, phys.use_feynman_dropout),
           ln1(d_model_),
           ln2(d_model_)
-    {}
+    {
+        // [WIRED] NavierStokesAttention + Shunyam sparse mask (Attention.hpp)
+        // existed as toggleable fields on AttentionHead but nothing ever set
+        // them from model config — use_navier_stokes defaulted to false, so
+        // the NS code path never ran. Now driven by PhysicsConfig.
+        for (auto& h : mha.heads) {
+            h.use_sparse        = phys.use_sparse_attn;
+            h.sparse_window     = phys.sparse_window;
+            h.sparse_stride     = phys.sparse_stride;
+            h.use_navier_stokes = phys.use_navier_stokes;
+            h.ns_alpha          = phys.ns_alpha;
+            h.ns_eta            = phys.ns_eta;
+            h.ns_nu             = phys.ns_nu;
+        }
+        if (!phys.use_reynolds_norm) {
+            ln1.Re_crit = 1e6f;
+            ln2.Re_crit = 1e6f;
+        }
+    }
 
-    Tensor forward(const Tensor& X) {
-        Tensor normed1  = ln1.forward(X);
+    // is_training gates: ReynoldsBatchNorm running-stat EMA updates,
+    // and (via ffn.forward) FeynmanDropout's Bernoulli/Beta sampling.
+    Tensor forward(const Tensor& X, bool is_training = true) {
+        Tensor normed1  = ln1.forward(X, is_training);
         Tensor attn_out = mha.forward(normed1);
         // Residual 1: incompressible flow — project to ∇·u = 0
         Tensor h        = divergence_free(X + attn_out);
 
-        Tensor normed2  = ln2.forward(h);
-        Tensor ffn_out  = ffn.forward(normed2);
+        Tensor normed2  = ln2.forward(h, is_training);
+        Tensor ffn_out  = ffn.forward(normed2, is_training);
         // Residual 2: incompressible flow — project to ∇·u = 0
         return divergence_free(h + ffn_out);
     }

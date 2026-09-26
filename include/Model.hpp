@@ -1,35 +1,18 @@
 #pragma once
 // ============================================================
-//  LOGOS — Model.hpp
-//
-//  BUG 5 FIX: ModelConfig defaults unified — .hpp aur .cpp mismatch band
-//    Pehle .hpp:  d_model=128, num_heads=4, num_layers=4, max_seq_len=128
-//    Pehle .cpp:  d_model=256, num_heads=8, num_layers=6, max_seq_len=512
-//    → koi bhi ModelConfig{} use kare toh alag values milti thi
-//
-//    Ab: SINGLE SOURCE OF TRUTH yahan (Model.hpp) hai.
-//        Model.cpp mein duplicate ModelConfig definition remove kar di gayi.
-//        Chosen defaults: d_model=128, heads=4, layers=4, seq=128
-//        (conservative — fast iteration, easily scalable via explicit cfg)
-//
-//  RoPE UPGRADE: pos_embedding (learned, additive) → RoPE (parameter-free)
-//    Feynman Phase Rotation: x'[2i], x'[2i+1] = rotate by θ_i = pos/10000^(2i/d)
-//    Benefit: encodes RELATIVE positions naturally, better generalisation
-//    apply_rope() defined above LOGOSModel — called once in forward()
-//
-//  ✅ ModelConfig ONLY defined here — Model.cpp mein nahi
-//  ✅ LOGOSModel ONLY defined here — Model.cpp is now DEAD (not compiled)
-//  ✅ RoPE replaces learned pos_embedding — parameter-free, physics-grounded
-// ============================================================
 #include "Tensor.hpp"
 #include "VedicGEMM.hpp"
 #include "TransformerBlock.hpp"
 #include "Tokenizer.hpp"
+#include "PhysicsConfig.hpp"
 #include <vector>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <cmath>
+#include <numeric>    // std::iota (nucleus sampling)
+#include <algorithm>  // std::sort (nucleus sampling)
+#include <random>     // std::mt19937, std::discrete_distribution
 
 // ── RoPE: Rotary Positional Encoding (Feynman Phase Rotation) ─
 // Physics: each token position = phase rotation in complex plane
@@ -80,8 +63,14 @@ public:
     // RoPE is parameter-free: positions encoded via phase rotation (apply_rope)
     std::vector<TransformerBlock> layers;
 
-    LOGOSModel(const ModelConfig& config = {})
-        : cfg(config),
+    // [WIRED] phys controls which previously-dead physics/vedic code paths
+    // (ReynoldsBatchNorm, NavierStokesAttention, FeynmanDropout) actually
+    // run in this model's layers. Kept OUT of ModelConfig on purpose — see
+    // PhysicsConfig.hpp for why (checkpoint binary-layout compatibility).
+    PhysicsConfig phys_cfg;
+
+    LOGOSModel(const ModelConfig& config = {}, const PhysicsConfig& phys = {})
+        : cfg(config), phys_cfg(phys),
           embedding({cfg.vocab_size, cfg.d_model}),
           lm_head  ({cfg.d_model,    cfg.vocab_size})
     {
@@ -90,14 +79,55 @@ public:
         lm_head.fill_random(-scale, scale);
         layers.reserve(cfg.num_layers);
         for (int l = 0; l < cfg.num_layers; ++l)
-            layers.emplace_back(cfg.d_model, cfg.num_heads);
+            layers.emplace_back(cfg.d_model, cfg.num_heads, phys_cfg);
         std::cout << "LOGOS Model ready | layers=" << cfg.num_layers
                   << " d_model=" << cfg.d_model
                   << " vocab=" << cfg.vocab_size
-                  << " | pos=RoPE\n";
+                  << " | pos=RoPE"
+                  << " | reynolds_norm="   << (phys_cfg.use_reynolds_norm   ? "on" : "off")
+                  << " navier_stokes="     << (phys_cfg.use_navier_stokes   ? "on" : "off")
+                  << " feynman_dropout="   << (phys_cfg.use_feynman_dropout ? "on" : "off")
+                  << "\n";
     }
 
-    Tensor forward(const std::vector<int>& token_ids) {
+    // ── forward_with_hidden ───────────────────────────────────
+    // IMPROVEMENT: Returns {logits, hidden_state} in ONE pass.
+    // Eliminates the double-forward-pass bug in main.cpp training loop.
+    // Use this in the training loop instead of calling forward() + recomputing
+    // embedding+layers separately for gradient computation.
+    //
+    // Before (main.cpp bug): model.forward() for loss → rerun embedding+layers for grad
+    // After: forward_with_hidden() → both logits AND hidden state from 1 pass
+    //
+    // Returns:
+    //   first  = logits  {seq, vocab}  — for loss computation
+    //   second = X_final {seq, d_model} — transformer output, for gradient
+    std::pair<Tensor, Tensor> forward_with_hidden(const std::vector<int>& token_ids,
+                                                   bool is_training = true) {
+        int seq = (int)token_ids.size();
+        if (seq > cfg.max_seq_len)
+            throw std::runtime_error("Input too long: " + std::to_string(seq)
+                                     + " > max_seq_len " + std::to_string(cfg.max_seq_len));
+
+        Tensor X({seq, cfg.d_model}, 0.0f);
+        for (int i = 0; i < seq; ++i) {
+            int tok = std::max(0, std::min(token_ids[i], cfg.vocab_size-1));
+            for (int j = 0; j < cfg.d_model; ++j)
+                X.at(i,j) = embedding.at(tok,j);
+        }
+        apply_rope(X, seq, cfg.d_model);
+        for (auto& block : layers) X = block.forward(X, is_training);
+
+        Tensor hidden = X;  // save hidden state (copy, same shape)
+        Tensor logits = vedic_gemm(X, lm_head);
+        return {std::move(logits), std::move(hidden)};
+    }
+
+    // is_training: true during the training loop (enables ReynoldsBatchNorm's
+    // running-stat EMA update and FeynmanDropout sampling). Pass false for
+    // eval/generation so both behave deterministically (no dropout, uses
+    // running BN stats once available).
+    Tensor forward(const std::vector<int>& token_ids, bool is_training = true) {
         int seq = (int)token_ids.size();
         if (seq > cfg.max_seq_len)
             throw std::runtime_error("Input too long: " + std::to_string(seq)
@@ -115,25 +145,91 @@ public:
         // Applied ONCE after embedding, before transformer blocks
         apply_rope(X, seq, cfg.d_model);
 
-        for (auto& block : layers) X = block.forward(X);
+        for (auto& block : layers) X = block.forward(X, is_training);
         return vedic_gemm(X, lm_head);
     }
 
+    // IMPROVEMENT: generate() now supports nucleus (top-p) sampling.
+    // Before: greedy argmax only (temp was accepted but ignored for selection)
+    // After:
+    //   top_p < 1.0 → nucleus sampling (diverse, natural text)
+    //   top_p = 1.0 → full temperature sampling
+    //   temp  = 0.0 → greedy argmax (deterministic, same as before)
+    //
+    // Nucleus sampling (Holtzman et al. 2020):
+    //   Sort vocab by probability descending.
+    //   Keep smallest set S such that Σ_{v∈S} p(v) >= top_p.
+    //   Sample uniformly within S (redistributed).
+    //   This avoids both: low-entropy greedy (repetition) and
+    //                     high-entropy full sampling (incoherence).
     std::vector<int> generate(std::vector<int> prompt,
-                              int max_new = 50, float temp = 1.0f) {
+                              int max_new = 50, float temp = 1.0f,
+                              float top_p = 0.9f) {
         auto out = prompt;
+        std::mt19937 gen(std::random_device{}());
+
         for (int s = 0; s < max_new; ++s) {
             std::vector<int> ctx = out;
             if ((int)ctx.size() > cfg.max_seq_len)
                 ctx = {ctx.end() - cfg.max_seq_len, ctx.end()};
-            Tensor logits = forward(ctx);
+
+            Tensor logits = forward(ctx, /*is_training=*/false);
             int last = logits.rows()-1, vocab = logits.cols();
-            float max_l = logits.at(last,0);
-            for (int v=1;v<vocab;++v) max_l = std::max(max_l, logits.at(last,v));
-            float sum=0; std::vector<float> p(vocab);
-            for (int v=0;v<vocab;++v){ p[v]=std::exp((logits.at(last,v)-max_l)/temp); sum+=p[v]; }
-            int next=0; float best=0;
-            for (int v=0;v<vocab;++v) if(p[v]/sum>best){best=p[v]/sum;next=v;}
+
+            // Greedy path (temp == 0 or very small)
+            if (temp < 1e-5f) {
+                int next = 0; float best = logits.at(last, 0);
+                for (int v = 1; v < vocab; ++v)
+                    if (logits.at(last, v) > best) { best = logits.at(last, v); next = v; }
+                out.push_back(next);
+                if (next == TOKEN_EOS) break;
+                continue;
+            }
+
+            // Temperature-scaled softmax
+            float max_l = logits.at(last, 0);
+            for (int v = 1; v < vocab; ++v) max_l = std::max(max_l, logits.at(last, v));
+            float sum = 0.0f;
+            std::vector<float> p(vocab);
+            for (int v = 0; v < vocab; ++v) {
+                p[v] = std::exp((logits.at(last, v) - max_l) / temp);
+                sum += p[v];
+            }
+            for (int v = 0; v < vocab; ++v) p[v] /= (sum + 1e-9f);
+
+            // Nucleus (top-p) filtering
+            int next = 0;
+            if (top_p < 1.0f - 1e-5f) {
+                // Sort indices by probability descending
+                std::vector<int> idx(vocab);
+                std::iota(idx.begin(), idx.end(), 0);
+                std::sort(idx.begin(), idx.end(),
+                          [&](int a, int b){ return p[a] > p[b]; });
+
+                // Find nucleus boundary
+                float cumsum = 0.0f; int nucleus_end = 0;
+                for (int i = 0; i < vocab; ++i) {
+                    cumsum += p[idx[i]];
+                    nucleus_end = i;
+                    if (cumsum >= top_p) break;
+                }
+
+                // Renormalize within nucleus
+                float nucleus_sum = 0.0f;
+                for (int i = 0; i <= nucleus_end; ++i) nucleus_sum += p[idx[i]];
+                std::vector<float> nucleus_p(nucleus_end + 1);
+                for (int i = 0; i <= nucleus_end; ++i)
+                    nucleus_p[i] = p[idx[i]] / (nucleus_sum + 1e-9f);
+
+                // Sample from nucleus
+                std::discrete_distribution<int> dist(nucleus_p.begin(), nucleus_p.end());
+                next = idx[dist(gen)];
+            } else {
+                // Full distribution sampling
+                std::discrete_distribution<int> dist(p.begin(), p.end());
+                next = dist(gen);
+            }
+
             out.push_back(next);
             if (next == TOKEN_EOS) break;
         }

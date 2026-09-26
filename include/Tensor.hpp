@@ -12,31 +12,6 @@
 #include <atomic>
 
 // ============================================================
-//  LOGOS — Tensor.hpp
-//
-//  BUG 8 FIX: fill_random() — deterministic seeding system
-//    Pehle: rand() global state use karta tha
-//           - Non-reproducible: har run alag weights
-//           - Thread-unsafe: race condition in multi-thread
-//           - srand(42) sirf unit test mein call hota tha,
-//             production training mein nahi → completely random init
-//    Ab:    Global deterministic RNG with seed control:
-//           - set_global_seed(N) → reproducible training runs
-//           - Default seed=42 → consistent results out-of-box
-//           - Each fill_random() advances global RNG atomically
-//           - Thread-safe via per-call snapshot pattern
-//           - fill_random(lo, hi, local_seed) bhi supported
-//             (local_seed >= 0 → isolated RNG for that tensor only)
-//
-//  BUG 15 FIX (carry forward): at() bounds check always active
-//    assert() → disabled in Release. Now: std::out_of_range always.
-//
-//  BUG 2 FIX (carry forward): reshape() avoids unnecessary copy.
-// ============================================================
-
-// ── Global RNG for reproducible weight initialization ────────
-// BUG 8 FIX: replaces global rand() with seeded mt19937
-// Call set_global_seed() at program start for reproducibility.
 namespace logos_rng {
     // Global generator — default seed 42 (same init every run)
     inline std::mt19937& global_gen() {
@@ -327,12 +302,26 @@ struct RiemannianMetric {
     // This transforms the standard gradient into the natural gradient direction.
     // The result is the steepest ascent direction in Riemannian metric distance.
     Tensor riemannian_gradient(const Tensor& grad) const {
+        return riemannian_gradient_at(grad, 0);
+    }
+
+    // [WIRED — offset variant] update_from_params() builds the metric by
+    // concatenating ALL parameter tensors into one flat index space (see
+    // its `offset` accumulation above). To precondition a single tensor's
+    // gradient consistently with that global metric, the caller must supply
+    // the same offset it used when building metric_diag for this tensor.
+    // Without this overload, every tensor would incorrectly read
+    // metric_diag[0..size) regardless of where its params actually live in
+    // the flattened space — silently wrong once more than one tensor exists.
+    Tensor riemannian_gradient_at(const Tensor& grad, int offset) const {
         Tensor g_nat(grad.shape);
-        int n = std::min(grad.total_size, dim);
+        int n = std::min(grad.total_size, std::max(0, dim - offset));
         for (int i = 0; i < n; ++i) {
-            float G_ii = metric_diag[i] + damping;
+            float G_ii = metric_diag[offset + i] + damping;
             g_nat.data[i] = grad.data[i] / G_ii;
         }
+        // Any elements beyond metric coverage pass through unscaled (safety).
+        for (int i = n; i < grad.total_size; ++i) g_nat.data[i] = grad.data[i];
         return g_nat;
     }
 

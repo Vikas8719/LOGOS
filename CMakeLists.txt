@@ -141,6 +141,22 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
+    # ── TEST 4: Large Data Scale & Production Test ────────────
+    # Tests: 1TB int64_t, chunked pipeline, grad accum, multi-shard,
+    #        smoke test, GPU large vocab — CI/CD production readiness
+    add_executable(test_large_data_scale
+        tests/test_large_data_scale.cu
+        cuda/VedicGEMM.cu
+        cuda/ModelGPU.cu
+        src/Checkpoint.cpp
+    )
+    target_include_directories(test_large_data_scale PRIVATE include cuda tests)
+    target_compile_options(test_large_data_scale PRIVATE ${LOGOS_CUDA_FLAGS})
+    target_link_libraries(test_large_data_scale PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_compile_definitions(test_large_data_scale PRIVATE
+        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
+
     # ── CTest integration ─────────────────────────────────────
     enable_testing()
 
@@ -154,15 +170,19 @@ if(CMAKE_CUDA_COMPILER)
     add_test(NAME "T3_Memory_Stress"
              COMMAND test_memory_stress)
 
-    # Timeouts: math=60s, syntax=120s, memory=300s
-    set_tests_properties("T2_Math_Unit"    PROPERTIES TIMEOUT 60)
-    set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
-    set_tests_properties("T1_Syntax_Build" PROPERTIES TIMEOUT 120)
-    set_tests_properties("T3_Memory_Stress" PROPERTIES TIMEOUT 300)
+    add_test(NAME "T4_Large_Data_Scale"
+             COMMAND test_large_data_scale)
 
-    message(STATUS "Tests: test_syntax_build, test_math_unit, test_memory_stress")
+    # Timeouts: math=60s, syntax=120s, memory=300s, large_data=600s
+    set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
+    set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
+    set_tests_properties("T1_Syntax_Build"     PROPERTIES TIMEOUT 120)
+    set_tests_properties("T3_Memory_Stress"    PROPERTIES TIMEOUT 300)
+    set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
+
+    message(STATUS "Tests: test_syntax_build, test_math_unit, test_memory_stress, test_large_data_scale")
     message(STATUS "Run:   ctest --output-on-failure")
-    message(STATUS "Or:    ./build/test_math_unit && ./build/test_syntax_build && ./build/test_memory_stress")
+    message(STATUS "Or:    ./build/test_math_unit && ./build/test_syntax_build && ./build/test_memory_stress && ./build/test_large_data_scale")
 
 else()
     message(STATUS "⚠️  CUDA not found — CPU-only build")
@@ -181,11 +201,30 @@ else()
     target_include_directories(test_checkpoint PRIVATE include)
     logos_set_cpu_test_options(test_checkpoint)
 
+    # ── TEST 4 (CPU-only build) ───────────────────────────────
+    # test_large_data_scale.cu compiles as CXX without CUDA
+    # HAS_CUDA=0 disables GPU sections automatically
+    add_executable(test_large_data_scale
+        tests/test_large_data_scale.cu
+        src/Checkpoint.cpp
+    )
+    target_include_directories(test_large_data_scale PRIVATE include tests)
+    # Rename .cu to allow CXX compiler (no nvcc needed)
+    set_source_files_properties(
+        tests/test_large_data_scale.cu
+        PROPERTIES LANGUAGE CXX
+    )
+    logos_set_cpu_test_options(test_large_data_scale)
+
     enable_testing()
-    add_test(NAME "T2_Math_Unit" COMMAND test_math_unit)
+    add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
     add_test(NAME "Checkpoint_Roundtrip" COMMAND test_checkpoint)
-    set_tests_properties("T2_Math_Unit" PROPERTIES TIMEOUT 60)
+    add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
+    set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
     set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
+    set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
+
+    message(STATUS "CPU-only tests: test_math_unit, test_checkpoint, test_large_data_scale")
 endif()
 
 install(TARGETS logos DESTINATION bin)
@@ -195,11 +234,12 @@ endif()
 
 message(STATUS "")
 message(STATUS "Build targets:")
-message(STATUS "  logos              — CPU training")
+message(STATUS "  logos                  — CPU training")
 if(CMAKE_CUDA_COMPILER)
-message(STATUS "  logos_gpu          — GPU training (Phase 1+2)")
-message(STATUS "  test_syntax_build  — Test 1: CUDA syntax + GPU kernels")
-message(STATUS "  test_math_unit     — Test 2: Vedic math formulas vs modern")
-message(STATUS "  test_memory_stress — Test 3: 1M+ data, VRAM leak, bounds")
+message(STATUS "  logos_gpu              — GPU training (Phase 1+2)")
+message(STATUS "  test_syntax_build      — Test 1: CUDA syntax + GPU kernels")
+message(STATUS "  test_math_unit         — Test 2: Vedic math formulas vs modern")
+message(STATUS "  test_memory_stress     — Test 3: 1M+ data, VRAM leak, bounds")
+message(STATUS "  test_large_data_scale  — Test 4: 1TB scale, production CI/CD")
 endif()
 message(STATUS "")

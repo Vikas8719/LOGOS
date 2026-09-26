@@ -1,24 +1,5 @@
 // ============================================================
 //  LOGOS — DataLoader.cpp
-//  Text file se 512-token batches banana
-//  TinyStories / Wikipedia / any .txt file support
-//
-//  BUG 11 FIX (partial→complete): batch_size dead code remove
-//    Pehle: batch_size stored + constructor param mein tha,
-//           lekin next_batch() mein kabhi use nahi hua.
-//    Ab:    batch_size param + member dono remove.
-//           DataLoader.hpp ke saath fully consistent.
-//
-//  SECURITY FIX (token bounds strict check):
-//    Pehle: all_tokens seedha Model mein pass hote the — agar
-//           koi token id vocab_size se bahar tha (corrupt dataset /
-//           mismatched vocab.bin) toh OOB embedding lookup possible tha.
-//    Ab:
-//      - Constructor mein clamp_tokens() call hoti hai
-//      - Har token id [0, vocab_size) mein hona chahiye
-//      - Out-of-range token → TOKEN_UNK (0) se replace
-//      - vocab_size 0 hone par tokenization skip + warning
-// ============================================================
 #pragma once
 #include "../include/Tensor.hpp"
 #include "Tokenizer.cpp"

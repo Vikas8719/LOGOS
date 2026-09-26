@@ -1,47 +1,5 @@
 #pragma once
-// ============================================================
-//  LOGOS — cuda/ModelGPU.cuh  (v8 — Phase 2 Physics)
-//
-//  v6 retained: Full attention backward (10 kernels), HeadCache,
-//               LayerCache, all_parameters(), alloc_grad_buffers()
-//
-//  PHASE 2 ADDITIONS:
-//
-//  [P2-A] Hyperbolic Embedding Space (Poincaré Ball Model)
-//    Applies AFTER token+positional embedding lookup, BEFORE Transformer.
-//    exp_map: Euclidean vector → Poincaré ball surface
-//      expmap0(v) = tanh(||v||/2) * v / (||v|| + ε)
-//    log_map: Poincaré ball → Euclidean tangent space (for backward)
-//      logmap0(y) = 2 * arctanh(||y||) * y / (||y|| + ε)
-//
-//    Why only embedding layer:
-//      - All Transformer ops (GEMM, LayerNorm, Attention) assume flat R^d
-//      - Embedding maps discrete tokens to geometry — hyperbolic is natural here
-//      - Hierarchical language structure fits exponentially in hyperbolic space
-//      - NO change to attention backward, FFN backward, or any other kernel
-//
-//    VRAM: zero extra (in-place on X buffer)
-//    Speed: +2 kernels per forward pass (seq×D tanh/atanh ops — negligible)
-//    Curvature: c = 1.0 (unit Poincaré ball, adjustable via HyperConfig)
-//
-//  [P2-B] Nikhilam KV Cache Compression (INT8 per-head)
-//    Nikhilam Navatascharamam Dashatah: complement-from-base
-//    Applied to K and V tensors in HeadCache after computation, before store.
-//    Compression: float32 (4B) → int8 (1B) = 4x memory reduction
-//    Method:
-//      scale[h] = max(|K|) / 127.0f
-//      K_int8[i] = clamp(round(K[i] / scale), -127, 127)
-//      K_reconstructed[i] = K_int8[i] * scale   (for backward)
-//    Nikhilam complement encoding:
-//      For each 8-element group: store (base - value) where base = 127
-//      Reconstruction: value = base - complement
-//      This is Nikhilam's "nines' complement" adapted to int8 range
-//
-//    HeadCache change:
-//      K, V: float32 GPUTensor → kept for backward (needed for dK, dV grads)
-//      K_int8, V_int8: int8 compressed versions (for VRAM savings during fwd)
-//      scale_K, scale_V: per-head float scalars
-//
+
 //    Forward: compress after compute, decompress before attn_probs
 //    Backward: use float32 K/V (already cached before compression)
 //    VRAM: at seq=512, H=8, DH=64: saves 8×512×64×3B = 1.5MB per layer

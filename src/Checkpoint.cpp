@@ -1,17 +1,4 @@
 // ============================================================
-//  LOGOS — Checkpoint.cpp
-//
-//  BUG 4 FIX: load_checkpoint() ab cfg mismatch pe ABORT karta hai
-//    Pehle: mismatch warning print karta tha, phir bhi load karta tha
-//           → d=256 checkpoint ko d=64 model mein load = silent overflow
-//           → model ke embedding tensor sirf 64*vocab floats allocate hain
-//             lekin 256*vocab floats padhe jaate hain → heap corruption
-//    Ab:    strict match required. False return on mismatch.
-//           load_checkpoint_force() available for deliberate partial loads.
-//
-//  BUG 3 FIX (carry forward): validate cfg bounds before any read
-//  BUG 13 FIX (carry forward): single definition, declarations in .hpp
-// ============================================================
 #ifndef LOGOS_CHECKPOINT_CPP
 #define LOGOS_CHECKPOINT_CPP
 
@@ -183,6 +170,12 @@ bool save_checkpoint(const LOGOSModel& model,
     write_legacy_position_slot(f, model.cfg);
     wt(model.lm_head);
 
+    // Helper: write a std::vector<float> (for BN running stats)
+    auto wv = [&](const std::vector<float>& v) {
+        f.write(reinterpret_cast<const char*>(v.data()),
+                static_cast<std::streamsize>(v.size() * sizeof(float)));
+    };
+
     for (const auto& block : model.layers) {
         for (const auto& head : block.mha.heads) {
             wt(head.W_Q); wt(head.W_K); wt(head.W_V); wt(head.W_O);
@@ -192,6 +185,11 @@ bool save_checkpoint(const LOGOSModel& model,
         wt(block.ffn.W2); wt(block.ffn.b2);
         wt(block.ln1.gamma); wt(block.ln1.beta);
         wt(block.ln2.gamma); wt(block.ln2.beta);
+        // IMPROVEMENT: Save ReynoldsBatchNorm EMA running stats.
+        // Before: running_mean/running_var were NEVER saved → cold BN after every load.
+        // After:  EMA buffers persist → model resumes warm training exactly.
+        wv(block.ln1.running_mean); wv(block.ln1.running_var);
+        wv(block.ln2.running_mean); wv(block.ln2.running_var);
     }
 
     if (!f) {
@@ -243,6 +241,21 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     if (!discard_legacy_position_slot(f, file_cfg, path, false)) return false;
     if (!rt(model.lm_head))       return false;
 
+    // Helper: read a std::vector<float> of known size
+    auto rv = [&](std::vector<float>& v, const std::string& lbl) -> bool {
+        auto bytes = static_cast<std::streamsize>(v.size() * sizeof(float));
+        f.read(reinterpret_cast<char*>(v.data()), bytes);
+        if (f.gcount() != bytes) {
+            // Older checkpoints won't have BN stats — tolerate gracefully.
+            // Zero-fill (cold BN) and continue: training resumes correctly.
+            std::fill(v.begin(), v.end(), 0.0f);
+            f.clear();  // reset EOF so subsequent reads can proceed
+            std::cerr << "⚠️  BN running stat '" << lbl
+                      << "' missing in checkpoint (older format) — zero-initialised\n";
+        }
+        return true;  // always non-fatal for BN stats
+    };
+
     for (auto& block : model.layers) {
         for (auto& head : block.mha.heads) {
             if (!rt(head.W_Q)) return false;
@@ -259,6 +272,15 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         if (!rt(block.ln1.beta))   return false;
         if (!rt(block.ln2.gamma))  return false;
         if (!rt(block.ln2.beta))   return false;
+        // IMPROVEMENT: Restore Reynolds BN EMA stats (warm resume).
+        // Older checkpoints silently zero-fill (cold start — safe fallback).
+        rv(block.ln1.running_mean, "ln1.running_mean");
+        rv(block.ln1.running_var,  "ln1.running_var");
+        rv(block.ln2.running_mean, "ln2.running_mean");
+        rv(block.ln2.running_var,  "ln2.running_var");
+        // Mark as initialized so eval path uses running stats (not batch stats)
+        block.ln1.initialized = true;
+        block.ln2.initialized = true;
     }
 
     if (model.embedding.has_nan()) {

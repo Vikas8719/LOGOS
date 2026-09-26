@@ -1,35 +1,3 @@
-// ============================================================
-//  LOGOS — cuda/train_gpu.cu  (v9 — Hybrid SHM Optimizer)
-//
-//  v8 retained: Phase 1+2+3 (FreeEnergy, Leapfrog, Hyperbolic,
-//               Nikhilam KV, Feynman Beam Search)
-//
-//  v9 NEW — GPUSHMOpt: Hybrid Stochastic Hamiltonian Mechanics
-//
-//  Problem with GPULangevinOpt (v7/v8):
-//    pure Leapfrog Langevin adds SAME noise level at every step
-//    → late training: noise prevents tight loss convergence
-//    → early training: friction kills momentum too fast
-//
-//  Solution — GPUSHMOpt (this version):
-//    shm_hybrid_kernel = Hamiltonian symplectic + Langevin stochastic
-//
-//    Early steps  (α_H=0.3, α_L=0.7):
-//      Langevin dominant → high noise, wide exploration, fast escape
-//      from bad initializations and saddle points
-//
-//    Middle steps (α_H=0.6, α_L=0.4):
-//      Balanced → momentum builds direction, noise prevents overfitting
-//
-//    Late steps   (α_H=0.9, α_L=0.1):
-//      Hamiltonian dominant → sharp convergence like heavy-ball/Adam
-//      residual Langevin noise keeps solution in flat minimum
-//      (flat minima generalize better — Hochreiter & Schmidhuber 1997)
-//
-//    Same memory as pure Leapfrog (one velocity buffer per param)
-//    +2 FLOPs per parameter vs leapfrog (negligible overhead)
-//    Training loop: IDENTICAL — just optimizer class swapped
-//
 //  Logging: added alpha_H, alpha_L columns to training output
 //  All Phase 1+2+3 kernels: UNCHANGED
 // ============================================================

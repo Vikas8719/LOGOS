@@ -117,13 +117,24 @@ struct FeedForward {
     Tensor W1, b1, W2, b2;
     int d_model, d_ff;
 
-    FeedForward(int d_model_, int d_ff_ = 0)
+    // [WIRED] FeynmanDropout was defined above but never called from
+    // forward(). It's now a real member, applied after GELU (the
+    // standard placement for Transformer FFN dropout — between the
+    // activation and the down-projection).
+    bool  use_dropout;
+    FeynmanDropout dropout;
+
+    FeedForward(int d_model_, int d_ff_ = 0,
+                float dropout_p = 0.1f, float dropout_hbar = 1.0f,
+                bool enable_dropout = true)
         : d_model(d_model_),
           d_ff(d_ff_ > 0 ? d_ff_ : 4 * d_model_),
           W1({d_model_, d_ff_ > 0 ? d_ff_ : 4*d_model_}),
           b1({1,        d_ff_ > 0 ? d_ff_ : 4*d_model_}),
           W2({d_ff_ > 0 ? d_ff_ : 4*d_model_, d_model_}),
-          b2({1, d_model_})
+          b2({1, d_model_}),
+          use_dropout(enable_dropout),
+          dropout(dropout_p, dropout_hbar)
     {
         float scale = std::sqrt(2.0f / d_model_);
         W1.fill_random(-scale, scale);
@@ -131,9 +142,15 @@ struct FeedForward {
         b1.zero(); b2.zero();
     }
 
-    Tensor forward(const Tensor& X) {
+    // is_training: forwarded into FeynmanDropout so eval/generate runs
+    // get the identity path (no dropout), matching standard practice.
+    Tensor forward(const Tensor& X, bool is_training = true) {
         Tensor H = vedic_gemm_bias(X, W1, b1);
         for (float& v : H.data) v = gelu(v);
+        if (use_dropout) {
+            dropout.training = is_training;
+            H = dropout.forward(H);
+        }
         return vedic_gemm_bias(H, W2, b2);
     }
 
