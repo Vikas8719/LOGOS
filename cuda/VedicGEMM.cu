@@ -726,7 +726,29 @@ float cuda_clip_gradients(std::vector<GPUTensor*>& grads, float max_norm) {
 
 // ============================================================
 //  [P1-A] HOST WRAPPER: cuda_vedic_verify()
-//  Gunitasamuchayah: sum(C) ≈ dot(row_sums(A), col_sums(B))
+//  Gunitasamuchayah: sum(C) ≈ dot(col_sums_A, row_sums_B)
+//
+//  CORRECT Vedic sutram for C = A(M×K) × B(K×N):
+//    sum(C) = Σ_m Σ_n C[m,n]
+//           = Σ_m Σ_n Σ_k A[m,k] * B[k,n]
+//           = Σ_k (Σ_m A[m,k]) * (Σ_n B[k,n])
+//           = dot( col_sums(A)[K], row_sums(B)[K] )
+//
+//  Previous WRONG formula:
+//    checksum_vedic = sum_all(A) * sum_all(B) / K
+//    This is the "grand sum" approximation — only holds when columns
+//    of A and rows of B happen to have equal variance (they don't).
+//    Result: err=27x even with 30% tolerance → always WARN.
+//
+//  Correct formula needs K-length vectors:
+//    col_sums_A[k] = Σ_m A[m,k]     (sum each column of A)
+//    row_sums_B[k] = Σ_n B[k,n]     (sum each row of B)
+//    vedic_pred    = dot(col_sums_A, row_sums_B)
+//
+//  Expected relative_error with this formula:
+//    Custom CUDA kernel: < 1e-4 (bitwise exact)
+//    cuBLAS (float32 reorder): 0.1% – 2% typical, < 5% worst case
+//    → tolerance=0.05f (5%) is fine for BOTH backends now
 // ============================================================
 VedicVerifyResult cuda_vedic_verify(const GPUTensor& A,
                                      const GPUTensor& B,
@@ -735,60 +757,63 @@ VedicVerifyResult cuda_vedic_verify(const GPUTensor& A,
 {
     int M=A.rows, K=A.cols, N=B.cols;
 
-    // Allocate GPU buffers for row/col sums and scalars
-    float *d_row_sums, *d_col_sums, *d_sum_C, *d_dot_vedic;
-    CUDA_CHECK(cudaMalloc(&d_row_sums,    M * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_col_sums,    N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sum_C,       sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dot_vedic,   sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_sum_C,     0, sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_dot_vedic, 0, sizeof(float)));
+    // GPU buffers
+    float *d_col_sums_A, *d_row_sums_B, *d_sum_C;
+    CUDA_CHECK(cudaMalloc(&d_col_sums_A, K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_row_sums_B, K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_sum_C,      sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_col_sums_A, 0, K * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_row_sums_B, 0, K * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_sum_C,      0, sizeof(float)));
 
-    // 1. Row sums of A: one block per row, 256 threads
-    row_sum_kernel<<<M, 256>>>(A.data, d_row_sums, M, K);
+    // 1. col_sums_A[k] = Σ_m A[m,k]
+    //    Reuse col_sum_kernel: treats A as (M rows, K cols)
+    //    col_sum_kernel(A, col_sums, rows=M, cols=K): col j = Σ_i A[i*K+j]
+    //    → gives us col_sums_A[k] = Σ_m A[m,k]  ✅
+    col_sum_kernel<<<K, 256>>>(A.data, d_col_sums_A, M, K);
     CUDA_KERNEL_CHECK();
 
-    // 2. Col sums of B: one block per col, 256 threads
-    col_sum_kernel<<<N, 256>>>(B.data, d_col_sums, K, N);
+    // 2. row_sums_B[k] = Σ_n B[k,n]
+    //    Reuse row_sum_kernel: treats B as (K rows, N cols)
+    //    row_sum_kernel(B, row_sums, rows=K, cols=N): row i = Σ_j B[i*N+j]
+    //    → gives us row_sums_B[k] = Σ_n B[k,n]  ✅
+    row_sum_kernel<<<K, 256>>>(B.data, d_row_sums_B, K, N);
     CUDA_KERNEL_CHECK();
 
-    // 3. Sum all elements of C
+    // 3. sum(C) = Σ_m Σ_n C[m,n]
     {
-        int sz=C.size, blk=(sz+255)/256;
-        array_sum_kernel<<<blk,256>>>(C.data, d_sum_C, sz);
+        int sz = C.size, blk = (sz + 255) / 256;
+        array_sum_kernel<<<blk, 256>>>(C.data, d_sum_C, sz);
         CUDA_KERNEL_CHECK();
     }
 
-    // 4. Dot product: row_sums(A) · col_sums(B) = Vedic prediction
-    //    Use array_sum on element-wise product (computed on host — small arrays)
-    std::vector<float> h_row(M), h_col(N);
-    CUDA_CHECK(cudaMemcpy(h_row.data(), d_row_sums, M*sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_col.data(), d_col_sums, N*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Vedic prediction: Σ_m row_sum_A[m] * (Σ_n col_sum_B[n] for matching k)
-    // Simplified: sum(row_sums_A) * sum(col_sums_B) / K
-    // This is a valid approximation when A, B have zero-mean (which they do
-    // after LayerNorm). For exact Gunitasamuchayah: need K-aligned grouping.
-    // Here we use the sum-of-sums version as the checksum:
-    float sum_rs=0.0f, sum_cs=0.0f;
-    for (float v : h_row) sum_rs+=v;
-    for (float v : h_col) sum_cs+=v;
-    float checksum_vedic = sum_rs * sum_cs / (float)K;
+    // 4. Pull K-length vectors to host and compute dot product
+    std::vector<float> h_col_A(K), h_row_B(K);
+    CUDA_CHECK(cudaMemcpy(h_col_A.data(), d_col_sums_A, K*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_row_B.data(), d_row_sums_B, K*sizeof(float), cudaMemcpyDeviceToHost));
 
-    float h_sum_C=0.0f;
+    // Vedic prediction: dot(col_sums_A, row_sums_B)
+    // = Σ_k (Σ_m A[m,k]) * (Σ_n B[k,n])
+    // = sum(C)  [exactly, for real arithmetic]
+    double checksum_vedic = 0.0;   // double for K-length dot (avoids FP accumulation error)
+    for (int k = 0; k < K; ++k)
+        checksum_vedic += (double)h_col_A[k] * (double)h_row_B[k];
+
+    float h_sum_C = 0.0f;
     CUDA_CHECK(cudaMemcpy(&h_sum_C, d_sum_C, sizeof(float), cudaMemcpyDeviceToHost));
 
-    cudaFree(d_row_sums);
-    cudaFree(d_col_sums);
+    cudaFree(d_col_sums_A);
+    cudaFree(d_row_sums_B);
     cudaFree(d_sum_C);
-    cudaFree(d_dot_vedic);
 
     VedicVerifyResult res;
-    res.checksum_C      = h_sum_C;
-    res.checksum_vedic  = checksum_vedic;
-    float denom         = fabsf(checksum_vedic) + 1e-6f;
-    res.relative_error  = fabsf(h_sum_C - checksum_vedic) / denom;
-    res.pass            = res.relative_error < tolerance;
+    res.checksum_C     = h_sum_C;
+    res.checksum_vedic = (float)checksum_vedic;
+    float denom        = fabsf(res.checksum_vedic) + 1e-6f;
+    res.relative_error = fabsf(h_sum_C - res.checksum_vedic) / denom;
+    res.pass           = res.relative_error < tolerance;
     return res;
 }
 

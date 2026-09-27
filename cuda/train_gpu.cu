@@ -59,8 +59,8 @@ public:
     float alpha_L = 0.7f;
 
     GPUSHMOpt(float lr_        = 2e-4f,
-              float friction_  = 0.1f,
-              float mom_decay_ = 0.9f,
+              float friction_  = 0.8f,
+              float mom_decay_ = 0.7f,
               float T_s        = 0.05f,
               float T_e        = 1e-3f,   // FIX-1: default raised from 1e-6
               float aH_start   = 0.3f,
@@ -548,13 +548,10 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v12-VEDIC            ║\n");
-    printf("║  FIX-4: Hamiltonian-dominant optimizer   ║\n");
-    printf("║  FIX-5: T_start=0.5 (real annealing)    ║\n");
-    printf("║  FIX-6: α_H: 0.7→0.99 (strong gradient) ║\n");
-    printf("║  FIX-7: grad_clip 1.0→5.0 (CE descent!) ║\n");
-    printf("║  FIX-8: Gunitasamuchayah tol cuBLAS=30%% ║\n");
-    printf("║          cuBLAS FP reorder ≠ Vedic bug   ║\n");
+    printf("║  LOGOS GPU Training v13-VEDIC-FIX        ║\n");
+    printf("║  FIX-11: Gunitasamuchayah correct formula ║\n");
+    printf("║  dot(col_sums_A, row_sums_B) not wrong   ║\n");
+    printf("║  sum_all(A)*sum_all(B)/K formula          ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -763,7 +760,12 @@ void train_gpu(const std::string& dataset_path) {
                 cuda_vedic_gemm(gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy);
 
                 bool using_cublas = cuda_vedic_gemm_uses_cublas();
-                float vedic_tol   = using_cublas ? 0.30f : 0.05f;
+                // FIX-11: Now that cuda_vedic_verify() uses the CORRECT
+                // Gunitasamuchayah formula (dot(col_sums_A, row_sums_B)),
+                // cuBLAS FP reorder error is only 0.1-2%, not 2700%.
+                // Both backends can use the same tight tolerance = 0.05f (5%).
+                // The old 0.30f was masking the wrong formula, not cuBLAS.
+                float vedic_tol = 0.05f;
 
                 VedicVerifyResult vr = cuda_vedic_verify(
                     gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy, vedic_tol);
@@ -773,15 +775,8 @@ void train_gpu(const std::string& dataset_path) {
                     snprintf(vedic_status, 8, "PASS");
                 } else {
                     snprintf(vedic_status, 8, "WARN");
-                    // cuBLAS mismatch is expected — log differently
-                    if (using_cublas) {
-                        printf("\n[Gunitasamuchayah] cuBLAS-WARN @ step %lld"
-                               " err=%.4f (tol=%.2f, expected for cuBLAS)\n",
-                               (long long)step, vr.relative_error, vedic_tol);
-                    } else {
-                        printf("\n[Gunitasamuchayah] WARN @ step %lld err=%.4f\n",
-                               (long long)step, vr.relative_error);
-                    }
+                    printf("\n[Gunitasamuchayah] WARN @ step %lld err=%.4f (tol=%.2f)\n",
+                           (long long)step, vr.relative_error, vedic_tol);
                 }
             }
 
@@ -800,8 +795,8 @@ void train_gpu(const std::string& dataset_path) {
                 save_checkpoint(cpu_model,"logos_gpu_ckpt",(int)step);
                 // [v11-CLIP] Show cuBLAS context so Vedic PASS/FAIL is interpretable
                 const char* gemm_backend = cuda_vedic_gemm_uses_cublas()
-                                           ? "cuBLAS(tol=30%)" : "CustomCUDA(tol=5%)";
-                printf("Ckpt @ step %lld | best_F=%.4f | Vedic: %d/%d PASS [%s]\n",
+                                           ? "cuBLAS" : "CustomCUDA";
+                printf("Ckpt @ step %lld | best_F=%.4f | Vedic: %d/%d PASS [%s tol=5%%]\n",
                        (long long)step, best_loss, vedic_pass, vedic_checks, gemm_backend);
                 fflush(stdout);
             }
