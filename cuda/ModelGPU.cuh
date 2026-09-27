@@ -114,6 +114,10 @@ __global__ void nikhilam_dequantize_kernel(const int8_t* src, float* dst,
 // Compute per-tensor absmax (for scale computation)
 __global__ void absmax_kernel(const float* data, float* out, int size);
 
+// Host helper: decompress NikhilamTensor → float32 GPUTensor
+// (used in inference / checkpoint export; defined in ModelGPU.cu)
+GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols);
+
 // ── GPU Model class ───────────────────────────────────────────
 class ModelGPU {
 public:

@@ -406,7 +406,9 @@ static NikhilamTensor nikhilam_compress(const GPUTensor& src)
 }
 
 // Decompress NikhilamTensor → new float32 GPUTensor
-static GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols)
+// NOTE: forward pass uses float32 K/V directly for backward consistency;
+// this helper is retained for inference / checkpoint export.
+GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols)
 {
     GPUTensor out = gpu_alloc(rows, cols);
     int blks=(src.size+255)/256;

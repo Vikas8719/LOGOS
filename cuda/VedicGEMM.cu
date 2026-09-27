@@ -662,13 +662,14 @@ void cuda_vedic_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C) {
 
 void cuda_vedic_gemm_bias(const GPUTensor& A, const GPUTensor& W,
                            const GPUTensor& bias, GPUTensor& C) {
-    int M=A.rows, K=A.cols, N=W.cols;
+    int M=A.rows, N=W.cols;
 #if LOGOS_USE_CUBLAS
     cuda_vedic_gemm(A, W, C);
     int size = M * N;
     add_bias_kernel<<<(size + 255) / 256, 256>>>(C.data, bias.data, M, N);
     CUDA_KERNEL_CHECK();
 #else
+    int K=A.cols;
     dim3 block(TILE_SIZE,TILE_SIZE);
     dim3 grid((N+TILE_SIZE-1)/TILE_SIZE,(M+TILE_SIZE-1)/TILE_SIZE);
     vedic_gemm_bias_kernel<<<grid,block>>>(A.data,W.data,bias.data,C.data,M,K,N);

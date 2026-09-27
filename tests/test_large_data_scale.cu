@@ -916,13 +916,6 @@ static void test_lds_gpu_large_vocab() {
     cfg.num_layers  = 2;
     cfg.max_seq_len = 64;
 
-    bool ok = false;
-    size_t free_before = 0;
-    {
-        size_t total;
-        cudaMemGetInfo(&free_before, &total);
-    }
-
     try {
         ModelGPU model(cfg);
         LOGOSModel cpu_model(cfg);
@@ -941,7 +934,7 @@ static void test_lds_gpu_large_vocab() {
         bool finite = true;
         for (float v : h) if (!std::isfinite(v)) { finite = false; break; }
 
-        ok = finite && (logits.rows == 32) && (logits.cols == 8192);
+        bool ok = finite && (logits.rows == 32) && (logits.cols == 8192);
         std::cout << "    Shape: " << logits.rows << "×" << logits.cols << "\n";
         std::cout << "    Finite: " << (finite ? "YES" : "NO") << "\n";
 
