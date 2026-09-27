@@ -643,25 +643,35 @@ static void test_lds10_multishard() {
         return;
     }
 
-    // Build 100 DataShard objects (each covers 5KB of the file)
+    // Build 100 DataShard objects
+    // Use equal-split so bytes sum exactly to FILE_SIZE:
+    //   first (FILE_SIZE % N_SHARDS) shards get one extra byte each.
     const int N_SHARDS = 100;
     std::vector<DataShard> shards;
     shards.reserve(N_SHARDS);
-    int64_t shard_size = FILE_SIZE / N_SHARDS;
+    int64_t base_size  = FILE_SIZE / N_SHARDS;          // 5242 bytes
+    int64_t remainder  = FILE_SIZE % N_SHARDS;          // leftover bytes
+    int64_t current_offset = 0;
 
     for (int i = 0; i < N_SHARDS; ++i) {
         DataShard s;
         s.file_path   = path;
-        s.byte_offset = i * shard_size;
-        s.byte_length = shard_size;
+        s.byte_offset = current_offset;
+        s.byte_length = base_size + (i < remainder ? 1 : 0);
         shards.push_back(s);
+        current_offset += s.byte_length;
     }
 
-    // Verify struct fields
+    // Verify struct fields — recompute expected offsets using the same
+    // remainder-aware split logic used during construction.
     bool offsets_ok = true;
-    for (int i = 0; i < N_SHARDS; ++i) {
-        if (shards[i].byte_offset != (int64_t)i * shard_size) {
-            offsets_ok = false; break;
+    {
+        int64_t expected_offset = 0;
+        for (int i = 0; i < N_SHARDS; ++i) {
+            if (shards[i].byte_offset != expected_offset) {
+                offsets_ok = false; break;
+            }
+            expected_offset += base_size + (i < remainder ? 1 : 0);
         }
     }
 
@@ -683,8 +693,11 @@ static void test_lds10_multishard() {
     TEST("Multi-shard: offsets are int64_t, correct",  offsets_ok);
     TEST("Multi-shard: total_shard_bytes correct",     total_shard_bytes == FILE_SIZE);
     TEST("Multi-shard: simulated 1TB fits in int64_t", simulated_total > 0);
+    // int32 cannot represent values > INT32_MAX (2,147,483,647).
+    // 100 × 10 GB = 1,073,741,824,000 >> INT32_MAX — safely check via cast comparison.
+    // Using signed-overflow UB is avoided: we compare via int64_t arithmetic.
     TEST("Multi-shard: int32 overflow confirmed for 1TB",
-         (int)(simulated_total) < 0);   // int overflow = negative = expected
+         simulated_total > (int64_t)INT_MAX);   // 1TB total exceeds int32 range
 
     std::filesystem::remove(path);
 }
