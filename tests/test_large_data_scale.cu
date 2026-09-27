@@ -136,17 +136,22 @@ static void test_lds1_int64_counters() {
     int64_t est_tokens  = (int64_t)((double)TB_BYTES * TPB);
     int64_t est_batches = est_tokens / SEQ;
 
-    // int overflow check: if this were int, it would be negative
-    int int_overflow = (int)est_batches;  // intentionally truncated
+    // int overflow check: use volatile to prevent compiler from optimizing away UB
+    // Standard C++ says signed overflow is UB, so we cast via memcpy/union trick
+    volatile int64_t tmp = est_batches;
+    int int_overflow = (int)(tmp & 0xFFFFFFFFLL);  // low 32 bits — safe cast
 
     std::cout << "    1TB tokens (est): " << est_tokens / 1000000000LL << "B\n";
     std::cout << "    1TB batches (est): " << est_batches / 1000000000LL << "B\n";
-    std::cout << "    int32 overflow: " << (int_overflow < 0 ? "YES (confirmed)" : "no") << "\n";
+    // int_overflow will be non-zero but may not be negative on all platforms;
+    // what matters is that int64 holds the value correctly
+    std::cout << "    int32 truncated low-32: " << int_overflow << "\n";
     std::cout << "    int64 safe: " << (est_batches > 0 ? "YES" : "no") << "\n";
 
     TEST("int64_t: 1TB step count > 0 (no overflow)",     est_batches > 0);
     TEST("int64_t: 1TB step count > INT_MAX",              est_batches > (int64_t)INT_MAX);
-    TEST("int32:   1TB step count overflows (expected)",   int_overflow < 0);
+    // Test that int32 CANNOT hold this value (truncation changes it)
+    TEST("int32:   1TB step count overflows (expected)",   (int64_t)(int)est_batches != est_batches);
     TEST("total_tokens_seen: int64_t holds 1TB tokens",    est_tokens > 0);
 
     // Simulate a counter running to 1B steps without overflow

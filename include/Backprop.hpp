@@ -291,20 +291,18 @@ inline Tensor softmax_backward_2d(const Tensor& A,   // (seq, seq) softmax outpu
 
 inline Tensor attention_head_backward(
     AttentionHead& head,
-    const Tensor& X,      // (seq, d_model) — block input to this head
-    const Tensor& dY,     // (seq, d_model) — upstream gradient
+    const Tensor& X,        // (seq, d_model) — block input to this head
+    const Tensor& dO,       // (seq, d_k)     — upstream grad w.r.t. head output O
     Tensor& dW_Q, Tensor& dW_K, Tensor& dW_V, Tensor& dW_O)
 {
-    float inv_sqrt_dk = 1.0f / std::sqrt((float)head.d_k);
+    float temperature = std::sqrt((float)head.d_k);
     int   seq         = X.rows();
 
     // ── Recompute forward intermediates ──────────────────────
-    // (same computation as AttentionHead::forward — needed for grads)
     Tensor Q = vedic_gemm(X, head.W_Q);  // (seq, d_k)
     Tensor K = vedic_gemm(X, head.W_K);  // (seq, d_k)
     Tensor V = vedic_gemm(X, head.W_V);  // (seq, d_k)
 
-    // Select mask (same logic as forward)
     Tensor mask;
     if (head.use_sparse && seq > head.sparse_window)
         mask = shunyam_sparse_mask_cached(seq, head.sparse_window, head.sparse_stride);
@@ -312,69 +310,63 @@ inline Tensor attention_head_backward(
         mask = causal_mask_cached(seq);
 
     Tensor K_T = K.transpose();
-    Tensor S   = vedic_gemm(Q, K_T);        // (seq, seq) — raw scores
+    Tensor S   = vedic_gemm(Q, K_T);
     S += mask;
-    float temperature = std::sqrt((float)head.d_k);
     Tensor A   = boltzmann_softmax(S, temperature);  // (seq, seq)
     Tensor O   = vedic_gemm(A, V);                   // (seq, d_k)
 
-    // ── Backward through W_O ──────────────────────────────────
-    // dO = dY @ W_O^T
-    Tensor W_O_T = head.W_O.transpose();
-    Tensor dO    = vedic_gemm(dY, W_O_T);        // (seq, d_k)
+    // ── dO is (seq, d_k) — grad w.r.t. this head's output O ──
+    // dW_O += O^T @ dO  [but W_O is {d_k, d_model} so this must be (d_k,d_model)]
+    // NOTE: W_O maps head output → d_model. So forward is: attn_out += O @ W_O
+    // But in block_backward we already split via W_proj. Here W_O per head is
+    // (d_k, d_model) and we receive dO as (seq, d_k) meaning d_model downstream
+    // was already handled. So we skip W_O here and handle it via W_proj.
+    // dA = dO @ V^T  where V is (seq, d_k), so dA: (seq, d_k) @ (d_k, seq) = (seq, seq) ✅
+    Tensor V_T = V.transpose();                       // (d_k, seq)
+    Tensor dA  = vedic_gemm(dO, V_T);                // (seq, seq) ✅
 
-    // dW_O += O^T @ dY
-    Tensor O_T   = O.transpose();
-    Tensor dW_O_c = vedic_gemm(O_T, dY);         // (d_k, d_model)
-    for (int i = 0; i < dW_O.total_size; ++i) dW_O.data[i] += dW_O_c.data[i];
-
-    // ── Backward through attn weights ─────────────────────────
-    // dA = dO @ V^T
-    Tensor V_T = V.transpose();
-    Tensor dA  = vedic_gemm(dO, V_T);            // (seq, seq)
-
-    // dV = A^T @ dO
-    Tensor A_T  = A.transpose();
-    Tensor dV   = vedic_gemm(A_T, dO);           // (seq, d_k)
+    // dV = A^T @ dO  : (seq,seq)^T @ (seq,d_k) = (seq, d_k) ✅
+    Tensor A_T = A.transpose();                       // (seq, seq)
+    Tensor dV  = vedic_gemm(A_T, dO);                // (seq, d_k) ✅
 
     // ── Backward through softmax ──────────────────────────────
-    // dS = softmax_backward(A, dA)   (scaled by 1/sqrt(d_k) like forward)
-    Tensor dS_raw = softmax_backward_2d(A, dA);  // (seq, seq)
-    // Scale: dS = dS_raw / temperature (since S was divided by temperature in forward)
+    Tensor dS_raw = softmax_backward_2d(A, dA);      // (seq, seq)
     for (int i = 0; i < dS_raw.total_size; ++i)
         dS_raw.data[i] /= temperature;
 
-    // ── Backward through QK^T ─────────────────────────────────
-    // dQ = dS @ K
-    // dK = dS^T @ Q
-    Tensor dQ  = vedic_gemm(dS_raw, K);          // (seq, d_k)
+    // dQ = dS @ K  : (seq,seq) @ (seq,d_k) = (seq, d_k) ✅
+    Tensor dQ   = vedic_gemm(dS_raw, K);             // (seq, d_k)
+    // dK = dS^T @ Q : (seq,seq) @ (seq,d_k) = (seq, d_k) ✅
     Tensor dS_T = dS_raw.transpose();
-    Tensor dK  = vedic_gemm(dS_T, Q);            // (seq, d_k)
+    Tensor dK   = vedic_gemm(dS_T, Q);               // (seq, d_k)
 
-    // ── dW_Q, dW_K, dW_V ─────────────────────────────────────
-    Tensor X_T = X.transpose();
-    Tensor dW_Q_c = vedic_gemm(X_T, dQ);
+    // ── dW_Q, dW_K, dW_V : X^T @ d* = (d_model, seq) @ (seq, d_k) = (d_model, d_k) ✅
+    Tensor X_T    = X.transpose();                    // (d_model, seq)
+    Tensor dW_Q_c = vedic_gemm(X_T, dQ);             // (d_model, d_k) ✅
+    Tensor dW_K_c = vedic_gemm(X_T, dK);             // (d_model, d_k) ✅
+    Tensor dW_V_c = vedic_gemm(X_T, dV);             // (d_model, d_k) ✅
+
     for (int i = 0; i < dW_Q.total_size; ++i) dW_Q.data[i] += dW_Q_c.data[i];
-
-    Tensor dW_K_c = vedic_gemm(X_T, dK);
     for (int i = 0; i < dW_K.total_size; ++i) dW_K.data[i] += dW_K_c.data[i];
-
-    Tensor dW_V_c = vedic_gemm(X_T, dV);
     for (int i = 0; i < dW_V.total_size; ++i) dW_V.data[i] += dW_V_c.data[i];
 
-    // ── dX from this head = dQ@W_Q^T + dK@W_K^T + dV@W_V^T ──
-    Tensor W_Q_T = head.W_Q.transpose();
-    Tensor W_K_T = head.W_K.transpose();
-    Tensor W_V_T = head.W_V.transpose();
+    // dW_O not used per-head (handled by W_proj in block_backward)
+    (void)dW_O;
 
-    Tensor dX_head = vedic_gemm(dQ, W_Q_T);
-    Tensor dK_inp  = vedic_gemm(dK, W_K_T);
-    Tensor dV_inp  = vedic_gemm(dV, W_V_T);
+    // ── dX_head = dQ@W_Q^T + dK@W_K^T + dV@W_V^T ────────────
+    // Each term: (seq, d_k) @ (d_k, d_model) = (seq, d_model) ✅
+    Tensor W_Q_T   = head.W_Q.transpose();            // (d_k, d_model)
+    Tensor W_K_T   = head.W_K.transpose();
+    Tensor W_V_T   = head.W_V.transpose();
+
+    Tensor dX_head = vedic_gemm(dQ, W_Q_T);          // (seq, d_model) ✅
+    Tensor dK_inp  = vedic_gemm(dK, W_K_T);          // (seq, d_model) ✅
+    Tensor dV_inp  = vedic_gemm(dV, W_V_T);          // (seq, d_model) ✅
 
     for (int i = 0; i < dX_head.total_size; ++i)
         dX_head.data[i] += dK_inp.data[i] + dV_inp.data[i];
 
-    return dX_head;  // (seq, d_model)
+    return dX_head;  // (seq, d_model) ✅
 }
 
 // ── 8. Full TransformerBlock backward ────────────────────────
