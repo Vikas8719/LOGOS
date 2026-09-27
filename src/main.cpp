@@ -555,29 +555,19 @@ void run_training(const std::string& dataset_path) {
             clip_gradients(gptrs, 1.0f);
 
             // Step 2: [v10 NEW] Āṇurūpyeṇa proportional gradient scaling
-            // Applied AFTER clip, BEFORE Riemannian preconditioning.
-            // This ensures different param groups (emb/attn/FFN/LN) have
-            // proportionally normalized gradient magnitudes.
+            // Applied AFTER clip, BEFORE optimizer.
+            // Normalizes per-tensor gradient RMS to target_rms=1.0
             anurup_scaler.scale_gradients(gptrs);
 
-            // Step 3: Riemannian (Fisher diagonal) preconditioning
-            riem.update_from_params(gptrs);
-            {
-                int offset = 0;
-                for (auto* g : gptrs) {
-                    *g = riem.riemannian_gradient_at(*g, offset);
-                    offset += g->total_size;
-                }
-            }
+            // Step 3: Path-integral adaptive LR
+            // lr_min_frac=0.5: learning rate 50% se neeche nahi girega
+            opt.learning_rate = BASE_LR * path_integral.lr_scale(0.5f);
 
-            // Step 4: Path-integral adaptive LR
-            opt.learning_rate = BASE_LR * path_integral.lr_scale();
-
-            // Step 5: Optimizer step
+            // Step 4: Optimizer step
             auto snap_before = WeightPathIntegral::snapshot(params);
             opt.step(params, gptrs);
 
-            // Step 6: Record path integral with FreeEnergy loss
+            // Step 5: Record path integral with FreeEnergy loss
             path_integral.record_step_from_tensors(loss, params, snap_before);
 
             smooth = smooth < 0 ? loss : 0.95f*smooth + 0.05f*loss;

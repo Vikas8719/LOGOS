@@ -3,6 +3,7 @@
 //  [P1-C] leapfrog_langevin_kernel — REPLACED by shm_hybrid_kernel
 //  [NEW]  shm_hybrid_kernel — Hamiltonian + Langevin fused kernel
 // ============================================================
+#pragma once
 #include <cuda_runtime.h>
 #include <vector>
 #include <stdexcept>

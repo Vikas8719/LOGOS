@@ -485,7 +485,7 @@ struct WeightPathIntegral {
         float log_amplitude; // log A after this step (cumulative)
     };
     std::vector<PathStep> history;
-    float   best_log_amplitude = -1e30f;  // track peak amplitude
+    float   best_log_amplitude = 0.0f;   // track peak amplitude (init to starting value)
     int     best_step = 0;
 
     explicit WeightPathIntegral(float hbar_ = 1.0f, int hist = 1000)
