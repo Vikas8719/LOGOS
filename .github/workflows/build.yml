@@ -1,4 +1,4 @@
-name: LOGOS CI v10
+name: LOGOS CI v12
 
 permissions:
   contents: read
@@ -450,17 +450,55 @@ jobs:
           USERNAME_LOWER=$(echo "$KAGGLE_USERNAME" | tr '[:upper:]' '[:lower:]')
           KERNEL_ID="${USERNAME_LOWER}/logos-gpu-training-v3"
 
+          # ── FIX: Kaggle GPU notebooks sit in QUEUED for 5-15 min ──────────
+          # Previous: 10 × 30s = 5 min total — nearly always still QUEUED.
+          # Root cause: Kaggle queues GPU kernels based on cluster load.
+          #   A fresh push takes 5-20 min to reach RUNNING, sometimes longer.
+          # Fix: Poll up to 20 times × 60s = 20 min max.
+          #   Exit early on RUNNING/COMPLETE/ERROR — don't wait full 20 min.
+          #   A final QUEUED after 20 min is still a successful trigger (async).
+          # ─────────────────────────────────────────────────────────────────────
+          MAX_POLLS=20
+          SLEEP_SEC=60
+
           echo "Polling kernel status for $KERNEL_ID ..."
-          for i in $(seq 1 10); do
-            sleep 30
-            STATUS=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null || echo "unknown")
-            echo "[$i/10] Status: $STATUS"
-            if echo "$STATUS" | grep -qi "running\|complete\|error"; then
+          echo "(max ${MAX_POLLS} polls × ${SLEEP_SEC}s = $((MAX_POLLS * SLEEP_SEC / 60)) min)"
+          FINAL_STATUS="unknown"
+
+          for i in $(seq 1 $MAX_POLLS); do
+            sleep $SLEEP_SEC
+            RAW=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null || echo "unknown")
+            STATUS_UPPER=$(echo "$RAW" | tr '[:lower:]' '[:upper:]')
+            echo "[$i/$MAX_POLLS] Status: $RAW"
+            FINAL_STATUS="$RAW"
+
+            # Exit early the moment training actually starts or finishes
+            if echo "$STATUS_UPPER" | grep -qE "RUNNING|COMPLETE|ERROR|CANCEL"; then
+              echo "✅ Kernel left queue — exiting poll loop early"
               break
             fi
           done
-          echo "Kaggle notebook triggered. Full GPU training runs asynchronously on Kaggle."
-          echo "Results: https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  Kaggle GPU notebook trigger complete"
+          echo "  Final status : $FINAL_STATUS"
+          if echo "$FINAL_STATUS" | grep -qi "QUEUED"; then
+            echo "  ℹ️  Still QUEUED — this is NORMAL for Kaggle GPU."
+            echo "  Kaggle P100/T4 slots fill up; notebook will run when"
+            echo "  a GPU becomes available (usually within 30-60 min)."
+            echo "  CI exits SUCCESS — training is asynchronous."
+          elif echo "$FINAL_STATUS" | grep -qi "RUNNING"; then
+            echo "  🚀 Kernel is RUNNING — GPU training in progress!"
+          elif echo "$FINAL_STATUS" | grep -qi "COMPLETE"; then
+            echo "  ✅ Kernel COMPLETE — check output for results"
+          elif echo "$FINAL_STATUS" | grep -qi "ERROR"; then
+            echo "  ❌ Kernel ERROR — check Kaggle notebook for details"
+          fi
+          echo "  Results: https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
+          echo "════════════════════════════════════════════"
+          # Never exit non-zero here — QUEUED is not a CI failure.
+          # The notebook runs async on Kaggle; CI's job is only to trigger it.
 
   summary:
     name: "CI Summary"
@@ -495,6 +533,7 @@ jobs:
           echo "  Training E2E + T4:    $R5  (production smoke)"
           echo "  Windows Build:        $R6"
           echo "  macOS Build:          $R7"
+          echo "  Kaggle GPU Trigger:   async (QUEUED=normal, see Kaggle)"
           echo "================================================="
           echo "  T4 Coverage:"
           echo "    ✦ int64_t counter overflow (1TB = >INT_MAX steps)"
