@@ -534,10 +534,11 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v10-HAM              ║\n");
+    printf("║  LOGOS GPU Training v11-CLIP             ║\n");
     printf("║  FIX-4: Hamiltonian-dominant optimizer   ║\n");
     printf("║  FIX-5: T_start=0.5 (real annealing)    ║\n");
     printf("║  FIX-6: α_H: 0.7→0.99 (strong gradient) ║\n");
+    printf("║  FIX-7: grad_clip 1.0→5.0 (CE descent!) ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -595,6 +596,7 @@ void train_gpu(const std::string& dataset_path) {
     printf("  ✦ FIX-4: α_H: 0.7→0.99 (Hamiltonian dominant throughout)\n");
     printf("  ✦ FIX-5: T_start=0.5 → T_end=1e-3 (real cosine annealing)\n");
     printf("  ✦ FIX-6: friction=0.1 mom=0.95 (strong momentum build-up)\n");
+    printf("  ✦ FIX-7: grad_clip=5.0 (was 1.0, GNorm~60 so 60x cut was killing descent)\n");
     printf("  ✦ Loss: Free Energy F = CE - T·S (thermodynamic)\n\n");
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
@@ -719,7 +721,9 @@ void train_gpu(const std::string& dataset_path) {
                 CUDA_KERNEL_CHECK();
             }
 
-            float grad_norm=cuda_clip_gradients(gpu_grads,1.0f);
+            // FIX-7: GNorm 50-70 par clip=1.0 bahut aggressive tha (50x cut!)
+            // max_norm=5.0 → effective gradient ~10x zyada → CE descent shuru hoga
+            float grad_norm=cuda_clip_gradients(gpu_grads,5.0f);
             optimizer.update(gpu_params,gpu_grads);
 
             if (step % 1000 == 0 && step > 0) {
@@ -767,7 +771,7 @@ void train_gpu(const std::string& dataset_path) {
     save_checkpoint(cpu_model,"logos_final",(int)step);
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v10-HAM)             ║\n");
+    printf("║  Training Complete! (v11-CLIP)            ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
     printf("╚══════════════════════════════════════════╝\n");
