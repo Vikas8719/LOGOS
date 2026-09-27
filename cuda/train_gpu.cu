@@ -613,10 +613,10 @@ void train_gpu(const std::string& dataset_path) {
 
     // FIX-1: T_end raised to 1e-3 (was 1e-6)
     GPUSHMOpt optimizer(lr_init,
-                        /*friction=*/0.1f,
+                        /*friction=*/0.25f,
                         /*mom_decay=*/0.9f,
-                        /*T_start=*/0.05f,
-                        /*T_end=*/1e-3f,    // FIX-1
+                        /*T_start=*/1e-5f,
+                        /*T_end=*/1e-8f,    // FIX-1
                         /*aH_start=*/0.3f,
                         /*aH_end=*/0.9f,
                         total_steps);

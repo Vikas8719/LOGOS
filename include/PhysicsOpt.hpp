@@ -83,7 +83,7 @@ public:
     std::normal_distribution<float> noise_dist{0.0f, 1.0f};
 
     LangevinOptimizer(float lr=1e-4f, float fric=0.9f,
-                      float T_start=0.05f, float T_end=1e-3f,
+                      float T_start=1e-5f, float T_end=1e-8f,
                       int steps=100000, int seed=42)
         : learning_rate(lr), friction(fric),
           temperature(T_start), temp_start(T_start),
