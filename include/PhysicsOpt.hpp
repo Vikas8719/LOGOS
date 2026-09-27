@@ -27,6 +27,7 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <cstdint>
 
 // ── FIX-1 constant: minimum temperature floor ─────────────────
 // T below this causes F=CE-T*S to lose entropy regularization.
