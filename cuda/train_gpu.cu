@@ -77,7 +77,7 @@ public:
         float c = 0.5f * (1.0f + cosf(3.14159265f * r));
 
         // FIX-1: fmaxf ensures T stays >= GPU_T_MIN_FLOOR
-        temperature = fmaxf(GPU_T_MIN_FLOOR, T_End + (T_Start - T_End) * c);
+        temperature = fmaxf(GPU_T_MIN_FLOOR, T_end + (T_start - T_end) * c);
 
         alpha_H = alpha_H_start + (alpha_H_end - alpha_H_start) * (1.0f - c);
         alpha_L = 1.0f - alpha_H;

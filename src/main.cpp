@@ -471,10 +471,16 @@ void run_training(const std::string& dataset_path) {
     const float BASE_LR = LR;
 
     // [v10 NEW] Āṇurūpyeṇa proportional gradient scaler
-    // Target RMS = 1.0; min/max clamp prevent extreme rescaling.
-    // EMA beta = 0.99 for smooth tracking of per-tensor grad magnitude.
+    // FIX (research pass): target_rms was hard-coded to 1.0f here, which
+    // silently re-introduced the pre-FIX-2 bug (see AnurupyenaScaler.hpp
+    // header comment). Real transformer grad RMS after clip_gradients(1.0)
+    // is ~1e-3..1e-2, so target=1.0 forces scale=target/rms to saturate at
+    // max_scale=10x on almost every step (confirmed in logs: grad_rms stays
+    // ~0.003-0.02 the whole run) — the "proportional" scaler degenerates
+    // into a constant 10x multiplier, defeating its own purpose and fighting
+    // the shock-wave clip. Use the documented safe default (0.01) instead.
     AnurupyenaScaler anurup_scaler(
-        /*target_rms=*/1.0f,
+        /*target_rms=*/0.01f,
         /*epsilon=*/1e-8f,
         /*min_scale=*/0.01f,
         /*max_scale=*/10.0f,
@@ -579,15 +585,41 @@ void run_training(const std::string& dataset_path) {
                           << " | F(loss): " << loss
                           << " | CE: "      << loss_ce
                           << " | Smooth: "  << smooth
+                          // FIX (research pass): log the SAME lr_min_frac=0.5
+                          // used to actually scale the LR a few lines above.
+                          // The old code printed lr_scale() with its default
+                          // arg (0.1), a different number than what was
+                          // really applied — cosmetic bug that made the
+                          // console log lie about the true learning rate.
                           << " | T: "       << opt.temperature
                           << " | aH: "      << opt.alpha_H
-                          << " | lr_x: "    << path_integral.lr_scale() << "\n";
+                          << " | lr_x: "    << path_integral.lr_scale(0.5f) << "\n";
                 std::cout.flush();
             }
             if (step % 500 == 0) {
                 riem.log_state();
                 path_integral.log_state();
                 anurup_scaler.log_state(step);  // [v10] Āṇurūpyeṇa diagnostic
+            }
+            // FIX (research pass): WeightPathIntegral.log_amplitude is an
+            // UNBOUNDED cumulative sum of -action every step (action =
+            // loss*||delta_theta|| >= 0), so it only ever decreases and
+            // best_log_amplitude is (with FIX-3's -1e30 init) essentially
+            // always set at step 0 and never beaten again. That makes
+            // relative_amplitude() = exp(log_A - best_log_A) decay to 0
+            // within a few thousand steps no matter how training is going
+            // (this is exactly what the logs showed: rel_A 1.000 -> 0.130 ->
+            // 0.032 -> ... -> 0.000, permanently, from step ~500 onward) —
+            // after that the "physics-adaptive" LR is just pinned at the
+            // lr_min_frac floor for the rest of the run and stops adapting.
+            // reset_best() (already written in PhysicsOpt.hpp, but never
+            // called anywhere) restarts the baseline periodically so the
+            // amplitude signal can keep reflecting *recent* trajectory
+            // instead of decaying against a baseline from the start of
+            // training. Calling it here is a minimal fix; a more complete
+            // fix would replace the cumulative sum with an EMA of action.
+            if (step > 0 && step % 2000 == 0) {
+                path_integral.reset_best();
             }
             if (step > 0 && step % 500 == 0) {
                 save_checkpoint(model, "logos_ckpt", step);
