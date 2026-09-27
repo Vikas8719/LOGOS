@@ -534,10 +534,10 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v9-fix               ║\n");
-    printf("║  FIX-1: T_floor=1e-3 (no entropy death)  ║\n");
-    printf("║  FIX-2: Anurupyena target=0.01 max=10x   ║\n");
-    printf("║  FIX-3: PathIntegral best=-inf init       ║\n");
+    printf("║  LOGOS GPU Training v10-HAM              ║\n");
+    printf("║  FIX-4: Hamiltonian-dominant optimizer   ║\n");
+    printf("║  FIX-5: T_start=0.5 (real annealing)    ║\n");
+    printf("║  FIX-6: α_H: 0.7→0.99 (strong gradient) ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -591,9 +591,10 @@ void train_gpu(const std::string& dataset_path) {
            cfg.d_model,cfg.num_layers,cfg.num_heads,cfg.d_model/cfg.num_heads,
            cfg.max_seq_len,cfg.vocab_size,grad_accum);
 
-    printf("\n[v9-fix Hybrid SHM Optimizer]\n");
-    printf("  ✦ FIX-1: T_floor=1e-3 enforced (entropy reg always ON)\n");
-    printf("  ✦ Hamiltonian: α_H: 0.3→0.9 | Langevin: α_L: 0.7→0.1\n");
+    printf("\n[v10-HAM Hamiltonian-Dominant SHM Optimizer]\n");
+    printf("  ✦ FIX-4: α_H: 0.7→0.99 (Hamiltonian dominant throughout)\n");
+    printf("  ✦ FIX-5: T_start=0.5 → T_end=1e-3 (real cosine annealing)\n");
+    printf("  ✦ FIX-6: friction=0.1 mom=0.95 (strong momentum build-up)\n");
     printf("  ✦ Loss: Free Energy F = CE - T·S (thermodynamic)\n\n");
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
@@ -611,14 +612,20 @@ void train_gpu(const std::string& dataset_path) {
     int64_t total_steps=EPOCHS*(batches_per_epoch/grad_accum);
     float   lr_init=(cfg.d_model>=256)?1e-4f:2e-4f;
 
-    // FIX-1: T_end raised to 1e-3 (was 1e-6)
+    // FIX-4/5/6: Hamiltonian-dominant mode
+    // T_start=0.5  → real annealing hoga (1e-5 se floor pe hi stuck tha)
+    // T_end=1e-3   → entropy floor preserved (FIX-1 bhi intact)
+    // aH_start=0.7 → Hamiltonian dominant from step 0 (gradient direction strong)
+    // aH_end=0.99  → near-pure Hamiltonian at end (deterministic convergence)
+    // friction=0.1 → kam friction = momentum build up kare
+    // mom_decay=0.95 → stronger momentum retention
     GPUSHMOpt optimizer(lr_init,
-                        /*friction=*/0.25f,
-                        /*mom_decay=*/0.9f,
-                        /*T_start=*/1e-5f,
-                        /*T_end=*/1e-8f,    // FIX-1
-                        /*aH_start=*/0.3f,
-                        /*aH_end=*/0.9f,
+                        /*friction=*/0.1f,
+                        /*mom_decay=*/0.95f,
+                        /*T_start=*/0.5f,
+                        /*T_end=*/1e-3f,
+                        /*aH_start=*/0.7f,
+                        /*aH_end=*/0.99f,
                         total_steps);
     auto gpu_params=gpu_model.all_parameters();
     optimizer.init(gpu_params);
@@ -760,7 +767,7 @@ void train_gpu(const std::string& dataset_path) {
     save_checkpoint(cpu_model,"logos_final",(int)step);
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v9-fix)              ║\n");
+    printf("║  Training Complete! (v10-HAM)             ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
     printf("╚══════════════════════════════════════════╝\n");

@@ -158,9 +158,11 @@ public:
     std::mt19937 rng;
     std::normal_distribution<float> noise_dist{0.0f, 1.0f};
 
-    HybridSHMOptimizer(float lr=1e-4f, float fric=0.1f, float mom_d=0.9f,
-                       float T_start=0.05f, float T_end=1e-3f,
-                       float aH_start=0.3f, float aH_end=0.9f,
+    // v10-HAM: Hamiltonian-dominant defaults
+    // T_start=0.5 (real annealing), aH_start=0.7 (gradient-strong from start)
+    HybridSHMOptimizer(float lr=1e-4f, float fric=0.1f, float mom_d=0.95f,
+                       float T_start=0.5f, float T_end=1e-3f,
+                       float aH_start=0.7f, float aH_end=0.99f,
                        int steps=100000, int seed=42)
         : learning_rate(lr), friction(fric), mom_decay(mom_d),
           temperature(T_start), temp_start(T_start),

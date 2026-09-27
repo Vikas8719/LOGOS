@@ -452,9 +452,12 @@ __global__ void free_energy_loss_kernel(
 //     W_{t+1} = W_t + lr · v_{t+½}           [full position step]
 //
 //  Annealing (done on host, passed as alpha_H/alpha_L):
-//     Step 0%:   α_H=0.3, α_L=0.7  → Explore (Langevin dominant)
-//     Step 50%:  α_H=0.6, α_L=0.4  → Balanced
-//     Step 100%: α_H=0.9, α_L=0.1  → Exploit (Hamiltonian dominant)
+//  [v10-HAM: Hamiltonian-dominant throughout]
+//     Step 0%:   α_H=0.7, α_L=0.3  → Hamiltonian-dominant (strong gradient)
+//     Step 50%:  α_H=0.85, α_L=0.15 → Near-pure Hamiltonian
+//     Step 100%: α_H=0.99, α_L=0.01 → Almost pure symplectic (deterministic)
+//  Reason: Loss 9.3+ plateau = model not following gradient, Langevin noise
+//          was dominating and preventing descent. Hamiltonian mode fixes this.
 //
 //  Memory: IDENTICAL to leapfrog_langevin_kernel (one velocity buffer)
 //  Compute: +2 FLOPs vs leapfrog (alpha_H, alpha_L multiplications)
