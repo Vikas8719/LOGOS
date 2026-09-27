@@ -62,7 +62,7 @@
 #include "Model.hpp"
 #include "Checkpoint.hpp"
 #include "DataLoader.hpp"
-#include "StreamingDataLoader.hpp"
+#include "StreamingDataLoader.hpp"  // UnifiedDataLoader — must be before Evaluate.hpp
 #include "Evaluate.hpp"
 #include "Backprop.hpp"          // [v10] Full analytical backprop
 #include "AnurupyenaScaler.hpp"  // [v10] Āṇurūpyeṇa Vedic gradient scaler
@@ -610,8 +610,7 @@ void run_training(const std::string& dataset_path) {
     std::cout << "========== Training Done ==========\n";
     save_checkpoint(model, "logos_final", step);
 
-    // BUG 9 FIX: loader reuse
-    loader.current_pos = 0;
+    // evaluate() — overloaded for UnifiedDataLoader (Evaluate.hpp v5)
     auto r = evaluate(model, loader, 50);
     print_eval(r, step);
 

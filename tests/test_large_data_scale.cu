@@ -31,6 +31,7 @@
 #include "../include/Tokenizer.hpp"
 #include "../include/Model.hpp"
 #include "../include/Checkpoint.hpp"
+#include "../include/PhysicsOpt.hpp"      // HybridSHMOptimizer (LDS11)
 
 #ifdef __CUDACC__
 #include "../cuda/VedicGEMM.cuh"
