@@ -642,12 +642,26 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             cuda_vedic_gemm(cache.normed1,blk.W_V[h],hc.V);
 
             // [P2-B] Nikhilam: compress K → K_int8, V → V_int8
-            // float32 K/V kept above for backward; int8 for forward attention
+            // Still computed + cached for stats/checkpoint compatibility,
+            // but NOT used in the attention math below (see FIX note).
             hc.K_int8 = nikhilam_compress(hc.K);
             hc.V_int8 = nikhilam_compress(hc.V);
 
-            // Decompress K_int8 → K_q for attention score computation
-            GPUTensor K_q = nikhilam_decompress(hc.K_int8, seq, DH);
+            // FIX (research pass): attention used to run on the DEQUANTIZED
+            // K_q/V_q here, while run_backward() in train_gpu.cu computes
+            // dV/dK/dQ/d_attn_probs from the float32 hc.K/hc.V — a real
+            // mismatch between what forward actually computed and what
+            // backward assumes it computed (the code comment claiming
+            // "zero regression" was incorrect: forward's real output used
+            // the lossy INT8-roundtrip K/V, so every gradient below was for
+            // a computation graph that never actually ran). That mismatch,
+            // repeated every head/layer/step, is consistent with the model
+            // never learning (CE and entropy staying flat for 6000+ steps).
+            // Use the exact float32 K/V here so forward and backward agree;
+            // INT8 K_int8/V_int8 stay available for inference-time savings.
+            GPUTensor K_q = gpu_alloc(seq, DH);
+            CUDA_CHECK(cudaMemcpy(K_q.data, hc.K.data,
+                       seq*DH*sizeof(float), cudaMemcpyDeviceToDevice));
 
             // scores = Q @ K_q^T
             GPUTensor K_T=gpu_alloc(DH,seq);
@@ -669,8 +683,12 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             hc.attn_probs=gpu_alloc(seq,seq);
             cuda_boltzmann_softmax(scores,hc.attn_probs,seq,seq,sqrtf((float)DH));
 
-            // Decompress V_int8 → V_q for context vector computation
-            GPUTensor V_q = nikhilam_decompress(hc.V_int8, seq, DH);
+            // FIX: same reasoning as K_q above — use exact float32 V so the
+            // context vector matches what run_backward()'s dV/d_attn_probs
+            // kernels assume.
+            GPUTensor V_q = gpu_alloc(seq, DH);
+            CUDA_CHECK(cudaMemcpy(V_q.data, hc.V.data,
+                       seq*DH*sizeof(float), cudaMemcpyDeviceToDevice));
 
             hc.head_out=gpu_alloc(seq,DH);
             cuda_vedic_gemm(hc.attn_probs,V_q,hc.head_out);
