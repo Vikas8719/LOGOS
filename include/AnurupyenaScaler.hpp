@@ -1,44 +1,25 @@
 #pragma once
 // ============================================================
 //  LOGOS — AnurupyenaScaler.hpp
-//  Vedic Sutra: Āṇurūpyeṇa (अणुरूप्येण)
-//  "Proportionality / In Proportion To"
+//  Vedic Sutra: Āṇurūpyeṇa (अणुरूप्येण) — "In Proportion To"
 //
-//  Meaning:
-//    "By suitable / by the proportion" — when a scaling factor is
-//    needed, choose one proportional to the magnitude of the quantity
-//    being scaled, rather than a fixed constant.
+//  FIX-2: Stable default parameters
+//    Pehle: target_rms=1.0, max_scale=100
+//      → grad_rms = 0.0028 → scale = 1.0/0.0028 = 357x → explosion
+//    Ab:    target_rms=0.01, max_scale=10
+//      → grad_rms = 0.0028 → scale = 0.01/0.0028 = 3.6x → stable
+//      → At most 10x boost, which is safe with clip_gradients(1.0)
 //
-//  Application to Gradient Scaling:
-//    Standard gradient descent: θ -= lr * g
-//    Problem: different parameter groups (embedding, attention, FFN,
-//    layer-norm) have wildly different gradient magnitudes. A single
-//    lr clips or under-updates different groups disproportionately.
+//  Why target_rms=0.01?
+//    Real transformer gradient RMS is typically 1e-3 to 1e-2.
+//    Setting target at 0.01 keeps gradients in their natural range
+//    while equalizing across param groups. This prevents:
+//      1. Embedding grads (naturally tiny) being over-boosted
+//      2. LM-head grads (naturally large) being over-shrunk
 //
-//    Āṇurūpyeṇa fix:
-//      scale_i = (target_rms) / (rms(g_i) + ε)
-//      g̃_i    = g_i * scale_i   [proportional rescaling]
-//    where target_rms is a global reference RMS (default = 1.0).
-//
-//    This is different from:
-//      • Adam/RMSProp:  per-element second moment → over-adaptive
-//      • Gradient clip: hard cap, not proportional rescaling
-//      • NaturalGrad:   Fisher metric (more expensive)
-//
-//    Āṇurūpyeṇa is PER-TENSOR proportional:
-//      each weight tensor's gradient is scaled so its RMS matches
-//      target_rms. Tensors that are already at target_rms are
-//      unchanged. Over-large gradients are shrunk, tiny ones are
-//      boosted — all proportionally.
-//
-//  Implementation note:
-//    Applied AFTER clip_gradients() and BEFORE the optimizer step.
-//    Works with any optimizer (SHM, Langevin, NaturalGrad).
-//    Maintains the gradient DIRECTION; only magnitude changes.
-//    Safe to combine with RiemannianMetric (apply Anurupyena first).
-//
-//  Reference: Vedic Mathematics (Tirthaji, 1965), Sutra 13
-//             "Sopaantyadvayamantyam" family — proportional methods
+//  max_scale=10 is the safety net:
+//    Even if a layer has grad_rms=0.001, scale = 0.01/0.001 = 10x max.
+//    This keeps the optimizer step bounded to clip_gradients budget.
 // ============================================================
 #include "Tensor.hpp"
 #include <cmath>
@@ -48,37 +29,26 @@
 
 class AnurupyenaScaler {
 public:
-    float target_rms;   // reference RMS all tensors are scaled to
-    float epsilon;      // numerical safety (avoid div-by-zero)
-    float min_scale;    // minimum scale factor (prevent explosion on tiny grads)
-    float max_scale;    // maximum scale factor (prevent explosion on large grads)
-    bool  enabled;      // can be toggled per-run
-
-    // EMA tracking of actual grad RMS per tensor (for diagnostics)
+    float target_rms;   // FIX-2: was 1.0 → now 0.01
+    float epsilon;
+    float min_scale;
+    float max_scale;    // FIX-2: was 100.0 → now 10.0
+    bool  enabled;
     float ema_beta;
-    std::vector<float> rms_ema;   // one per param tensor
+    std::vector<float> rms_ema;
     bool  ema_init = false;
 
-    AnurupyenaScaler(float target    = 1.0f,
-                     float eps       = 1e-8f,
-                     float min_s     = 0.01f,
-                     float max_s     = 100.0f,
-                     float ema_b     = 0.99f,
-                     bool  on        = true)
+    AnurupyenaScaler(float target  = 0.01f,   // FIX-2: realistic default
+                     float eps     = 1e-8f,
+                     float min_s   = 0.01f,
+                     float max_s   = 10.0f,   // FIX-2: tighter clamp
+                     float ema_b   = 0.99f,
+                     bool  on      = true)
         : target_rms(target), epsilon(eps),
           min_scale(min_s), max_scale(max_s),
           enabled(on), ema_beta(ema_b)
     {}
 
-    // ── scale_gradients ──────────────────────────────────────
-    // Apply Āṇurūpyeṇa proportional rescaling to a list of gradient tensors.
-    // Modifies grads in-place.
-    //
-    // For each gradient tensor g_i:
-    //   rms_i    = sqrt( mean(g_i^2) )         [per-tensor RMS]
-    //   scale_i  = target_rms / (rms_i + eps)  [proportional factor]
-    //   scale_i  = clamp(scale_i, min_s, max_s) [safety]
-    //   g̃_i = g_i * scale_i                    [in-place rescale]
     void scale_gradients(std::vector<Tensor*>& grads) {
         if (!enabled) return;
 
@@ -89,47 +59,44 @@ public:
         if (rms_ema.size() != grads.size())
             rms_ema.resize(grads.size(), target_rms);
 
-        for (int gi = 0; gi < (int)grads.size(); ++gi) {
+        for (int gi=0; gi<(int)grads.size(); ++gi) {
             Tensor* g = grads[gi];
-            if (!g || g->total_size == 0) continue;
+            if (!g || g->total_size==0) continue;
 
-            // ── Compute per-tensor RMS ────────────────────────
             float sum_sq = 0.0f;
-            for (int i = 0; i < g->total_size; ++i)
+            for (int i=0; i<g->total_size; ++i)
                 sum_sq += g->data[i] * g->data[i];
-            float rms = std::sqrt(sum_sq / (float)(g->total_size) + epsilon);
+            float rms = std::sqrt(sum_sq / (float)g->total_size + epsilon);
 
-            // EMA tracking
-            rms_ema[gi] = ema_beta * rms_ema[gi] + (1.0f - ema_beta) * rms;
+            rms_ema[gi] = ema_beta * rms_ema[gi] + (1.0f-ema_beta) * rms;
 
-            // ── Proportional scale (Āṇurūpyeṇa) ─────────────
-            // If rms < ε: tensor is essentially zero, skip to avoid
-            // division producing infinity that pollutes the optimizer.
+            // Skip near-zero tensors to avoid div-by-zero boost
             if (rms < epsilon * 10.0f) continue;
 
+            // FIX-2: scale = target / rms, clamped to [min_s, max_s=10]
+            // With target=0.01 and typical rms=0.003: scale=3.3x (safe)
+            // With target=0.01 and large rms=0.1:    scale=0.1x (shrinks, safe)
             float scale = target_rms / rms;
             scale = std::max(min_scale, std::min(max_scale, scale));
 
-            // ── Rescale in-place ──────────────────────────────
-            for (int i = 0; i < g->total_size; ++i)
+            for (int i=0; i<g->total_size; ++i)
                 g->data[i] *= scale;
         }
     }
 
-    // ── Diagnostic log ───────────────────────────────────────
-    void log_state(int step = -1) const {
+    void log_state(int step=-1) const {
         if (!ema_init) { std::cout << "AnurupyenaScaler: not yet applied\n"; return; }
-        float min_r = 1e30f, max_r = 0.0f, mean_r = 0.0f;
+        float min_r=1e30f, max_r=0.0f, mean_r=0.0f;
         for (float r : rms_ema) {
             min_r  = std::min(min_r, r);
             max_r  = std::max(max_r, r);
             mean_r += r;
         }
         if (!rms_ema.empty()) mean_r /= (float)rms_ema.size();
-        std::cout << "AnurupyenaScaler [Vedic proportional grad scale]"
-                  << (step >= 0 ? " | step=" + std::to_string(step) : "")
-                  << " | target_rms=" << std::fixed << std::setprecision(4) << target_rms
-                  << " | grad_rms(min=" << min_r
+        std::cout << "AnurupyenaScaler [FIX-2 | target=" << target_rms
+                  << " max_scale=" << max_scale << "]"
+                  << (step>=0 ? " | step="+std::to_string(step) : "")
+                  << " | grad_rms(min=" << std::fixed << std::setprecision(5) << min_r
                   << " mean=" << mean_r
                   << " max=" << max_r << ")\n";
     }

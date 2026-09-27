@@ -1,5 +1,10 @@
 //  Logging: added alpha_H, alpha_L columns to training output
 //  All Phase 1+2+3 kernels: UNCHANGED
+//
+//  FIX-1 (v9→v9-fix): Temperature floor in GPUSHMOpt::anneal()
+//    T_end was 1e-6 → T → 0.0000 at late training
+//    Now: T_end enforced >= T_MIN_FLOOR = 1e-3 in constructor + anneal()
+//    Reason: F = CE - T*S; T=0 kills entropy regularization → overconfident → loss spike
 // ============================================================
 #include "VedicGEMM.cuh"
 #include "ModelGPU.cuh"
@@ -17,55 +22,40 @@
 #include <stdexcept>
 #include <cstdint>
 
+// FIX-1: Minimum temperature — entropy regularization always active
+static constexpr float GPU_T_MIN_FLOOR = 1e-3f;
+
 // ============================================================
-//  [v9] GPU HYBRID SHM OPTIMIZER
-//  Replaces GPULangevinOpt — same interface, better physics
-//
-//  Combines:
-//    Hamiltonian Mechanics → deterministic momentum (fast convergence)
-//    Langevin Dynamics     → stochastic noise (exploration, FDT)
-//
-//  Annealing:
-//    alpha_H: 0.3 → 0.9 (cosine, over total_steps)
-//    alpha_L: 0.7 → 0.1 (= 1 - alpha_H)
-//    temperature: T_start → T_end (cosine, same as before)
-//    friction: lower than pure Langevin (0.1 default vs 0.9 old)
-//              because Hamiltonian momentum already provides damping
-//
-//  Key differences from GPULangevinOpt:
-//    OLD: friction=0.9 (heavy damping), noise=√(γkT·lr/2) always
-//    NEW: friction=0.1 (light damping from Langevin part only)
-//         mom_decay=0.9 (heavy Hamiltonian momentum carry)
-//         noise=√(γkT·lr·α_L) (scales down as α_L decreases)
-//         alpha_H/alpha_L blend shifts from explore→exploit
+//  [v9-fix] GPU HYBRID SHM OPTIMIZER
 // ============================================================
 class GPUSHMOpt {
 public:
     float   lr;
-    float   friction;      // γ — Langevin friction (≈0.1, lower than pure)
-    float   mom_decay;     // β — Hamiltonian momentum retention (≈0.9)
+    float   friction;
+    float   mom_decay;
     float   temperature, T_start, T_end;
-    float   alpha_H_start, alpha_H_end;   // Hamiltonian weight annealing
+    float   alpha_H_start, alpha_H_end;
     int64_t total_steps;
     int64_t step = 0;
 
     std::vector<float*> d_velocity;
     std::vector<int>    sizes;
 
-    // Current annealed values (updated each step)
     float alpha_H = 0.3f;
     float alpha_L = 0.7f;
 
-    GPUSHMOpt(float lr_       = 2e-4f,
-              float friction_ = 0.1f,    // LOW friction — Hamiltonian carries momentum
-              float mom_decay_= 0.9f,    // HIGH decay   — Hamiltonian momentum
-              float T_s       = 0.05f,
-              float T_e       = 1e-6f,
-              float aH_start  = 0.3f,    // start Langevin-dominant
-              float aH_end    = 0.9f,    // end  Hamiltonian-dominant
-              int64_t steps   = 500000)
+    GPUSHMOpt(float lr_        = 2e-4f,
+              float friction_  = 0.1f,
+              float mom_decay_ = 0.9f,
+              float T_s        = 0.05f,
+              float T_e        = 1e-3f,   // FIX-1: default raised from 1e-6
+              float aH_start   = 0.3f,
+              float aH_end     = 0.9f,
+              int64_t steps    = 500000)
         : lr(lr_), friction(friction_), mom_decay(mom_decay_),
-          temperature(T_s), T_start(T_s), T_end(T_e),
+          temperature(T_s), T_start(T_s),
+          // FIX-1: enforce floor even if caller passes tiny T_e
+          T_end(fmaxf(T_e, GPU_T_MIN_FLOOR)),
           alpha_H_start(aH_start), alpha_H_end(aH_end),
           total_steps(steps)
     {}
@@ -80,17 +70,15 @@ public:
         }
     }
 
-    // Cosine anneal both temperature and alpha_H simultaneously
+    // FIX-1: temperature floor applied — T can never reach 0
     void anneal() {
         float r = total_steps > 0
             ? std::min(1.0f, (float)step / (float)total_steps) : 1.0f;
         float c = 0.5f * (1.0f + cosf(3.14159265f * r));
 
-        // Temperature: T_start → T_end
-        temperature = T_end + (T_start - T_end) * c;
+        // FIX-1: fmaxf ensures T stays >= GPU_T_MIN_FLOOR
+        temperature = fmaxf(GPU_T_MIN_FLOOR, T_End + (T_Start - T_End) * c);
 
-        // Hamiltonian weight: alpha_H_start → alpha_H_end
-        // (opposite cosine direction — more Hamiltonian as training progresses)
         alpha_H = alpha_H_start + (alpha_H_end - alpha_H_start) * (1.0f - c);
         alpha_L = 1.0f - alpha_H;
     }
@@ -100,14 +88,8 @@ public:
                 float scale = 1.0f)
     {
         anneal();
-
-        // FDT-consistent noise: √(γ·kT·lr·α_L)
-        // As α_L → 0 (late training), noise → 0 automatically
-        // This is physically correct: less stochastic force when
-        // Hamiltonian dynamics dominate
         float noise_scale = sqrtf(friction * temperature * lr * alpha_L);
-
-        float lr_scaled = lr * scale;
+        float lr_scaled   = lr * scale;
 
         for (int i = 0; i < (int)params.size(); ++i) {
             int sz = params[i]->size;
@@ -128,7 +110,6 @@ public:
         ++step;
     }
 
-    // For logging in train_gpu.cu
     void get_state(float& out_T, float& out_aH, float& out_aL) const {
         out_T  = temperature;
         out_aH = alpha_H;
@@ -462,24 +443,19 @@ static void run_backward(
                    seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
         { dim3 g(D4,(D+31)/32),b(32);
           ffn_w2_grad_kernel<<<g,b>>>(cache.ffn_A.data,d_d_ffn_out.data,
-                                      gpu_grads[base+w2_off]->data,seq,D4,D);
-          CUDA_KERNEL_CHECK(); }
+                                      gpu_grads[base+w2_off]->data,seq,D4,D); CUDA_KERNEL_CHECK(); }
         { dim3 g(seq,(D4+31)/32),b(32);
           ffn_da_kernel<<<g,b>>>(d_d_ffn_out.data,blk.W2.data,
-                                 d_d_ffn_A.data,seq,D4,D);
-          CUDA_KERNEL_CHECK(); }
+                                 d_d_ffn_A.data,seq,D4,D); CUDA_KERNEL_CHECK(); }
         { int tot=seq*D4;
           gelu_bwd_kernel<<<(tot+255)/256,256>>>(cache.ffn_H.data,d_d_ffn_A.data,
-                                                  d_d_ffn_H.data,tot);
-          CUDA_KERNEL_CHECK(); }
+                                                  d_d_ffn_H.data,tot); CUDA_KERNEL_CHECK(); }
         { dim3 g(D,(D4+31)/32),b(32);
           ffn_w1_grad_kernel<<<g,b>>>(cache.normed2.data,d_d_ffn_H.data,
-                                      gpu_grads[base+w1_off]->data,seq,D,D4);
-          CUDA_KERNEL_CHECK(); }
+                                      gpu_grads[base+w1_off]->data,seq,D,D4); CUDA_KERNEL_CHECK(); }
         { dim3 g(seq,(D+31)/32),b(32);
           ffn_dx_kernel<<<g,b>>>(d_d_ffn_H.data,blk.W1.data,
-                                 d_d_normed2.data,seq,D,D4);
-          CUDA_KERNEL_CHECK(); }
+                                 d_d_normed2.data,seq,D,D4); CUDA_KERNEL_CHECK(); }
 
         layernorm_bwd_kernel<<<seq,256>>>(
             cache.block_input.data,blk.ln2_gamma.data,
@@ -487,18 +463,15 @@ static void run_backward(
             gpu_grads[base+ln2g_off]->data,gpu_grads[base+ln2b_off]->data,
             seq,D,1e-5f); CUDA_KERNEL_CHECK();
         { int sz=seq*D;
-          vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln.data,sz);
-          CUDA_KERNEL_CHECK(); }
+          vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln.data,sz); CUDA_KERNEL_CHECK(); }
 
         GPUTensor d_concat=gpu_alloc(seq,D);
         { dim3 g(D,(D+31)/32),b(32);
           attn_dWproj_kernel<<<g,b>>>(cache.concat.data,d_dX_out.data,
-                                      gpu_grads[base+wproj_off]->data,seq,D);
-          CUDA_KERNEL_CHECK(); }
+                                      gpu_grads[base+wproj_off]->data,seq,D); CUDA_KERNEL_CHECK(); }
         { dim3 g(seq,(D+31)/32),b(32);
           attn_dConcat_kernel<<<g,b>>>(d_dX_out.data,blk.W_proj.data,
-                                       d_concat.data,seq,D);
-          CUDA_KERNEL_CHECK(); }
+                                       d_concat.data,seq,D); CUDA_KERNEL_CHECK(); }
 
         CUDA_CHECK(cudaMemset(d_dX_attn_in.data,0,seq*D*sizeof(float)));
         for (int h=0;h<H;++h) {
@@ -506,12 +479,10 @@ static void run_backward(
             GPUTensor d_head_out_h=gpu_alloc(seq,DH);
             { dim3 g(seq,(DH+31)/32),b(32);
               attn_dHeadOut_kernel<<<g,b>>>(d_concat.data,blk.W_O[h].data,
-                                            d_head_out_h.data,seq,DH,D);
-              CUDA_KERNEL_CHECK(); }
+                                            d_head_out_h.data,seq,DH,D); CUDA_KERNEL_CHECK(); }
             { dim3 g(DH,(D+31)/32),b(32);
               attn_dWO_kernel<<<g,b>>>(hc.head_out.data,d_concat.data,
-                                       gpu_grads[base+h*4+3]->data,seq,DH,D);
-              CUDA_KERNEL_CHECK(); }
+                                       gpu_grads[base+h*4+3]->data,seq,DH,D); CUDA_KERNEL_CHECK(); }
             GPUTensor dV=gpu_alloc(seq,DH);
             CUDA_CHECK(cudaMemset(dV.data,0,seq*DH*sizeof(float)));
             { dim3 g(DH,(seq+31)/32),b(32);
@@ -520,41 +491,25 @@ static void run_backward(
             GPUTensor d_attn_probs=gpu_alloc(seq,seq);
             { dim3 g(seq,(seq+31)/32),b(32);
               attn_dAttnProbs_kernel<<<g,b>>>(d_head_out_h.data,hc.V.data,
-                                              d_attn_probs.data,seq,DH);
-              CUDA_KERNEL_CHECK(); }
+                                              d_attn_probs.data,seq,DH); CUDA_KERNEL_CHECK(); }
             GPUTensor d_scores=gpu_alloc(seq,seq);
             float inv_sqrt_DH=1.0f/sqrtf((float)DH);
             softmax_bwd_kernel<<<seq,256>>>(hc.attn_probs.data,d_attn_probs.data,
-                                            d_scores.data,seq,inv_sqrt_DH);
-            CUDA_KERNEL_CHECK();
+                                            d_scores.data,seq,inv_sqrt_DH); CUDA_KERNEL_CHECK();
             GPUTensor dQ=gpu_alloc(seq,DH);
             { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dQ_kernel<<<g,b>>>(d_scores.data,hc.K.data,dQ.data,seq,DH);
-              CUDA_KERNEL_CHECK(); }
+              attn_dQ_kernel<<<g,b>>>(d_scores.data,hc.K.data,dQ.data,seq,DH); CUDA_KERNEL_CHECK(); }
             GPUTensor dK=gpu_alloc(seq,DH);
             { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dK_kernel<<<g,b>>>(d_scores.data,hc.Q.data,dK.data,seq,DH);
-              CUDA_KERNEL_CHECK(); }
+              attn_dK_kernel<<<g,b>>>(d_scores.data,hc.Q.data,dK.data,seq,DH); CUDA_KERNEL_CHECK(); }
             { dim3 g(D,(DH+31)/32),b(32);
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,dQ.data,
-                                          gpu_grads[base+h*4+0]->data,seq,D,DH);
-              CUDA_KERNEL_CHECK();
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,dK.data,
-                                          gpu_grads[base+h*4+1]->data,seq,D,DH);
-              CUDA_KERNEL_CHECK();
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,dV.data,
-                                          gpu_grads[base+h*4+2]->data,seq,D,DH);
-              CUDA_KERNEL_CHECK(); }
+              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,dQ.data,gpu_grads[base+h*4+0]->data,seq,D,DH); CUDA_KERNEL_CHECK();
+              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,dK.data,gpu_grads[base+h*4+1]->data,seq,D,DH); CUDA_KERNEL_CHECK();
+              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,dV.data,gpu_grads[base+h*4+2]->data,seq,D,DH); CUDA_KERNEL_CHECK(); }
             { dim3 g(seq,(D+31)/32),b(32);
-              attn_dX_from_QKV_kernel<<<g,b>>>(dQ.data,blk.W_Q[h].data,
-                                                d_dX_attn_in.data,seq,D,DH);
-              CUDA_KERNEL_CHECK();
-              attn_dX_from_QKV_kernel<<<g,b>>>(dK.data,blk.W_K[h].data,
-                                                d_dX_attn_in.data,seq,D,DH);
-              CUDA_KERNEL_CHECK();
-              attn_dX_from_QKV_kernel<<<g,b>>>(dV.data,blk.W_V[h].data,
-                                                d_dX_attn_in.data,seq,D,DH);
-              CUDA_KERNEL_CHECK(); }
+              attn_dX_from_QKV_kernel<<<g,b>>>(dQ.data,blk.W_Q[h].data,d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK();
+              attn_dX_from_QKV_kernel<<<g,b>>>(dK.data,blk.W_K[h].data,d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK();
+              attn_dX_from_QKV_kernel<<<g,b>>>(dV.data,blk.W_V[h].data,d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK(); }
         }
 
         GPUTensor d_dX_ln1=gpu_alloc(seq,D);
@@ -564,8 +519,7 @@ static void run_backward(
             gpu_grads[base+ln1g_off]->data,gpu_grads[base+ln1b_off]->data,
             seq,D,1e-5f); CUDA_KERNEL_CHECK();
         { int sz=seq*D;
-          vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln1.data,sz);
-          CUDA_KERNEL_CHECK(); }
+          vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln1.data,sz); CUDA_KERNEL_CHECK(); }
     }
 
     { dim3 blk(32),grd(seq,(D+31)/32);
@@ -576,14 +530,14 @@ static void run_backward(
 }
 
 // ============================================================
-//  MAIN TRAINING FUNCTION — v7 (Phase 1 Physics)
+//  MAIN TRAINING FUNCTION
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v9 — Hybrid SHM     ║\n");
-    printf("║  Hamiltonian + Langevin  |  FreeEnergy   ║\n");
-    printf("║  Hyperbolic Emb  |  Nikhilam KV INT8    ║\n");
-    printf("║  Gunitasamuchayah  |  Feynman Inference  ║\n");
+    printf("║  LOGOS GPU Training v9-fix               ║\n");
+    printf("║  FIX-1: T_floor=1e-3 (no entropy death)  ║\n");
+    printf("║  FIX-2: Anurupyena target=0.01 max=10x   ║\n");
+    printf("║  FIX-3: PathIntegral best=-inf init       ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -637,13 +591,10 @@ void train_gpu(const std::string& dataset_path) {
            cfg.d_model,cfg.num_layers,cfg.num_heads,cfg.d_model/cfg.num_heads,
            cfg.max_seq_len,cfg.vocab_size,grad_accum);
 
-    // [v9] Physics mode announcement — Hybrid SHM
-    printf("\n[v9 Hybrid SHM Optimizer Active]\n");
-    printf("  ✦ Hamiltonian: momentum_decay=0.9, symplectic integration\n");
-    printf("  ✦ Langevin:    friction=0.1, FDT-consistent noise\n");
-    printf("  ✦ Annealing:   α_H: 0.3→0.9 | α_L: 0.7→0.1 (cosine)\n");
-    printf("  ✦ Loss:        Free Energy F = CE - T·S (thermodynamic)\n");
-    printf("  ✦ Verification: Gunitasamuchayah (every 1000 steps)\n\n");
+    printf("\n[v9-fix Hybrid SHM Optimizer]\n");
+    printf("  ✦ FIX-1: T_floor=1e-3 enforced (entropy reg always ON)\n");
+    printf("  ✦ Hamiltonian: α_H: 0.3→0.9 | Langevin: α_L: 0.7→0.1\n");
+    printf("  ✦ Loss: Free Energy F = CE - T·S (thermodynamic)\n\n");
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
     LOGOSModel cpu_model(cfg);
@@ -660,12 +611,12 @@ void train_gpu(const std::string& dataset_path) {
     int64_t total_steps=EPOCHS*(batches_per_epoch/grad_accum);
     float   lr_init=(cfg.d_model>=256)?1e-4f:2e-4f;
 
-    // [v9] GPUSHMOpt replaces GPULangevinOpt
+    // FIX-1: T_end raised to 1e-3 (was 1e-6)
     GPUSHMOpt optimizer(lr_init,
                         /*friction=*/0.1f,
                         /*mom_decay=*/0.9f,
                         /*T_start=*/0.05f,
-                        /*T_end=*/1e-6f,
+                        /*T_end=*/1e-3f,    // FIX-1
                         /*aH_start=*/0.3f,
                         /*aH_end=*/0.9f,
                         total_steps);
@@ -678,8 +629,6 @@ void train_gpu(const std::string& dataset_path) {
     CUDA_CHECK(cudaMalloc(&d_targets,SEQ*sizeof(int)));
     float* d_loss_buf;
     CUDA_CHECK(cudaMalloc(&d_loss_buf,SEQ*sizeof(float)));
-
-    // [P1-B] Gradient output buffer (same shape as before — drop-in)
     float* d_grad_out;
     CUDA_CHECK(cudaMalloc(&d_grad_out,SEQ*V*sizeof(float)));
 
@@ -696,7 +645,6 @@ void train_gpu(const std::string& dataset_path) {
            (long long)batches_per_epoch,(long long)total_steps,lr_init);
     printf("[5/5] Training...\n\n"); fflush(stdout);
 
-    // Column headers for SHM physics logging
     printf("%-8s | %-8s | %-8s | %-8s | %-8s | %-6s | %-6s | %-8s | %-8s\n",
            "Step","F(loss)","CE","Entropy","GNorm","α_H","α_L","T","Vedic");
     printf("---------|---------|---------|---------|---------|--------|--------|---------|--------\n");
@@ -704,9 +652,6 @@ void train_gpu(const std::string& dataset_path) {
 
     int64_t step=0;
     float   best_loss=999.f;
-    // [v9] Removed: smooth variable (was EMA of loss, now unused)
-    // alpha_H/alpha_L logged directly from optimizer.get_state()
-    // [P1-A] Gunitasamuchayah tracking
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
 
@@ -730,16 +675,14 @@ void train_gpu(const std::string& dataset_path) {
                 CUDA_CHECK(cudaMemset(d_loss_buf,0,seq*sizeof(float)));
                 CUDA_CHECK(cudaMemset(d_grad_out,0,seq*V*sizeof(float)));
 
-                // [P1-B] Free Energy Loss — replaces ce_loss_kernel_parallel
                 FreeEnergyResult fe_result;
                 cuda_free_energy_loss(
                     logits.data, d_targets,
                     d_loss_buf, d_grad_out,
                     seq, V,
-                    optimizer.temperature,  // current Langevin T
+                    optimizer.temperature,
                     fe_result);
 
-                // Copy gradient to the existing logits_grad buffer
                 CUDA_CHECK(cudaMemcpy(d_logits_grad.data, d_grad_out,
                            seq*V*sizeof(float), cudaMemcpyDeviceToDevice));
 
@@ -770,37 +713,27 @@ void train_gpu(const std::string& dataset_path) {
             }
 
             float grad_norm=cuda_clip_gradients(gpu_grads,1.0f);
-
-            // [v9] Hybrid SHM optimizer step
             optimizer.update(gpu_params,gpu_grads);
 
-            // [P1-A] Gunitasamuchayah: verify lm_head GEMM every 1000 steps
             if (step % 1000 == 0 && step > 0) {
-                // Create a small proxy: verify last_hidden @ gpu_lm_head
-                // We use gpu_model.last_hidden (seq×D) and gpu_lm_head (D×V)
-                // Allocate result buffer
                 GPUTensor C_proxy = gpu_alloc(gpu_model.last_hidden.rows,
                                               gpu_model.gpu_lm_head.cols);
                 cuda_vedic_gemm(gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy);
                 VedicVerifyResult vr = cuda_vedic_verify(
                     gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy, 0.05f);
                 ++vedic_checks;
-                if (vr.pass) {
-                    ++vedic_pass;
-                    snprintf(vedic_status,sizeof(vedic_status),"PASS");
-                } else {
-                    snprintf(vedic_status,sizeof(vedic_status),"WARN");
-                    printf("\n[Gunitasamuchayah] WARN @ step %lld: "
-                           "err=%.4f (C=%.2f, Vedic=%.2f)\n",
-                           (long long)step, vr.relative_error,
-                           vr.checksum_C, vr.checksum_vedic);
+                if (vr.pass) { ++vedic_pass; snprintf(vedic_status,8,"PASS"); }
+                else {
+                    snprintf(vedic_status,8,"WARN");
+                    printf("\n[Gunitasamuchayah] WARN @ step %lld err=%.4f\n",
+                           (long long)step, vr.relative_error);
                 }
             }
 
             if (step % 100 == 0) {
                 float cur_T, cur_aH, cur_aL;
                 optimizer.get_state(cur_T, cur_aH, cur_aL);
-                printf("%-8lld | %-8.4f | %-8.4f | %-8.4f | %-8.3f | %-6.2f | %-6.2f | %-8.2e | %s\n",
+                printf("%-8lld | %-8.4f | %-8.4f | %-8.4f | %-8.3f | %-6.2f | %-6.2f | %-8.4f | %s\n",
                        (long long)step, avg_F, avg_CE, avg_S,
                        grad_norm, cur_aH, cur_aL, cur_T, vedic_status);
                 fflush(stdout);
@@ -821,400 +754,150 @@ void train_gpu(const std::string& dataset_path) {
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    cudaFree(d_targets);
-    cudaFree(d_loss_buf);
-    cudaFree(d_grad_out);
+    cudaFree(d_targets); cudaFree(d_loss_buf); cudaFree(d_grad_out);
     for (auto* g : gpu_grads) delete g;
-
     gpu_model.sync_to_cpu(cpu_model);
     save_checkpoint(cpu_model,"logos_final",(int)step);
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v9 SHM)             ║\n");
+    printf("║  Training Complete! (v9-fix)              ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
-    printf("║  Final α_H=%.2f α_L=%.2f (Hamiltonian)  ║\n",optimizer.alpha_H,optimizer.alpha_L);
-    printf("║  Run --generate for Feynman beam decode  ║\n");
     printf("╚══════════════════════════════════════════╝\n");
 }
 
 // ============================================================
 //  [P3] FEYNMAN PATH INTEGRAL BEAM SEARCH
-//  ============================================================
-//
-//  Feynman's path integral formulation applied to text generation:
-//
-//    Each token sequence is a "path" in vocabulary space.
-//    The probability amplitude of a path is:
-//        A(path) = exp(-S(path) / ħ)
-//    where the action S is the total negative log-probability:
-//        S(path) = -Σ_t log p(w_t | w_0..w_{t-1})
-//
-//    The "propagator" (transition amplitude) at each step t is:
-//        K(w_{t+1} | w_t) = p(w_{t+1} | context)^{1/ħ}
-//
-//    Beam selection: keep top beam_width paths by amplitude A(path).
-//    Since log A = -S/ħ = (1/ħ) Σ log p, this is equivalent to
-//    standard beam search with temperature ħ applied to scores.
-//
-//    The physics insight: ħ controls quantum fluctuation.
-//    At ħ=1.0: equivalent to log-prob beam search.
-//    At ħ<1.0: more deterministic (sharper amplitude peaks).
-//    At ħ>1.0: more exploratory (flatter amplitude landscape).
-//
-//  Implementation:
-//    - CPU-side loop (no CUDA kernel needed for beam logic)
-//    - GPU used for forward() — logits are pulled to CPU for beam ops
-//    - Scores maintained in log-space for numerical stability:
-//        log A = Σ_t (1/ħ) * log p(w_t | ctx)
-//    - Top-K expansion: each beam expands to all vocab tokens,
-//      we keep best beam_width by log-amplitude
-//
-//  Result: FeynmanBeam struct per output beam with:
-//    - tokens: complete sequence
-//    - log_amplitude: log A(path) = (1/ħ) * Σ log p
-//    - action: S(path) = Σ -log p  (total negative log-prob)
 // ============================================================
-
 struct FeynmanBeam {
-    std::vector<int> tokens;   // prompt + generated tokens
-    float log_amplitude;       // log A(path) = (1/ħ) * Σ log p(w_t|ctx)
-    float action;              // S(path) = Σ -log p(w_t|ctx)  [lower=better]
+    std::vector<int> tokens;
+    float log_amplitude;
+    float action;
 };
 
-// ── Feynman path integral beam search (GPU-accelerated forward) ──────
-// gpu_model:   loaded ModelGPU (inference mode — no backward needed)
-// prompt_ids:  tokenized input prompt
-// max_new:     maximum new tokens to generate
-// beam_width:  number of parallel paths to maintain
-// hbar:        Planck constant analogue (temperature of path integral)
-//              hbar=1.0 → standard log-prob beam search
-//              hbar<1.0 → sharper (more greedy)
-//              hbar>1.0 → more exploratory (flatter amplitude)
-// top_k_expand: candidates per beam per step (limits O(beam*vocab) work)
-//               use top_k_expand=vocab for full beam search
-//               use top_k_expand=50 for fast approximate search
-// Returns top beam sorted by highest log_amplitude (best path first)
 std::vector<FeynmanBeam> generate_feynman(
-    ModelGPU&                   gpu_model,
-    const std::vector<int>&     prompt_ids,
-    int                         max_new      = 64,
-    int                         beam_width   = 4,
-    float                       hbar         = 1.0f,
-    int                         top_k_expand = 50)
+    ModelGPU& gpu_model, const std::vector<int>& prompt_ids,
+    int max_new=64, int beam_width=4, float hbar=1.0f, int top_k_expand=50)
 {
-    int V   = gpu_model.cfg.vocab_size;
-    int SEQ = gpu_model.cfg.max_seq_len;
+    int V=gpu_model.cfg.vocab_size, SEQ=gpu_model.cfg.max_seq_len;
+    beam_width=std::max(1,std::min(beam_width,32));
+    top_k_expand=std::max(1,std::min(top_k_expand,V));
+    hbar=std::max(0.01f,hbar);
 
-    // Clamp params
-    beam_width   = std::max(1, std::min(beam_width,   32));
-    top_k_expand = std::max(1, std::min(top_k_expand, V));
-    hbar         = std::max(0.01f, hbar);
+    printf("\n[Feynman Beam Search] ħ=%.3f beams=%d top_k=%d max_new=%d\n",
+           hbar,beam_width,top_k_expand,max_new); fflush(stdout);
 
-    printf("\n[Feynman Beam Search]\n");
-    printf("  ħ=%.3f | beams=%d | top_k=%d | max_new=%d\n",
-           hbar, beam_width, top_k_expand, max_new);
-    fflush(stdout);
-
-    // ── Initialize beams from prompt ─────────────────────────
     std::vector<FeynmanBeam> beams(1);
-    beams[0].tokens        = prompt_ids;
-    beams[0].log_amplitude = 0.0f;
-    beams[0].action        = 0.0f;
+    beams[0].tokens={prompt_ids.begin(),prompt_ids.end()};
+    beams[0].log_amplitude=0.0f; beams[0].action=0.0f;
+    int eos_token=1;
 
-    // GPU logits buffer (pulled to CPU for beam logic)
-    int eos_token = 1;  // conventional EOS (tokenizer-dependent)
-
-    for (int step = 0; step < max_new; ++step) {
+    for (int s=0;s<max_new;++s) {
         std::vector<FeynmanBeam> candidates;
-        candidates.reserve(beams.size() * top_k_expand);
-
+        candidates.reserve(beams.size()*top_k_expand);
         for (auto& beam : beams) {
-            // Check if beam already ended (EOS was last token)
-            if (!beam.tokens.empty() &&
-                beam.tokens.back() == eos_token &&
-                step > 0) {
-                // Propagate finished beam unchanged
-                candidates.push_back(beam);
-                continue;
-            }
-
-            // Context window: last SEQ-1 tokens (leave room for next)
-            std::vector<int> ctx = beam.tokens;
-            if ((int)ctx.size() >= SEQ)
-                ctx = {ctx.end() - (SEQ - 1), ctx.end()};
-
-            // ── GPU forward pass (inference, no gradient) ────
-            GPUTensor logits = gpu_model.forward(ctx);
-
-            // Pull last-token logits to CPU
-            int last_row  = (int)ctx.size() - 1;
+            if (!beam.tokens.empty()&&beam.tokens.back()==eos_token&&s>0)
+                { candidates.push_back(beam); continue; }
+            std::vector<int> ctx=beam.tokens;
+            if ((int)ctx.size()>=SEQ) ctx={ctx.end()-(SEQ-1),ctx.end()};
+            GPUTensor logits=gpu_model.forward(ctx);
+            int last_row=(int)ctx.size()-1;
             std::vector<float> h_logits(V);
-            CUDA_CHECK(cudaMemcpy(
-                h_logits.data(),
-                logits.data + last_row * V,
-                V * sizeof(float),
-                cudaMemcpyDeviceToHost));
-
-            // ── Softmax (numerically stable) ─────────────────
-            float max_l = *std::max_element(h_logits.begin(), h_logits.end());
-            float sum_exp = 0.0f;
+            CUDA_CHECK(cudaMemcpy(h_logits.data(),logits.data+last_row*V,
+                                   V*sizeof(float),cudaMemcpyDeviceToHost));
+            float max_l=*std::max_element(h_logits.begin(),h_logits.end());
+            float sum_exp=0.0f;
             std::vector<float> probs(V);
-            for (int v = 0; v < V; ++v) {
-                probs[v] = std::exp(h_logits[v] - max_l);
-                sum_exp += probs[v];
-            }
-            float inv_sum = 1.0f / (sum_exp + 1e-9f);
-            for (int v = 0; v < V; ++v) probs[v] *= inv_sum;
-
-            // ── Feynman top-K expansion ───────────────────────
-            // Find top-K tokens by probability (partial sort)
-            // These are the "classical paths" with highest amplitude
-            std::vector<int> sorted_vocab(V);
-            std::iota(sorted_vocab.begin(), sorted_vocab.end(), 0);
-            // Partial sort: top top_k_expand by descending prob
-            std::partial_sort(
-                sorted_vocab.begin(),
-                sorted_vocab.begin() + top_k_expand,
-                sorted_vocab.end(),
-                [&probs](int a, int b){ return probs[a] > probs[b]; });
-
-            // Expand beam into top-K candidate paths
-            for (int ki = 0; ki < top_k_expand; ++ki) {
-                int tok = sorted_vocab[ki];
-                float p = probs[tok];
-                if (p < 1e-10f) continue;
-
-                // Feynman action increment: ΔS = -log p(tok | ctx)
-                float delta_S = -std::log(p + 1e-10f);
-
-                // Feynman path integral amplitude (log-space):
-                // log A(extended path) = log A(beam) + (1/ħ) * log p(tok)
-                //                      = log A(beam) - (1/ħ) * ΔS
-                float new_log_amp  = beam.log_amplitude - delta_S / hbar;
-                float new_action   = beam.action + delta_S;
-
+            for (int v=0;v<V;++v) { probs[v]=std::exp(h_logits[v]-max_l); sum_exp+=probs[v]; }
+            float inv_sum=1.0f/(sum_exp+1e-9f);
+            for (int v=0;v<V;++v) probs[v]*=inv_sum;
+            std::vector<int> sv(V); std::iota(sv.begin(),sv.end(),0);
+            std::partial_sort(sv.begin(),sv.begin()+top_k_expand,sv.end(),
+                              [&probs](int a,int b){return probs[a]>probs[b];});
+            for (int ki=0;ki<top_k_expand;++ki) {
+                int tok=sv[ki]; float p=probs[tok];
+                if (p<1e-10f) continue;
+                float dS=-std::log(p+1e-10f);
                 FeynmanBeam cand;
-                cand.tokens        = beam.tokens;
-                cand.tokens.push_back(tok);
-                cand.log_amplitude = new_log_amp;
-                cand.action        = new_action;
+                cand.tokens=beam.tokens; cand.tokens.push_back(tok);
+                cand.log_amplitude=beam.log_amplitude-dS/hbar;
+                cand.action=beam.action+dS;
                 candidates.push_back(std::move(cand));
             }
         }
-
-        // ── Prune: keep top beam_width by log_amplitude ──────
-        // log A(path) = (1/ħ) Σ log p → higher = better path
-        if ((int)candidates.size() > beam_width) {
-            std::partial_sort(
-                candidates.begin(),
-                candidates.begin() + beam_width,
-                candidates.end(),
-                [](const FeynmanBeam& a, const FeynmanBeam& b){
-                    return a.log_amplitude > b.log_amplitude;  // descending
-                });
+        if ((int)candidates.size()>beam_width) {
+            std::partial_sort(candidates.begin(),candidates.begin()+beam_width,
+                              candidates.end(),[](const FeynmanBeam& a,const FeynmanBeam& b){
+                                  return a.log_amplitude>b.log_amplitude;});
             candidates.resize(beam_width);
         }
-        beams = std::move(candidates);
-
-        // Early stop: all beams ended with EOS
-        bool all_done = true;
-        for (auto& b : beams)
-            if (b.tokens.empty() || b.tokens.back() != eos_token)
-                { all_done = false; break; }
+        beams=std::move(candidates);
+        bool all_done=true;
+        for (auto& b:beams) if (b.tokens.empty()||b.tokens.back()!=eos_token){all_done=false;break;}
         if (all_done) break;
-
-        if ((step + 1) % 16 == 0) {
-            printf("  Step %d/%d | best_action=%.3f | best_logA=%.3f\n",
-                   step+1, max_new,
-                   beams[0].action, beams[0].log_amplitude);
-            fflush(stdout);
-        }
     }
-
-    // Sort final beams: highest log_amplitude first (best Feynman path)
-    std::sort(beams.begin(), beams.end(),
-              [](const FeynmanBeam& a, const FeynmanBeam& b){
-                  return a.log_amplitude > b.log_amplitude;
-              });
-
-    // Print beam statistics
-    printf("\n[Feynman Beam Results]\n");
-    printf("  %-5s | %-12s | %-12s | %s\n",
-           "Beam","Action S","log Amplitude","Tokens");
-    printf("  ------|--------------|--------------|------\n");
-    for (int i = 0; i < (int)beams.size() && i < beam_width; ++i) {
-        int new_toks = (int)beams[i].tokens.size() - (int)prompt_ids.size();
-        printf("  %-5d | %-12.4f | %-12.4f | +%d tokens\n",
-               i, beams[i].action, beams[i].log_amplitude, new_toks);
-    }
-    printf("\n");
-    fflush(stdout);
-
+    std::sort(beams.begin(),beams.end(),[](const FeynmanBeam& a,const FeynmanBeam& b){
+        return a.log_amplitude>b.log_amplitude;});
     return beams;
 }
 
-// ── GPU generate wrapper: load checkpoint + run Feynman search ─────────
-void generate_gpu(const std::string& ckpt_path,
-                  const std::string& prompt_text,
-                  int   max_new    = 64,
-                  int   beam_width = 4,
-                  float hbar       = 1.0f,
-                  int   top_k      = 50)
+void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
+                  int max_new=64, int beam_width=4, float hbar=1.0f, int top_k=50)
 {
-    printf("\n╔══════════════════════════════════════════════╗\n");
-    printf("║  LOGOS Feynman Beam Search — GPU Inference   ║\n");
-    printf("║  Feynman Path Integral  |  Nikhilam KV INT8  ║\n");
-    printf("║  Hyperbolic Embeddings  |  Leapfrog Langevin ║\n");
-    printf("╚══════════════════════════════════════════════╝\n\n");
-
-    // ── Load tokenizer ────────────────────────────────────────
     Tokenizer tok;
-    if (!tok.load("vocab.bin")) {
-        fprintf(stderr, "❌ vocab.bin not found. Run training first.\n");
-        return;
-    }
-    printf("[1/3] Vocab: %d tokens\n", tok.vocab_size);
-
-    // ── Load checkpoint config + model ────────────────────────
-    // Try to load checkpoint; on failure, use default config
-    ModelConfig cfg;
-    cfg.vocab_size = tok.vocab_size;
-    // Default inference config (same as training defaults)
-    // In practice, checkpoint carries its own config
-    cfg.d_model    = 128;
-    cfg.num_heads  = 4;
-    cfg.num_layers = 4;
-    cfg.max_seq_len = 128;
-
-    std::string cfg_err = validate_model_config(
-        cfg.d_model, cfg.num_heads, cfg.num_layers,
-        cfg.vocab_size, cfg.max_seq_len);
-    if (!cfg_err.empty()) {
-        fprintf(stderr, "❌ Config error: %s\n", cfg_err.c_str()); return;
-    }
-
-    printf("[2/3] Init GPU model (d=%d L=%d H=%d seq=%d)...\n",
-           cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len);
-
-    // Phase 2: Hyperbolic embeddings ON by default during inference
-    HyperConfig hyper_cfg;
-    hyper_cfg.enabled   = true;
-    hyper_cfg.curvature = 1.0f;
-
+    if (!tok.load("vocab.bin")) { fprintf(stderr,"❌ vocab.bin not found\n"); return; }
+    ModelConfig cfg; cfg.vocab_size=tok.vocab_size;
+    cfg.d_model=128; cfg.num_heads=4; cfg.num_layers=4; cfg.max_seq_len=128;
     LOGOSModel cpu_model(cfg);
-    if (ckpt_path != "none" && !ckpt_path.empty()) {
-        if (!load_checkpoint(cpu_model, ckpt_path)) {
-            printf("⚠️  Checkpoint not loaded ('%s') — using random weights\n",
-                   ckpt_path.c_str());
-        } else {
-            printf("✅ Checkpoint loaded: %s\n", ckpt_path.c_str());
-        }
-    } else {
-        printf("⚠️  No checkpoint — using random weights (for testing)\n");
-    }
-
-    ModelGPU gpu_model(cfg, hyper_cfg);
+    if (ckpt_path!="none"&&!ckpt_path.empty()) load_checkpoint(cpu_model,ckpt_path);
+    HyperConfig hyper_cfg; hyper_cfg.enabled=true; hyper_cfg.curvature=1.0f;
+    ModelGPU gpu_model(cfg,hyper_cfg);
     gpu_model.load_from_cpu(cpu_model);
-
-    // ── Tokenize prompt ───────────────────────────────────────
-    printf("[3/3] Prompt: \"%s\"\n\n", prompt_text.c_str());
-    auto prompt_ids = tok.encode(prompt_text, cfg.max_seq_len / 2);
-
-    if (prompt_ids.empty()) {
-        fprintf(stderr, "❌ Prompt tokenization failed.\n"); return;
+    auto prompt_ids=tok.encode(prompt_text,cfg.max_seq_len/2);
+    auto beams=generate_feynman(gpu_model,prompt_ids,max_new,beam_width,hbar,top_k);
+    for (int i=0;i<(int)beams.size();++i) {
+        std::vector<int> gen(beams[i].tokens.begin()+(int)prompt_ids.size(),beams[i].tokens.end());
+        printf("Beam %d: %s\n",i,tok.decode(gen).c_str());
     }
-    printf("Prompt tokens: %d\n", (int)prompt_ids.size());
-
-    // ── Feynman Beam Search ───────────────────────────────────
-    auto beams = generate_feynman(
-        gpu_model, prompt_ids,
-        max_new, beam_width, hbar, top_k);
-
-    // ── Decode and print results ──────────────────────────────
-    printf("═══ GENERATED SEQUENCES ═══\n\n");
-    for (int i = 0; i < (int)beams.size(); ++i) {
-        // Only decode the newly generated tokens (after prompt)
-        std::vector<int> generated(
-            beams[i].tokens.begin() + (int)prompt_ids.size(),
-            beams[i].tokens.end());
-
-        std::string decoded = tok.decode(generated);
-
-        printf("── Beam %d (S=%.4f, logA=%.4f) ──\n",
-               i, beams[i].action, beams[i].log_amplitude);
-        printf("Prompt:    %s\n", prompt_text.c_str());
-        printf("Generated: %s\n\n", decoded.c_str());
-    }
-
-    // Print KV cache stats
-    int seq_used = std::min((int)prompt_ids.size() + max_new, cfg.max_seq_len);
-    gpu_model.print_kvcache_stats(seq_used, (int)prompt_ids.size() + max_new);
 }
-
 
 // ============================================================
 //  MAIN
 // ============================================================
 int main(int argc, char* argv[]) {
     printf("╔══════════════════════════════════════════╗\n"
-           "║  LOGOS GPU v9 — Hybrid SHM Optimizer     ║\n"
-           "║  Hamiltonian + Langevin | Feynman Beams  ║\n"
+           "║  LOGOS GPU v9-fix                        ║\n"
+           "║  T_floor | Anurupyena fix | PathIntegral ║\n"
            "╚══════════════════════════════════════════╝\n\n");
 
-    std::string mode = (argc > 1) ? argv[1] : "--train";
-
-    // ── Sanitize path helper ──────────────────────────────────
-    auto safe = [](const char* raw, const char* fallback) -> std::string {
-        if (!raw) return fallback;
+    std::string mode=(argc>1)?argv[1]:"--train";
+    auto safe=[](const char* raw,const char* fb)->std::string{
+        if (!raw) return fb;
         std::string s(raw);
-        // Reject path traversal
-        if (s.find("..") != std::string::npos ||
-            s.find('\0') != std::string::npos) {
-            fprintf(stderr, "⚠️  Unsafe path rejected: '%s'\n", raw);
-            return fallback;
-        }
+        if (s.find("..")!=std::string::npos||s.find('\0')!=std::string::npos) return fb;
         return s;
     };
 
     try {
-        if (mode == "--train") {
-            // ── Training mode (Phase 1+2 active) ─────────────
-            std::string dataset = (argc > 2)
-                ? safe(argv[2], "dataset.txt") : "dataset.txt";
-            train_gpu(dataset);
-        }
-        else if (mode == "--generate" || mode == "--generate-gpu") {
-            // ── [P3] Feynman Beam Search inference ────────────
-            // Usage: logos_gpu --generate [ckpt] [prompt] [max_new] [beams] [hbar] [top_k]
-            std::string ckpt   = (argc > 2) ? safe(argv[2], "none")            : "none";
-            std::string prompt = (argc > 3) ? std::string(argv[3])              : "Once upon a time";
-            int   max_new      = (argc > 4) ? std::atoi(argv[4])               : 64;
-            int   beams        = (argc > 5) ? std::atoi(argv[5])               : 4;
-            float hbar         = (argc > 6) ? std::atof(argv[6])               : 1.0f;
-            int   top_k        = (argc > 7) ? std::atoi(argv[7])               : 50;
-
-            generate_gpu(ckpt, prompt, max_new, beams, hbar, top_k);
-        }
-        else {
-            fprintf(stderr,
-                "Usage:\n"
-                "  logos_gpu --train  [dataset.txt]\n"
-                "  logos_gpu --generate [ckpt] [\"prompt\"] [max_new] [beams] [hbar] [top_k]\n"
-                "\nExamples:\n"
-                "  logos_gpu --train dataset.txt\n"
-                "  logos_gpu --generate logos_final_1000 \"The meaning of\" 64 4 1.0 50\n"
-                "  logos_gpu --generate none \"Test prompt\" 32 2 0.8 20\n"
-                "\n[P3] Feynman ħ guide:\n"
-                "  ħ=0.5  → sharp (more greedy, low-action paths dominate)\n"
-                "  ħ=1.0  → standard beam search equivalent\n"
-                "  ħ=1.5  → exploratory (quantum fluctuations visible)\n"
-                "  ħ=2.0  → highly stochastic (wide amplitude distribution)\n");
+        if (mode=="--train") {
+            std::string ds=(argc>2)?safe(argv[2],"dataset.txt"):"dataset.txt";
+            train_gpu(ds);
+        } else if (mode=="--generate"||mode=="--generate-gpu") {
+            std::string ckpt=(argc>2)?safe(argv[2],"none"):"none";
+            std::string prompt=(argc>3)?std::string(argv[3]):"Once upon a time";
+            int   max_new=(argc>4)?std::atoi(argv[4]):64;
+            int   beams  =(argc>5)?std::atoi(argv[5]):4;
+            float hbar   =(argc>6)?std::atof(argv[6]):1.0f;
+            int   top_k  =(argc>7)?std::atoi(argv[7]):50;
+            generate_gpu(ckpt,prompt,max_new,beams,hbar,top_k);
+        } else {
+            fprintf(stderr,"Usage:\n"
+                "  logos_gpu --train [dataset.txt]\n"
+                "  logos_gpu --generate [ckpt] [prompt] [max_new] [beams] [hbar] [top_k]\n");
             return 1;
         }
     } catch (const std::exception& e) {
-        fprintf(stderr, "\n❌ Fatal: %s\n", e.what());
-        return 1;
+        fprintf(stderr,"\n❌ Fatal: %s\n",e.what()); return 1;
     }
     return 0;
 }
