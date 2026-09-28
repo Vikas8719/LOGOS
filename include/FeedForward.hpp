@@ -12,42 +12,7 @@ inline float gelu(float x) {
     return 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
-// ── Feynman Dropout ───────────────────────────────────────────
-// Physics: standard dropout = binary mask (neuron alive or dead)
-//          Feynman dropout  = path integral over ALL partial activation levels
-//
-// Feynman Path Integral motivation:
-//   In QFT, the propagator integrates over ALL paths between two points,
-//   weighted by the phase e^{iS/ħ} where S is the action.
-//   Here: instead of binary {0,1} mask (only alive/dead paths),
-//   we weight each neuron by a continuous amplitude drawn from a
-//   physical distribution. All paths contribute — none are fully silenced.
-//
-// Three regimes (selected by Feynman hbar ħ parameter):
-//   ħ → 0  (classical limit):  sharp binary dropout (standard Bernoulli)
-//   ħ = 1  (quantum regime):   Gaussian amplitude fluctuations (smooth dropout)
-//   ħ → ∞  (free particle):   no regularisation (identity mapping)
-//
-// Amplitude distribution:
-//   Classical path  : weight = 1 with prob (1-p), 0 with prob p
-//   Quantum path    : weight ~ Beta(α, β) where α=(1-p)ħ, β=pħ
-//   (Beta distribution → Bernoulli as ħ → 0)
-//
-// In practice: Beta(α,β) sampled via ratio of Gamma draws (Johnk's method)
-//   If X ~ Gamma(α,1) and Y ~ Gamma(β,1), then X/(X+Y) ~ Beta(α,β)
-//   When ħ=1 → Beta(1-p, p) (simple linear interpolation)
-//   When ħ→0 → sharp Bernoulli (classical limit recovered); large ħ concentrates
-//   around the mean (1-p).
-//
-// Inference (training=false): identity (no dropout), consistent with classical limit
-//
-// Scale invariance: outputs divided by (1-p) to maintain expected activation scale
-//   E[weight] = α/(α+β) = (1-p)ħ / ((1-p)ħ + pħ) = (1-p)   [independent of ħ!]
-//   → same expected magnitude as standard dropout, regardless of ħ
-//
-// Parameters:
-//   p    : dropout probability (0=no dropout, 0.1 typical for transformers)
-//   hbar : quantum fluctuation strength (1.0 default = balanced, 0.1 = near-classical)
+
 struct FeynmanDropout {
     float p;       // base dropout probability
     float hbar;    // quantum fluctuation ħ (controls path integral width)

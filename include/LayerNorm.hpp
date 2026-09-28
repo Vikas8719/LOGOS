@@ -51,31 +51,7 @@ struct LayerNorm {
     std::vector<Tensor*> parameters() { return {&gamma, &beta}; }
 };
 
-// ── Reynolds Batch Normalization ──────────────────────────────
-// Physics: fluid flow transitions from laminar → turbulent as
-//   Reynolds number Re = ρ·v·L / μ  (inertia / viscosity) increases.
-//
-//   In neural networks:
-//     Re_eff = ||x||_rms / (σ_batch + ε)   [signal energy / noise floor]
-//     Low  Re (< Re_crit): laminar regime  → standard layer norm (stable)
-//     High Re (≥ Re_crit): turbulent regime → attenuated normalisation
-//                           (prevent instability from large activations)
-//
-//   The blend uses a smooth sigmoid transition (not a hard threshold):
-//     weight_LN = σ(-k * (Re - Re_crit))   [approaches 1 when Re << Re_crit]
-//     weight_BN = 1 - weight_LN             [approaches 1 when Re >> Re_crit]
-//
-//   Dual normalisation:
-//     LN output  = LayerNorm(X)          — stable, per-token
-//     BN output  = BroadcastNorm(X)      — running stats, per-feature (like BatchNorm)
-//     Y = weight_LN * LN + weight_BN * BN + γ * ... + β
-//
-//   Annealing: Re_crit decreases over training (more stability early, less later)
-//     This mirrors real turbulence: early training = laminar (needs stability),
-//     late training = allow turbulence (enables exploration of sharp minima).
-//
-//   The per-step Reynolds number is computed from the incoming activations,
-//   making this a completely data-driven normalisation regime selector.
+
 struct ReynoldsBatchNorm {
     Tensor gamma, beta;
     int    d_model;

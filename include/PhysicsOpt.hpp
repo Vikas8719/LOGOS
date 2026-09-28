@@ -324,6 +324,25 @@ struct WeightPathIntegral {
 
     // FIX-3: reset_best() — call after warmup to restart best tracking
     // This prevents the very first bad steps from dominating best_step forever.
+    // GPU path: record ||delta_theta|| directly and track an EMA of action (self-normalising LR signal).
+    float ema_action  = 0.0f;
+    float last_action = 0.0f;
+    bool  ema_ready   = false;
+    void record_step_norm(float loss, float step_norm) {
+        float action = std::max(loss, 0.0f) * step_norm;
+        cumulative_action += action;
+        log_amplitude     -= action / hbar;
+        ema_action  = ema_ready ? 0.98f * ema_action + 0.02f * action : action;
+        ema_ready   = true;
+        last_action = action;
+        ++step_count;
+    }
+    // LR multiplier in [lr_min_frac,1]: shrinks when current action spikes above its running average.
+    float lr_scale_ema(float lr_min_frac = 0.5f) const {
+        float rel = std::min(1.0f, std::exp(-(last_action - ema_action) / (ema_action + 1e-8f)));
+        return lr_min_frac + (1.0f - lr_min_frac) * rel;
+    }
+
     void reset_best() {
         best_log_amplitude = log_amplitude;
         best_step          = step_count;

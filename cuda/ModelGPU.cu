@@ -1,54 +1,4 @@
-// ============================================================
-//  LOGOS — cuda/ModelGPU.cu  (v8 — Phase 2 Physics)
-//
-//  v6 retained: All forward kernels, P0 attention cache,
-//               load_from_cpu, sync_to_cpu, all_parameters
-//
-//  PHASE 2 ADDITIONS:
-//
-//  [P2-A] Hyperbolic Embedding Space
-//    expmap0_kernel:     Euclidean → Poincaré ball (forward, per-token)
-//    logmap0_kernel:     Poincaré → Euclidean (for backward pre-processing)
-//    expmap0_bwd_kernel: gradient through exp_map (chain rule)
-//
-//    Math (unit Poincaré ball, curvature c=1):
-//      expmap0(v) = tanh(√c · ||v||/2) · v / (√c · ||v|| + ε)
-//      logmap0(y) = (2/√c) · arctanh(√c · ||y||) · y / (||y|| + ε)
-//
-//    Backward (dL/dv given dL/d_expmap0(v)):
-//      Let r = ||v||, x̂ = v/r
-//      expmap0 = tanh(r/2) · x̂  (c=1)
-//      d/dv[expmap0] = (tanh(r/2)/r) · I
-//                    + (sech²(r/2)/2 - tanh(r/2)/r) · x̂ x̂^T
-//      dv = J^T · dOut  (Jacobian-vector product)
-//
-//    Forward integration: applied once after embedding_kernel, before layers
-//    Backward integration: expmap0_bwd_kernel called in run_backward()
-//                          BEFORE lmhead_grad_dx_kernel operates on X
-//
-//  [P2-B] Nikhilam KV Cache Compression
-//    absmax_kernel:            max(|K|) → scale (parallel reduction)
-//    nikhilam_quantize_kernel: float32 → int8 (complement encoding)
-//    nikhilam_dequantize_kernel: int8 → float32
-//
-//    Applied in forward():
-//      After K/V computed: compress to K_int8/V_int8
-//      K/V float32 kept intact for backward (gradients need full precision)
-//      attn_probs computed from DECOMPRESSED K/V (acceptable quantization error)
-//
-//    Nikhilam encoding (complement-from-base):
-//      base = 127 (int8 max)
-//      complement[i] = base - |round(K[i]/scale)|  (with sign bit)
-//      This is "Nikhilam Navatascharamam" — subtraction from base
-//      Reconstruction: K[i] ≈ sign * (base - complement) * scale
-//      In practice: complement encoding = standard INT8 quantization
-//      but with the Nikhilam "complement from 9/base" interpretation
-//
-//    VRAM savings at typical config (L=6, H=8, DH=64, seq=512):
-//      K float32: 6 × 8 × 512 × 64 × 4B = 6MB
-//      K int8:    6 × 8 × 512 × 64 × 1B = 1.5MB  → saves 4.5MB
-//      V same:  → saves another 4.5MB
-//      Total:   9MB freed → allows seq_len to grow from 512 → 640+
+
 //
 //  BACKWARD NOTE:
 //    K_int8/V_int8 are NOT used in backward — float32 K/V cached separately.
@@ -426,6 +376,194 @@ GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols)
 //  ModelGPU IMPLEMENTATION
 // ============================================================
 
+// ============================================================
+//  GPU-wired Vedic / physics kernels
+// ============================================================
+
+// Block-wide sum (blockDim.x must be 256); result broadcast to all threads.
+__device__ __forceinline__ float block_sum256(float v)
+{
+    __shared__ float sh[8];
+    __shared__ float tot;
+    for (int o=16;o>0;o>>=1) v += __shfl_down_sync(0xffffffff, v, o);
+    int lane=threadIdx.x&31, wid=threadIdx.x>>5;
+    if (lane==0) sh[wid]=v;
+    __syncthreads();
+    float t=(threadIdx.x<8)?sh[threadIdx.x]:0.0f;
+    if (wid==0) {
+        for (int o=4;o>0;o>>=1) t += __shfl_down_sync(0xffffffff, t, o);
+        if (lane==0) tot=t;
+    }
+    __syncthreads();
+    float r=tot;
+    __syncthreads();
+    return r;
+}
+
+__device__ __forceinline__ unsigned hash32(unsigned x)
+{
+    x ^= x>>16; x *= 0x7feb352dU; x ^= x>>15; x *= 0x846ca68bU; x ^= x>>16;
+    return x;
+}
+__device__ __forceinline__ float urand01(unsigned& s)
+{
+    s = hash32(s + 0x9e3779b9U);
+    return ((float)(s>>8) + 0.5f) * (1.0f/16777216.0f);
+}
+
+// Shunyam: keep causal AND (local window OR global stride-aligned token), void the rest.
+__global__ void shunyam_mask_kernel(float* scores, int seq, int window, int stride)
+{
+    int row=blockIdx.x, col=blockIdx.y*blockDim.x+threadIdx.x;
+    if (row>=seq||col>=seq) return;
+    bool allowed = (col<=row) && (col>=row-window || (col%stride)==0);
+    if (!allowed) scores[row*seq+col] += -1e9f;
+}
+
+// Q_adv[i] = Q[i] + eta*(Q[i]-Q[i-1])  (upwind advection, causal)
+__global__ void ns_advect_kernel(const float* Q, float* Qa, int seq, int d, float eta)
+{
+    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    if (idx>=seq*d) return;
+    int i=idx/d;
+    float q=Q[idx];
+    float qp=(i>0)?Q[idx-d]:q;
+    Qa[idx]=q+eta*(q-qp);
+}
+
+// Exact transpose-Jacobian of ns_advect_kernel.
+__global__ void ns_advect_bwd_kernel(const float* dQa, float* dQ, int seq, int d, float eta)
+{
+    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    if (idx>=seq*d) return;
+    int i=idx/d;
+    float g=dQa[idx]*((i==0)?1.0f:(1.0f+eta));
+    if (i+1<seq) g-=eta*dQa[idx+d];
+    dQ[idx]=g;
+}
+
+// Vs[i] = (1-nu)*V[i] + nu*V[i-1]  (one-sided viscous diffusion, no future leak)
+__global__ void ns_diffuse_kernel(const float* V, float* Vs, int seq, int d, float nu)
+{
+    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    if (idx>=seq*d) return;
+    int i=idx/d;
+    float v=V[idx];
+    float vp=(i>0)?V[idx-d]:v;
+    Vs[idx]=(1.0f-nu)*v+nu*vp;
+}
+
+// Exact transpose-Jacobian of ns_diffuse_kernel.
+__global__ void ns_diffuse_bwd_kernel(const float* dVs, float* dV, int seq, int d, float nu)
+{
+    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    if (idx>=seq*d) return;
+    int i=idx/d;
+    float g=(1.0f-nu)*dVs[idx];
+    if (i+1<seq) g+=nu*dVs[idx+d];
+    if (i==0)    g+=nu*dVs[idx];
+    dV[idx]=g;
+}
+
+// Per token: Re=RMS/std, w=sigmoid(-k(Re-Re_crit)); Y=gamma*(w*LN + (1-w)*BN_running)+beta
+__global__ void reynolds_norm_kernel(const float* X, const float* gamma, const float* beta,
+                                     const float* rmean, const float* rvar, float* Y, float* W,
+                                     int seq, int d, float re_crit, float k, float eps)
+{
+    int row=blockIdx.x;
+    if (row>=seq) return;
+    const float* x=X+row*d; float* y=Y+row*d;
+    float s=0.f, sq=0.f;
+    for (int j=threadIdx.x;j<d;j+=blockDim.x) { float v=x[j]; s+=v; sq+=v*v; }
+    s=block_sum256(s); sq=block_sum256(sq);
+    float mean=s/d;
+    float var=fmaxf(sq/d-mean*mean,0.0f);
+    float rms=sqrtf(sq/d);
+    float re=rms/(sqrtf(var+eps)+eps);
+    float w=1.0f/(1.0f+expf(k*(re-re_crit)));
+    float inv=rsqrtf(var+eps);
+    for (int j=threadIdx.x;j<d;j+=blockDim.x) {
+        float ln=(x[j]-mean)*inv;
+        float bn=(x[j]-rmean[j])*rsqrtf(rvar[j]+eps);
+        y[j]=gamma[j]*(w*ln+(1.0f-w)*bn)+beta[j];
+    }
+    if (threadIdx.x==0) W[row]=w;
+}
+
+// Backward of reynolds_norm_kernel (w and running stats treated as constants).
+__global__ void reynolds_bwd_kernel(const float* X, const float* gamma, const float* dY, const float* W,
+                                    const float* rmean, const float* rvar, float* dX,
+                                    float* dGamma, float* dBeta, int seq, int d, float eps)
+{
+    int row=blockIdx.x;
+    if (row>=seq) return;
+    const float* x=X+row*d; const float* dy=dY+row*d; float* dx=dX+row*d;
+    float w=W[row];
+    float s=0.f, sq=0.f;
+    for (int j=threadIdx.x;j<d;j+=blockDim.x) { float v=x[j]; s+=v; sq+=v*v; }
+    s=block_sum256(s); sq=block_sum256(sq);
+    float mean=s/d;
+    float var=fmaxf(sq/d-mean*mean,0.0f);
+    float inv=rsqrtf(var+eps);
+    float t1=0.f, t2=0.f;
+    for (int j=threadIdx.x;j<d;j+=blockDim.x) {
+        float xh=(x[j]-mean)*inv;
+        float dxh=dy[j]*gamma[j]*w;
+        t1+=dxh; t2+=dxh*xh;
+    }
+    t1=block_sum256(t1); t2=block_sum256(t2);
+    float inv_d=1.0f/d;
+    for (int j=threadIdx.x;j<d;j+=blockDim.x) {
+        float xh=(x[j]-mean)*inv;
+        float dxh=dy[j]*gamma[j]*w;
+        float ibn=rsqrtf(rvar[j]+eps);
+        float xb=(x[j]-rmean[j])*ibn;
+        dx[j]=inv*inv_d*(d*dxh-t1-xh*t2)+dy[j]*gamma[j]*(1.0f-w)*ibn;
+        atomicAdd(&dGamma[j], dy[j]*(w*xh+(1.0f-w)*xb));
+        atomicAdd(&dBeta[j],  dy[j]);
+    }
+}
+
+// Running per-feature mean/var EMA (one thread per feature).
+__global__ void run_stats_update_kernel(const float* X, float* rmean, float* rvar,
+                                        int seq, int d, float decay)
+{
+    int j=blockIdx.x*blockDim.x+threadIdx.x;
+    if (j>=d) return;
+    float m=0.f;
+    for (int i=0;i<seq;++i) m+=X[i*d+j];
+    m/=(float)seq;
+    float v=0.f;
+    for (int i=0;i<seq;++i) { float t=X[i*d+j]-m; v+=t*t; }
+    v/=(float)seq;
+    rmean[j]=decay*rmean[j]+(1.0f-decay)*m;
+    rvar[j] =decay*rvar[j] +(1.0f-decay)*v;
+}
+
+// Feynman path-integral dropout: w~Beta((1-p)h,p*h) via Johnk (h<=1), Bernoulli for tiny h.
+__global__ void feynman_dropout_kernel(float* A, float* mask, int n, float p, float hbar, unsigned seed)
+{
+    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    if (idx>=n) return;
+    unsigned s=hash32(seed ^ ((unsigned)idx*2654435761u));
+    float w;
+    if (hbar<=0.05f) {
+        w=(urand01(s)<p)?0.0f:1.0f;
+    } else {
+        float a=(1.0f-p)*hbar, b=p*hbar;
+        w=1.0f-p;
+        for (int t=0;t<8;++t) {
+            float u=urand01(s), v=urand01(s);
+            float x=powf(u,1.0f/a), y=powf(v,1.0f/b);
+            float sum=x+y;
+            if (sum<=1.0f && sum>1e-30f) { w=x/sum; break; }
+        }
+    }
+    float m=w/(1.0f-p+1e-8f);
+    mask[idx]=m;
+    A[idx]*=m;
+}
+
 ModelGPU::ModelGPU(const ModelConfig& cfg_, const HyperConfig& hcfg)
     : cfg(cfg_), hyper_cfg(hcfg)
 {
@@ -467,6 +605,13 @@ ModelGPU::ModelGPU(const ModelConfig& cfg_, const HyperConfig& hcfg)
         gpu_blocks.push_back(std::move(blk));
     }
     layer_cache.resize(cfg.num_layers);
+    // Reynolds running stats: mean=0, var=1 per norm site
+    for (int i=0;i<2*cfg.num_layers;++i) {
+        run_mean.push_back(gpu_alloc(1,D));
+        run_var.push_back(gpu_alloc(1,D));
+        std::vector<float> ones_rv(D,1.f);
+        h2d(run_var.back(),ones_rv.data(),D);
+    }
     CUDA_CHECK(cudaMalloc(&d_token_ids, cfg.max_seq_len*sizeof(int)));
 
     size_t free_mem,total_mem;
@@ -494,6 +639,10 @@ void ModelGPU::free_layer_cache() {
         lc.ffn_A=GPUTensor{};
         lc.attn_out=GPUTensor{};
         lc.concat=GPUTensor{};
+        lc.post_attn=GPUTensor{};
+        lc.ffn_mask=GPUTensor{};
+        lc.ln1_w=GPUTensor{};
+        lc.ln2_w=GPUTensor{};
         lc.heads.clear();
     }
     X_euclidean=GPUTensor{};  // [P2-A] clear hyperbolic pre-map cache
@@ -577,6 +726,7 @@ void ModelGPU::sync_to_cpu(LOGOSModel& cpu_model) const {
 // ============================================================
 //  FORWARD PASS (v8 — Phase 2: Hyperbolic + Nikhilam KV)
 // ============================================================
+#if 0  // legacy forward (no physics wiring) — replaced by the forward below
 GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
 {
     int seq=static_cast<int>(token_ids.size());
@@ -735,6 +885,172 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
         { int sz=seq*D,th=256;
           residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,ffn_out.data,sz);
           CUDA_KERNEL_CHECK(); }
+    }
+
+    last_hidden=std::move(X);
+    GPUTensor logits=gpu_alloc(seq,V);
+    cuda_vedic_gemm(last_hidden,gpu_lm_head,logits);
+    CUDA_KERNEL_CHECK();
+    return logits;
+}
+
+#endif  // legacy forward end
+
+// ── Reynolds-adaptive norm dispatch ──────────────────────────
+void ModelGPU::apply_norm(const GPUTensor& X, const GPUTensor& gamma, const GPUTensor& beta,
+                          GPUTensor& Y, GPUTensor& W, int slot, int seq)
+{
+    int D=cfg.d_model;
+    if (phys.reynolds) {
+        W=gpu_alloc(seq,1);
+        reynolds_norm_kernel<<<seq,256>>>(X.data,gamma.data,beta.data,
+            run_mean[slot].data,run_var[slot].data,Y.data,W.data,
+            seq,D,phys.re_crit,phys.re_k,1e-5f);
+        CUDA_KERNEL_CHECK();
+    } else {
+        cuda_layernorm(X,gamma,beta,Y,seq,D);
+    }
+}
+
+// EMA-updates Reynolds running stats from layer-cache after backward used old stats.
+void ModelGPU::update_norm_stats()
+{
+    if (!phys.reynolds||!phys.training) return;
+    int D=cfg.d_model;
+    for (int l=0;l<cfg.num_layers;++l) {
+        auto& c=layer_cache[l];
+        if (!c.block_input.valid()||!c.post_attn.valid()) continue;
+        int seq=c.block_input.rows;
+        run_stats_update_kernel<<<(D+127)/128,128>>>(c.block_input.data,run_mean[2*l].data,run_var[2*l].data,seq,D,0.99f);
+        run_stats_update_kernel<<<(D+127)/128,128>>>(c.post_attn.data,run_mean[2*l+1].data,run_var[2*l+1].data,seq,D,0.99f);
+    }
+    CUDA_KERNEL_CHECK();
+}
+
+// ── Forward: all Vedic+physics tools wired in ────────────────
+GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
+{
+    int seq=static_cast<int>(token_ids.size());
+    int D=cfg.d_model, H=cfg.num_heads, DH=D/H, V=cfg.vocab_size;
+    if (seq<=0||seq>cfg.max_seq_len)
+        throw std::invalid_argument("Invalid seq: "+std::to_string(seq));
+
+    std::vector<int> safe=token_ids;
+    for (int& t:safe) if(t<0||t>=V) t=0;
+    CUDA_CHECK(cudaMemcpy(d_token_ids,safe.data(),seq*sizeof(int),cudaMemcpyHostToDevice));
+    free_layer_cache();
+
+    GPUTensor X=gpu_alloc(seq,D);
+    {
+        dim3 grid(seq,(D+31)/32); dim3 block(32);
+        embedding_kernel<<<grid,block>>>(d_token_ids,gpu_embedding.data,gpu_pos_embedding.data,X.data,seq,D,V);
+        CUDA_KERNEL_CHECK();
+    }
+
+    // Poincare expmap; pre-map cached for exact backward
+    if (hyper_cfg.enabled) {
+        X_euclidean=gpu_alloc(seq,D);
+        CUDA_CHECK(cudaMemcpy(X_euclidean.data,X.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
+        expmap0_kernel<<<seq,256>>>(X.data,seq,D,hyper_cfg.curvature);
+        CUDA_KERNEL_CHECK();
+    }
+
+    for (int l=0;l<cfg.num_layers;++l) {
+        auto& blk=gpu_blocks[l];
+        auto& cache=layer_cache[l];
+
+        cache.block_input=gpu_alloc(seq,D);
+        CUDA_CHECK(cudaMemcpy(cache.block_input.data,X.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
+
+        cache.normed1=gpu_alloc(seq,D);
+        apply_norm(X,blk.ln1_gamma,blk.ln1_beta,cache.normed1,cache.ln1_w,2*l,seq);
+
+        cache.heads.resize(H);
+        GPUTensor concat=gpu_alloc(seq,D);
+        CUDA_CHECK(cudaMemset(concat.data,0,seq*D*sizeof(float)));
+
+        for (int h=0;h<H;++h) {
+            auto& hc=cache.heads[h];
+            hc.Q=gpu_alloc(seq,DH); cuda_vedic_gemm(cache.normed1,blk.W_Q[h],hc.Q);
+            hc.K=gpu_alloc(seq,DH); cuda_vedic_gemm(cache.normed1,blk.W_K[h],hc.K);
+            hc.V=gpu_alloc(seq,DH); cuda_vedic_gemm(cache.normed1,blk.W_V[h],hc.V);
+
+            // Nikhilam INT8 K/V saved for stats; attention uses float32 (no forward/backward mismatch)
+            if (phys.nikhilam_kv) { hc.K_int8=nikhilam_compress(hc.K); hc.V_int8=nikhilam_compress(hc.V); }
+
+            // Navier-Stokes: causal advection on Q, causal diffusion on V
+            hc.Q_adv=gpu_alloc(seq,DH);
+            hc.V_s  =gpu_alloc(seq,DH);
+            if (phys.navier_stokes) {
+                int qb=(seq*DH+255)/256;
+                ns_advect_kernel<<<qb,256>>>(hc.Q.data,hc.Q_adv.data,seq,DH,phys.ns_eta); CUDA_KERNEL_CHECK();
+                ns_diffuse_kernel<<<qb,256>>>(hc.V.data,hc.V_s.data,seq,DH,phys.ns_nu);   CUDA_KERNEL_CHECK();
+            } else {
+                CUDA_CHECK(cudaMemcpy(hc.Q_adv.data,hc.Q.data,seq*DH*sizeof(float),cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(hc.V_s.data,  hc.V.data,seq*DH*sizeof(float),cudaMemcpyDeviceToDevice));
+            }
+
+            GPUTensor K_T=gpu_alloc(DH,seq);
+            { dim3 tg((seq+15)/16,(DH+15)/16); dim3 tb(16,16);
+              gpu_transpose_kernel<<<tg,tb>>>(hc.K.data,K_T.data,seq,DH); CUDA_KERNEL_CHECK(); }
+            GPUTensor scores=gpu_alloc(seq,seq);
+            cuda_vedic_gemm(hc.Q_adv,K_T,scores);
+
+            // Shunyam sparse mask (causal-only fallback for short seq)
+            { dim3 g(seq,(seq+31)/32); dim3 b(32);
+              if (phys.shunyam&&seq>phys.window)
+                  shunyam_mask_kernel<<<g,b>>>(scores.data,seq,phys.window,phys.stride);
+              else
+                  causal_mask_kernel<<<g,b>>>(scores.data,seq);
+              CUDA_KERNEL_CHECK(); }
+
+            hc.attn_probs=gpu_alloc(seq,seq);
+            cuda_boltzmann_softmax(scores,hc.attn_probs,seq,seq,sqrtf((float)DH));
+
+            hc.head_out=gpu_alloc(seq,DH);
+            cuda_vedic_gemm(hc.attn_probs,hc.V_s,hc.head_out);
+
+            GPUTensor head_proj=gpu_alloc(seq,D);
+            cuda_vedic_gemm(hc.head_out,blk.W_O[h],head_proj);
+            int sz=seq*D,th=256;
+            residual_add_kernel<<<(sz+th-1)/th,th>>>(concat.data,head_proj.data,sz); CUDA_KERNEL_CHECK();
+        }
+
+        cache.concat=gpu_alloc(seq,D);
+        CUDA_CHECK(cudaMemcpy(cache.concat.data,concat.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
+        GPUTensor mha_out=gpu_alloc(seq,D);
+        cuda_vedic_gemm(concat,blk.W_proj,mha_out);
+        cache.attn_out=gpu_alloc(seq,D);
+        CUDA_CHECK(cudaMemcpy(cache.attn_out.data,mha_out.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
+        { int sz=seq*D,th=256; residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,mha_out.data,sz); CUDA_KERNEL_CHECK(); }
+
+        // Cache post-attention residual; LN2 backward needs this, not block_input
+        cache.post_attn=gpu_alloc(seq,D);
+        CUDA_CHECK(cudaMemcpy(cache.post_attn.data,X.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
+
+        cache.normed2=gpu_alloc(seq,D);
+        apply_norm(X,blk.ln2_gamma,blk.ln2_beta,cache.normed2,cache.ln2_w,2*l+1,seq);
+
+        cache.ffn_H=gpu_alloc(seq,4*D);
+        cuda_vedic_gemm_bias(cache.normed2,blk.W1,blk.b1,cache.ffn_H);
+
+        cache.ffn_A=gpu_alloc(seq,4*D);
+        CUDA_CHECK(cudaMemcpy(cache.ffn_A.data,cache.ffn_H.data,seq*4*D*sizeof(float),cudaMemcpyDeviceToDevice));
+        cuda_gelu(cache.ffn_A);
+
+        // Feynman dropout on FFN activations; mask cached for backward
+        if (phys.feynman_dropout&&phys.training) {
+            int n=seq*4*D;
+            cache.ffn_mask=gpu_alloc(seq,4*D);
+            feynman_dropout_kernel<<<(n+255)/256,256>>>(cache.ffn_A.data,cache.ffn_mask.data,
+                n,phys.drop_p,phys.drop_hbar,dropout_seed);
+            CUDA_KERNEL_CHECK();
+            dropout_seed=dropout_seed*1664525u+1013904223u+(unsigned)l;
+        }
+
+        GPUTensor ffn_out=gpu_alloc(seq,D);
+        cuda_vedic_gemm_bias(cache.ffn_A,blk.W2,blk.b2,ffn_out);
+        { int sz=seq*D,th=256; residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,ffn_out.data,sz); CUDA_KERNEL_CHECK(); }
     }
 
     last_hidden=std::move(X);

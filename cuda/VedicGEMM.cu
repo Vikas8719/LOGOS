@@ -504,7 +504,7 @@ __global__ void shm_hybrid_kernel(
     //    +thermal           → thermal noise (FDT fluctuation)
     //
     //  Combined: v_{t+½}
-    float ham_kick     = -(alpha_H * lr * 0.5f) * g;
+    float ham_kick     = -(alpha_H * 0.5f) * g;  // lr applied once at position update (was lr^2 -> no learning)
     float lang_friction = -(alpha_L * lr * 0.5f) * friction * v;
 
     float v_half = mom_decay * v + ham_kick + lang_friction + thermal;

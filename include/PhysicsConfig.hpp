@@ -2,22 +2,6 @@
 // ============================================================
 //  LOGOS — PhysicsConfig.hpp   [NEW — wiring pass]
 //
-//  Why a SEPARATE struct from ModelConfig:
-//    ModelConfig is written/read as a raw byte blob in Checkpoint.cpp
-//    (f.write(&model.cfg, sizeof(ModelConfig))). Adding fields to
-//    ModelConfig would change sizeof(ModelConfig) and silently break
-//    every checkpoint saved before this change (old .bin files would
-//    misalign on load). PhysicsConfig is NOT serialized — it only
-//    controls which forward-pass code paths run — so existing
-//    checkpoints keep loading correctly.
-//
-//  This struct is what turns previously-defined-but-unused classes
-//  (ReynoldsBatchNorm, NavierStokesAttention, FeynmanDropout, Shunyam
-//  sparse attention) into code paths that actually execute.
-//  All default to "on" so a plain `LOGOSModel model(cfg)` now runs the
-//  full physics/vedic stack instead of the plain fallback.
-// ============================================================
-
 struct PhysicsConfig {
     // ── Reynolds-adaptive normalisation (LayerNorm.hpp) ──────
     // true  → ReynoldsBatchNorm (laminar/turbulent blended norm)

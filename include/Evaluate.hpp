@@ -1,24 +1,6 @@
 #pragma once
 // ============================================================
 //  LOGOS — Evaluate.hpp  v5 — FINAL FIX
-//
-//  Problem: main.cpp line 615 calls evaluate(model, loader, 50)
-//  where loader is UnifiedDataLoader. Previous versions required
-//  evaluate_unified() — a different name — which broke when the
-//  old main.cpp was cached on macOS/Windows runners.
-//
-//  Solution: provide BOTH overloads under the SAME name evaluate().
-//    Overload A: evaluate(model, DataLoader&,        batches)
-//    Overload B: evaluate(model, UnifiedDataLoader&, batches)
-//  No templates, no concepts, no std::function tricks.
-//  Works on GCC 12, Clang 14, AppleClang 15, MinGW — all C++17.
-//
-//  UnifiedDataLoader is defined in StreamingDataLoader.hpp.
-//  main.cpp includes StreamingDataLoader.hpp BEFORE Evaluate.hpp,
-//  so the type is complete here.  We use a forward declaration +
-//  out-of-line body pattern: the overload is declared inline and
-//  defined right here, but the body only calls methods that exist
-//  on both loaders (next_batch + reset / current_pos=0).
 // ============================================================
 #include "Tensor.hpp"
 #include "Model.hpp"
