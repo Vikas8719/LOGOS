@@ -831,19 +831,21 @@ void train_gpu(const std::string& dataset_path) {
 
     StreamingDataLoader loader(dataset_path, tok, SEQ, grad_accum, CHUNK_BYTES,
                                /*start_byte=*/0, /*end_byte=*/val_start_byte);
-    // [v17] FIXED validation set. Purana approach har eval par val loader aage badhata tha →
-    // har baar alag windows → Val_CE curve noisy aur non-comparable. Ab val region se 32
-    // windows (har 16th) ek baar tokenize karke memory me rakhte hain; har eval par SAME
-    // windows. Loader scope me hai → nikalte hi prefetch thread band ho jaata hai.
+    // [v17] FIXED validation set: 32 windows pre-loaded into memory (every 16th batch).
+    // val_loader is declared at function scope (not inside {} block) because
+    // it is also used later in the training loop every 100 steps for on-the-fly
+    // Val_CE evaluation (forward-only pass on ~10 batches).
+    // BUG-FIX v17: pehle val_loader {} block ke andar tha → bahar 'undefined' compile error.
+    StreamingDataLoader val_loader(dataset_path, tok, SEQ, 1, 1LL*1024*1024,
+                                   /*start_byte=*/val_start_byte, /*end_byte=*/actual_size);
     std::vector<std::pair<std::vector<int>,std::vector<int>>> fixed_val;
     {
-        StreamingDataLoader val_loader(dataset_path, tok, SEQ, 1, 1LL*1024*1024,
-                                       /*start_byte=*/val_start_byte, /*end_byte=*/actual_size);
         std::vector<std::pair<std::vector<int>,std::vector<int>>> tmp;
         for (int i=0; i<512 && (int)fixed_val.size()<32; ++i) {
             if (!val_loader.next_accum_batch(tmp) || tmp.empty()) break;
             if (i%16==0) fixed_val.push_back(std::move(tmp[0]));
         }
+        val_loader.reset();  // rewind so training loop can use it from the start
     }
     printf("  Val set: %zu fixed windows x %d tokens\n", fixed_val.size(), SEQ);
     if (fixed_val.empty()) printf("  ⚠️  Val set empty — Val_CE N/A rahega\n");
