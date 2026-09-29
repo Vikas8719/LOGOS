@@ -776,6 +776,14 @@ void train_gpu(const std::string& dataset_path) {
     if (actual_size>200LL*1024*1024) grad_accum=4;
     else if (actual_size>50LL*1024*1024) grad_accum=2;
 
+    // [v18] vocab_size debug: tok.vocab_size tokenizer ka actual size hai
+    // decide_vocab_size() sirf target tha — actual size slightly different ho sakta hai
+    // (BPE merge count ya character coverage ke wajah se).
+    // Agar dono match nahi karte to yahan warn karo.
+    if (cfg.vocab_size != (int)decide_vocab_size(actual_size)) {
+        printf("  ℹ️  vocab target=%d → actual tok.vocab_size=%d (BPE coverage)\n",
+               decide_vocab_size(actual_size), cfg.vocab_size);
+    }
     printf("d=%d L=%d H=%d DH=%d seq=%d vocab=%d grad_accum=%d\n",
            cfg.d_model,cfg.num_layers,cfg.num_heads,cfg.d_model/cfg.num_heads,
            cfg.max_seq_len,cfg.vocab_size,grad_accum);
@@ -1005,7 +1013,7 @@ void train_gpu(const std::string& dataset_path) {
             //   unchecked → GNorm exponential growth → training breakdown
             // Fix: clip=1.0 hard ceiling → GNorm stays in 4-8 range (healthy)
             // Combined with LR=5e-5: effective update = 5x smaller total
-            float grad_norm=cuda_clip_gradients(gpu_grads,1.0f);
+            float grad_norm=cuda_clip_gradients(gpu_grads, clip_norm);
 
             // [v14-WIRE] WeightPathIntegral adaptive LR scaling
             // lr_scale_ema(): current action spike ke hisab se LR shrink karta hai
@@ -1070,7 +1078,10 @@ void train_gpu(const std::string& dataset_path) {
                 float val_ce_sum = 0.f;
                 int   val_count  = 0;
                 std::vector<std::pair<std::vector<int>,std::vector<int>>> val_batches;
-                int val_batches_to_eval = 10;
+                // [v18] 10 → 30: val_ce estimate ka variance kam karo
+                // 10 batches par std-dev ~0.4 CE unit thi → fake OVF-warn
+                // 30 batches par std-dev ~0.15 → reliable overfit signal
+                int val_batches_to_eval = 30;
                 for (int vb = 0; vb < val_batches_to_eval; ++vb) {
                     if (!val_loader.next_accum_batch(val_batches)) {
                         // Restart val loader if exhausted
@@ -1113,16 +1124,26 @@ void train_gpu(const std::string& dataset_path) {
                 // Underfit: both val_ce and train_ce > 5.0 after step 5000
                 const char* fit_status = "OK";
                 if (val_ce > 0.f && step > 500) {
-                    bool val_rising   = (val_ce   > prev_val_ce   + 0.05f);
-                    bool train_falling = (avg_CE  < prev_train_ce - 0.05f);
+                    // [v18] Threshold 0.05 → 0.30: LR=3e-3 ke saath val_ce har step
+                    // 0.3-0.5 CE units oscillate karta hai (sampling noise + LR noise).
+                    // 0.05 threshold pe har dip/spike OVF-warn trigger karta tha.
+                    // 0.30 = real generalization gap indicate karta hai, noise nahi.
+                    bool val_rising    = (val_ce  > prev_val_ce   + 0.30f);
+                    bool train_falling = (avg_CE  < prev_train_ce - 0.10f);
                     if (val_rising && train_falling) {
                         ++overfit_streak;
                         fit_status = (overfit_streak >= 3) ? "OVERFIT!" : "OVF-warn";
                     } else {
                         overfit_streak = 0;
                     }
-                    if (avg_CE > 5.5f && step > 5000) fit_status = "UNDERFIT";
-                    if (val_ce  > 5.5f && step > 5000) fit_status = "UNDERFIT";
+                    // [v18] UNDERFIT: sirf tab warn karo jab DONO > 5.5 ho
+                    // aur step > 10000. Val_CE 6.7-6.9 at step 8k = normal progress,
+                    // real underfit tab hai jab val_ce bhi 5.5+ rahe step 10k ke baad.
+                    // [v19] Additional check: agar val_ce gir rahi hai (< prev-0.2)
+                    // to UNDERFIT suppress karo — model learn kar raha hai.
+                    bool val_improving = (val_ce < prev_val_ce - 0.05f);
+                    if (avg_CE > 5.5f && val_ce > 5.5f && step > 10000 && !val_improving)
+                        fit_status = "UNDERFIT";
                 }
                 if (val_ce > 0.f) { prev_val_ce = val_ce; prev_train_ce = avg_CE; }
 
