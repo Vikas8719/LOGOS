@@ -1143,8 +1143,10 @@ void train_gpu(const std::string& dataset_path) {
                 gpu_model.sync_to_cpu(cpu_model);
                 save_checkpoint(cpu_model,"logos_gpu_ckpt",(int)step);
                 // [v11-CLIP] Show cuBLAS context so Vedic PASS/FAIL is interpretable
+                // [v17-FIX] tol=5% dono backends ke liye (FIX-11: correct formula ke baad
+                //   cuBLAS FP error sirf 0.1-2% reh gaya, purani 30% ki zarurat nahi)
                 const char* gemm_backend = cuda_vedic_gemm_uses_cublas()
-                                           ? "cuBLAS" : "CustomCUDA";
+                                           ? "cuBLAS(tol=5%)" : "CustomCUDA(tol=5%)";
                 float lr_x = gpu_path_integral.lr_scale_ema(0.5f);
                 // Show val_ce at checkpoint for overfit tracking
                 printf("Ckpt @ step %lld | best_F=%.4f | Train_CE≈%.4f | Val_CE≈%.4f | Vedic: %d/%d [%s] | LRx=%.3f\n",
