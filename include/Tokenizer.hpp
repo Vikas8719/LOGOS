@@ -138,6 +138,26 @@ public:
             fflush(stdout);
         }
 
+        // [v17] Multilingual Wikipedia (Hindi+English) me 500k+ unique word types hote hain →
+        // merge loop O(merges × types) = ghanton. Rare words (freq < min_freq) BPE merges ke
+        // liye useful signal nahi dete; unhe hata do. encode() unhe phir bhi byte-level se
+        // handle karta hai, isliye koi token "kho" nahi jaata. TinyStories jaisa chhota
+        // corpus (<150k types) is block se untouched rehta hai.
+        if (word_dict.size() > 150000) {
+            size_t before = word_dict.size();
+            int min_freq = 2;
+            for (;; ++min_freq) {
+                for (auto it = word_dict.begin(); it != word_dict.end(); ) {
+                    if (it->second.second < min_freq) it = word_dict.erase(it);
+                    else ++it;
+                }
+                if (word_dict.size() <= 120000 || min_freq >= 6) break;
+            }
+            printf("  BPE prune: %zu → %zu word types (freq >= %d)\n",
+                   before, word_dict.size(), min_freq);
+            fflush(stdout);
+        }
+
         if (word_dict.empty()) {
             std::cout << "⚠️  Empty corpus — no BPE merges done.\n";
             return;
@@ -254,7 +274,20 @@ public:
 
         std::istringstream iss(text);
         std::string word;
+        // [v17] per-call word cache (local → thread-safe, do loaders concurrently chalte hain).
+        // Har unique word par ~8000 merge-passes lagte the; Zipf distribution me
+        // chunk ke zyadatar words repeat hote hain, isliye cache se bahut tez.
+        std::unordered_map<std::string, std::vector<int>> word_cache;
         while (iss >> word && (int)ids.size() < max_len - 1) {
+            auto cached = word_cache.find(word);
+            if (cached != word_cache.end()) {
+                for (int cid : cached->second) {
+                    ids.push_back(cid);
+                    if ((int)ids.size() >= max_len - 1) break;
+                }
+                continue;
+            }
+            std::vector<int> word_ids;
             std::vector<std::string> seq;
             seq.reserve(word.size() + 1);
             seq.push_back(" ");
@@ -282,9 +315,13 @@ public:
                 auto it = vocab.find(subword);
                 int id = (it != vocab.end()) ? it->second : TOKEN_UNK;
                 if (id < 0 || id >= vocab_size) id = TOKEN_UNK;
+                word_ids.push_back(id);
                 ids.push_back(id);
                 if ((int)ids.size() >= max_len - 1) break;
             }
+            // sirf poori tarah encode hue words cache karo (max_len par truncate hua to nahi)
+            if ((int)ids.size() < max_len - 1)
+                word_cache.emplace(word, std::move(word_ids));
         }
 
         ids.push_back(TOKEN_EOS);

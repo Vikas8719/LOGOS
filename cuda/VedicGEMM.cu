@@ -505,7 +505,12 @@ __global__ void shm_hybrid_kernel(
     //
     //  Combined: v_{t+½}
     float ham_kick     = -(alpha_H * 0.5f) * g;  // lr applied once at position update (was lr^2 -> no learning)
-    float lang_friction = -(alpha_L * lr * 0.5f) * friction * v;
+    // [v17] FIX: friction ke saath `lr` mat multiply karo. Pehle coefficient
+    //   alpha_L*lr*0.5*friction = 0.5*5e-5*0.5*0.3 ≈ 4e-6 tha → friction knob (0.1→0.3)
+    //   ka koi asar hi nahi tha ("geodesic friction" effectively OFF). `lr` position update
+    //   (w += lr*v_half) me pehle se ek baar lag raha hai — velocity-space damping me nahi.
+    //   Ab per-step damping = 0.5·α_L·γ  (0.075 early → 0.0075 late)  ✅
+    float lang_friction = -(alpha_L * 0.5f) * friction * v;
 
     float v_half = mom_decay * v + ham_kick + lang_friction + thermal;
 

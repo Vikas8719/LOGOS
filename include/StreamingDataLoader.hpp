@@ -109,6 +109,64 @@ public:
         _launch_prefetch();       // Next chunk prefetch start
     }
 
+    // ── Constructor: Byte-range of a single file ──────────────
+    // [v17] Train/Val split ke liye: sirf [start_byte, end_byte) padhta hai.
+    // train_gpu.cu pehle isi 7-arg constructor ko call kar raha tha lekin ye exist hi
+    // nahi karta tha → build fail hota. start_byte > 0 ho to agli '\n' tak aage badhte
+    // hain taaki UTF-8 character / article beech se na kate (Hindi = 3 bytes/char).
+    StreamingDataLoader(const std::string& text_file,
+                        Tokenizer& tok,
+                        int seq_len_,
+                        int grad_accum_,
+                        int64_t chunk_bytes,
+                        int64_t start_byte,
+                        int64_t end_byte)
+        : seq_len(seq_len_)
+        , grad_accum_steps(grad_accum_)
+        , tokenizer_ref_(&tok)
+        , chunk_bytes_(chunk_bytes)
+    {
+        if (seq_len_ <= 0)
+            throw std::invalid_argument("seq_len must be > 0");
+        if (grad_accum_ <= 0)
+            throw std::invalid_argument("grad_accum_steps must be > 0");
+
+        int64_t file_size = scan_dataset_size(text_file);
+        if (file_size == 0)
+            throw std::runtime_error("Dataset empty or not found: " + text_file);
+
+        if (start_byte < 0) start_byte = 0;
+        if (end_byte <= 0 || end_byte > file_size) end_byte = file_size;
+        if (start_byte >= end_byte)
+            throw std::invalid_argument("StreamingDataLoader: empty byte range");
+
+        if (start_byte > 0) {
+            std::ifstream probe(text_file, std::ios::binary);
+            probe.seekg(start_byte, std::ios::beg);
+            char c = 0;
+            int64_t skipped = 0;
+            while (start_byte + skipped < end_byte && probe.get(c)) {
+                ++skipped;
+                if (c == '\n') break;
+            }
+            // agar range me newline hi nahi mila to original start rakho
+            if (start_byte + skipped < end_byte) start_byte += skipped;
+        }
+
+        DataShard shard;
+        shard.file_path   = text_file;
+        shard.byte_offset = start_byte;
+        shard.byte_length = end_byte - start_byte;
+        shards.push_back(shard);
+
+        // total_batches_per_epoch() ab sirf is range ke size par based hai
+        actual_text_size_ = shard.byte_length;
+
+        _open_current_shard();
+        _load_next_chunk_sync();
+        _launch_prefetch();
+    }
+
     // ── Constructor: Multiple shards / files ──────────────────
     StreamingDataLoader(const std::vector<DataShard>& shards_,
                         Tokenizer& tok,

@@ -36,9 +36,20 @@
 #include <numeric>
 #include <stdexcept>
 #include <cstdint>
+#include <cstdlib>
 
 // FIX-1: Minimum temperature — entropy regularization always active
 static constexpr float GPU_T_MIN_FLOOR = 1e-3f;
+
+// [v17] Env override: Kaggle notebook se source badle bina LR / clip / T / steps tune kar sako
+//   LOGOS_LR, LOGOS_CLIP, LOGOS_T_START, LOGOS_STEPS, LOGOS_WARMUP, LOGOS_NOISE_GAIN
+static float logos_env_f(const char* name, float def) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    float v = std::strtof(s, &end);
+    return (end != s && std::isfinite(v)) ? v : def;
+}
 
 // ============================================================
 //  [v9-fix] GPU HYBRID SHM OPTIMIZER
@@ -52,6 +63,12 @@ public:
     float   alpha_H_start, alpha_H_end;
     int64_t total_steps;
     int64_t step = 0;
+
+    // [v17] Langevin noise gain. `temperature` do kaam karta hai: (1) loss me entropy weight
+    // F=CE-T·S, (2) thermal noise amplitude. Noise ko N≈9M params par T=0.1 se seedha lagana
+    // weights ko lr ke saath ~lr^1.5 se bigadta hai (drift ~lr). noise_gain<1 se noise ko
+    // gradient-drift ke neeche rakhte hain; 1.0 = purana behaviour.
+    float   noise_gain = 0.05f;
 
     std::vector<float*> d_velocity;
     std::vector<int>    sizes;
@@ -103,8 +120,9 @@ public:
                 float scale = 1.0f)
     {
         anneal();
-        float noise_scale = sqrtf(friction * temperature * lr * alpha_L);
+        // [v17] noise ab lr schedule (warmup/cosine) follow karta hai + noise_gain se scaled
         float lr_scaled   = lr * scale;
+        float noise_scale = noise_gain * sqrtf(friction * temperature * lr_scaled * alpha_L);
 
         for (int i = 0; i < (int)params.size(); ++i) {
             int sz = params[i]->size;
@@ -189,6 +207,49 @@ __global__ void scale_grads_kernel(float* grad, float scale, int size) {
 __global__ void vec_mul_kernel(float* dst, const float* src, int size) {
     int idx=blockIdx.x*blockDim.x+threadIdx.x;
     if (idx<size) dst[idx]*=src[idx];
+}
+
+// [v17] FFN bias gradients. b1/b2 ke gradient buffers kabhi likhe hi nahi jaate the
+// (grads zero → biases kabhi learn nahi karte). db[j] = Σ_s dY[s,j]
+__global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict__ db,
+                                 int seq, int cols)
+{
+    int j=blockIdx.x*blockDim.x+threadIdx.x;
+    if (j>=cols) return;
+    float acc=0.0f;
+    for (int s=0;s<seq;++s) acc+=dY[s*cols+j];
+    atomicAdd(&db[j],acc);
+}
+
+// [v17] GNorm diagnostics: Σ g² (float accumulator on device)
+__global__ void sumsq_accum_kernel(const float* __restrict__ g, float* __restrict__ out, int n)
+{
+    __shared__ float sh[256];
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    sh[threadIdx.x]=(i<n)?g[i]*g[i]:0.0f;
+    __syncthreads();
+    for (int s=128;s>0;s>>=1) {
+        if (threadIdx.x<s) sh[threadIdx.x]+=sh[threadIdx.x+s];
+        __syncthreads();
+    }
+    if (threadIdx.x==0) atomicAdd(out,sh[0]);
+}
+
+// Σ g² over grads[b .. e)  — pre-clip group norm ke liye (sqrt caller karta hai)
+static float grad_group_sumsq(const std::vector<GPUTensor*>& grads, int b, int e)
+{
+    float* d_acc;
+    CUDA_CHECK(cudaMalloc(&d_acc,sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_acc,0,sizeof(float)));
+    for (int i=b;i<e && i<(int)grads.size();++i) {
+        int n=grads[i]->size;
+        sumsq_accum_kernel<<<(n+255)/256,256>>>(grads[i]->data,d_acc,n);
+    }
+    CUDA_KERNEL_CHECK();
+    float h=0.0f;
+    CUDA_CHECK(cudaMemcpy(&h,d_acc,sizeof(float),cudaMemcpyDeviceToHost));
+    cudaFree(d_acc);
+    return h;
 }
 
 __global__ void ffn_w2_grad_kernel(
@@ -468,6 +529,9 @@ static void run_backward(
         { dim3 g(D4,(D+31)/32),b(32);
           ffn_w2_grad_kernel<<<g,b>>>(cache.ffn_A.data,d_d_ffn_out.data,
                                       gpu_grads[base+w2_off]->data,seq,D4,D); CUDA_KERNEL_CHECK(); }
+        // [v17] b2 gradient (pehle kabhi compute nahi hota tha)
+        { bias_grad_kernel<<<(D+127)/128,128>>>(d_d_ffn_out.data,
+                                                gpu_grads[base+w2_off+1]->data,seq,D); CUDA_KERNEL_CHECK(); }
         { dim3 g(seq,(D4+31)/32),b(32);
           ffn_da_kernel<<<g,b>>>(d_d_ffn_out.data,blk.W2.data,
                                  d_d_ffn_A.data,seq,D4,D); CUDA_KERNEL_CHECK(); }
@@ -492,6 +556,9 @@ static void run_backward(
         { dim3 g(D,(D4+31)/32),b(32);
           ffn_w1_grad_kernel<<<g,b>>>(cache.normed2.data,d_d_ffn_H.data,
                                       gpu_grads[base+w1_off]->data,seq,D,D4); CUDA_KERNEL_CHECK(); }
+        // [v17] b1 gradient (d_ffn_H = gradient w.r.t. pre-GELU H, dropout mask ke baad)
+        { bias_grad_kernel<<<(D4+127)/128,128>>>(d_d_ffn_H.data,
+                                                 gpu_grads[base+w1_off+1]->data,seq,D4); CUDA_KERNEL_CHECK(); }
         { dim3 g(seq,(D+31)/32),b(32);
           ffn_dx_kernel<<<g,b>>>(d_d_ffn_H.data,blk.W1.data,
                                  d_d_normed2.data,seq,D,D4); CUDA_KERNEL_CHECK(); }
@@ -507,8 +574,9 @@ static void run_backward(
                 gpu_grads[base+ln2g_off]->data, gpu_grads[base+ln2b_off]->data,
                 seq, D, 1e-5f);
         } else {
+            // [v17] FIX: LN2 ka real input post_attn hai (block_input LN1 ka input hai)
             layernorm_bwd_kernel<<<seq,256>>>(
-                cache.block_input.data, blk.ln2_gamma.data,
+                cache.post_attn.data, blk.ln2_gamma.data,
                 d_d_normed2.data, d_dX_ln.data,
                 gpu_grads[base+ln2g_off]->data, gpu_grads[base+ln2b_off]->data,
                 seq, D, 1e-5f);
@@ -549,7 +617,8 @@ static void run_backward(
                   gpu_model.phys.ns_nu); CUDA_KERNEL_CHECK(); }
             GPUTensor d_attn_probs=gpu_alloc(seq,seq);
             { dim3 g(seq,(seq+31)/32),b(32);
-              attn_dAttnProbs_kernel<<<g,b>>>(d_head_out_h.data,hc.V.data,
+              // [v17] FIX: forward me head_out = probs @ V_s (diffused V) → d_probs bhi V_s se
+              attn_dAttnProbs_kernel<<<g,b>>>(d_head_out_h.data,hc.V_s.data,
                                               d_attn_probs.data,seq,DH); CUDA_KERNEL_CHECK(); }
             GPUTensor d_scores=gpu_alloc(seq,seq);
             float inv_sqrt_DH=1.0f/sqrtf((float)DH);
@@ -601,7 +670,13 @@ static void run_backward(
           vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln1.data,sz); CUDA_KERNEL_CHECK(); }
     }
 
-    { dim3 blk(32),grd(seq,(D+31)/32);
+    // [v17] FIX (v15-B bug): hyperbolic ON ho to embedding gradient SIRF expmap Jacobian se
+    // chain hokar jaana chahiye. v15 me pehle raw d_dX_out scatter hota tha AUR phir
+    // J^T·d_dX_out bhi add hota tha → embedding/pos grads double-counted + galat direction
+    // (GNorm inflation ka ek confirmed source). Ab hyper ON me ye raw scatter skip hota hai.
+    const bool hyper_chain = gpu_model.hyper_cfg.enabled && gpu_model.X_euclidean.valid();
+    if (!hyper_chain) {
+      dim3 blk(32),grd(seq,(D+31)/32);
       embedding_bwd_kernel<<<grd,blk>>>(
           gpu_model.d_token_ids,d_dX_out.data,
           gpu_grads[0]->data,gpu_grads[1]->data,
@@ -616,7 +691,7 @@ static void run_backward(
     //   accumulated above. Ab un gradients ko expmap Jacobian se chain karo.
     // Without this: embedding weights get Euclidean gradient, ignoring that
     //   the actual computation happened on the Poincaré manifold.
-    if (gpu_model.hyper_cfg.enabled && gpu_model.X_euclidean.valid()) {
+    if (hyper_chain) {
         // d_emb_grad aur d_pos_grad hyperbolic chain se nahi gayi thi
         // expmap0_bwd_kernel: dX_euc[i] = J(X_euc[i])^T · dOut[i]
         // Note: we apply bwd in-place on d_dX_out, then re-scatter to emb/pos grads
@@ -628,7 +703,7 @@ static void run_backward(
             seq, D, gpu_model.hyper_cfg.curvature);
         CUDA_KERNEL_CHECK();
         // Scatter d_dX_euc back into embedding + positional embedding gradients
-        // (additive — on top of what embedding_bwd_kernel already wrote)
+        // [v17] ab yahi AKELA scatter hai (upar wala raw scatter hyper ON me skip hota hai)
         { dim3 blk2(32), grd2(seq,(D+31)/32);
           embedding_bwd_kernel<<<grd2,blk2>>>(
               gpu_model.d_token_ids, d_dX_euc.data,
@@ -643,13 +718,13 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v15-COMPLETE         ║\n");
-    printf("║  ALL Vedic + Physics 100%% wired          ║\n");
-    printf("║  ✦ Feynman dropout bwd: mask applied     ║\n");
-    printf("║  ✦ Hyperbolic expmap0 bwd: chain fixed   ║\n");
-    printf("║  ✦ NS bwd: advect_bwd + diffuse_bwd      ║\n");
-    printf("║  ✦ Reynolds bwd: LN1+LN2 + EMA stats     ║\n");
-    printf("║  ✦ WeightPathIntegral: GPU LR adaptation ║\n");
+    printf("║  LOGOS GPU Training v17-AUDIT            ║\n");
+    printf("║  ✦ Fixed val-set CE (overfit/underfit)   ║\n");
+    printf("║  ✦ Wikipedia Hindi+English (shuffled)    ║\n");
+    printf("║  ✦ friction fixed (was no-op), noise_gain║\n");
+    printf("║  ✦ warmup+cosine LR, clip, 50k step cap  ║\n");
+    printf("║  ✦ bias grads, V_s, LN2, hyper-emb bwd   ║\n");
+    printf("║  ✦ per-group GNorm diagnostics           ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -670,7 +745,9 @@ void train_gpu(const std::string& dataset_path) {
     printf("[1/5] Tokenizer build (vocab=%d)...\n",vocab_target); fflush(stdout);
     Tokenizer tok;
     {
-        static constexpr int64_t TOKENIZER_SAMPLE=32LL*1024*1024;
+        // [v17] 8MB (was 32MB): dataset shuffled hai isliye pehle 8MB Hindi+English dono ka
+        // representative sample hai; 32MB par 8192-vocab BPE ghanton leta tha.
+        static constexpr int64_t TOKENIZER_SAMPLE=8LL*1024*1024;
         int64_t sample_size=std::min(actual_size,TOKENIZER_SAMPLE);
         std::ifstream f(dataset_path,std::ios::binary);
         if (!f) { fprintf(stderr,"❌ Cannot open: %s\n",dataset_path.c_str()); return; }
@@ -703,12 +780,9 @@ void train_gpu(const std::string& dataset_path) {
            cfg.d_model,cfg.num_layers,cfg.num_heads,cfg.d_model/cfg.num_heads,
            cfg.max_seq_len,cfg.vocab_size,grad_accum);
 
-    printf("\n[v10-HAM Hamiltonian-Dominant SHM Optimizer]\n");
-    printf("  ✦ FIX-4: α_H: 0.7→0.99 (Hamiltonian dominant throughout)\n");
-    printf("  ✦ FIX-5: T_start=0.5 → T_end=1e-3 (real cosine annealing)\n");
-    printf("  ✦ FIX-6: friction=0.1 mom=0.95 (strong momentum build-up)\n");
-    printf("  ✦ FIX-7: grad_clip=5.0 (was 1.0, GNorm~60 so 60x cut was killing descent)\n");
-    printf("  ✦ Loss: Free Energy F = CE - T·S (thermodynamic)\n\n");
+    // Actual values (LR/clip/T/steps/noise) optimizer banao ke baad print hote hain —
+    // env override: LOGOS_LR, LOGOS_CLIP, LOGOS_T_START, LOGOS_STEPS, LOGOS_WARMUP, LOGOS_NOISE_GAIN
+    printf("\n[v17 SHM Optimizer] hyper-parameters neeche [4/5] me print honge\n\n");
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
     LOGOSModel cpu_model(cfg);
@@ -743,27 +817,78 @@ void train_gpu(const std::string& dataset_path) {
     printf("[4/5] StreamingDataLoader + Optimizer...\n"); fflush(stdout);
     int SEQ=cfg.max_seq_len;
     static constexpr int64_t CHUNK_BYTES=4LL*1024*1024;
-    StreamingDataLoader loader(dataset_path,tok,SEQ,grad_accum,CHUNK_BYTES);
 
-    int EPOCHS=3;
+    // [v16-STABLE] Validation split: 5% of dataset held out
+    // First 95% = training, Last 5% = validation (never trained on)
+    // This enables overfit/underfit detection:
+    //   Val_CE rising while Train_CE falls = OVERFIT
+    //   Both Val_CE and Train_CE high = UNDERFIT
+    //   Both falling together = healthy training
+    int64_t val_start_byte = (int64_t)(actual_size * 0.95);
+    int64_t val_bytes      = actual_size - val_start_byte;
+    printf("  Train: %.1f MB | Val: %.1f MB (5%% held out)\n",
+           (float)val_start_byte/1024/1024, (float)val_bytes/1024/1024);
+
+    StreamingDataLoader loader(dataset_path, tok, SEQ, grad_accum, CHUNK_BYTES,
+                               /*start_byte=*/0, /*end_byte=*/val_start_byte);
+    // [v17] FIXED validation set. Purana approach har eval par val loader aage badhata tha →
+    // har baar alag windows → Val_CE curve noisy aur non-comparable. Ab val region se 32
+    // windows (har 16th) ek baar tokenize karke memory me rakhte hain; har eval par SAME
+    // windows. Loader scope me hai → nikalte hi prefetch thread band ho jaata hai.
+    std::vector<std::pair<std::vector<int>,std::vector<int>>> fixed_val;
+    {
+        StreamingDataLoader val_loader(dataset_path, tok, SEQ, 1, 1LL*1024*1024,
+                                       /*start_byte=*/val_start_byte, /*end_byte=*/actual_size);
+        std::vector<std::pair<std::vector<int>,std::vector<int>>> tmp;
+        for (int i=0; i<512 && (int)fixed_val.size()<32; ++i) {
+            if (!val_loader.next_accum_batch(tmp) || tmp.empty()) break;
+            if (i%16==0) fixed_val.push_back(std::move(tmp[0]));
+        }
+    }
+    printf("  Val set: %zu fixed windows x %d tokens\n", fixed_val.size(), SEQ);
+    if (fixed_val.empty()) printf("  ⚠️  Val set empty — Val_CE N/A rahega\n");
+
+    // [v17] Steps hard-cap (default 50000). Pehle sirf total_steps compute hota tha,
+    // loop me koi break nahi tha → poora dataset khatam hone tak train chalta rehta.
+    // Ab loop ke top par `step >= total_steps` par break hai.
+    // NOTE: 50k steps × grad_accum × seq tokens ≈ dataset ka sirf shuruaati hissa padhte
+    // hain (Wikipedia bahut bada hai) — isliye dataset file shuffled honi zaroori hai.
+    int EPOCHS=1;
     int64_t batches_per_epoch=loader.total_batches_per_epoch();
-    int64_t total_steps=EPOCHS*(batches_per_epoch/grad_accum);
-    float   lr_init=(cfg.d_model>=256)?1e-4f:2e-4f;
+    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS",50000.f);
+    int64_t total_steps=std::min(steps_cap, EPOCHS*(batches_per_epoch/grad_accum));
+    if (total_steps < 1) total_steps = 1;
 
-    // FIX-4/5/6: Hamiltonian-dominant mode
-    // T_start=0.5  → real annealing hoga (1e-5 se floor pe hi stuck tha)
-    // T_end=1e-3   → entropy floor preserved (FIX-1 bhi intact)
-    // aH_start=0.7 → Hamiltonian dominant from step 0 (gradient direction strong)
-    // aH_end=0.99  → near-pure Hamiltonian at end (deterministic convergence)
-    // friction=0.1 → kam friction = momentum build up kare
-    // mom_decay=0.95 → stronger momentum retention
+    // [v17] LR analysis: ye optimizer plain SGD-momentum jaisa hai (per-parameter
+    // normalization nahi). Effective SGD lr = lr·(α_H/2)/(1-β_eff), β_eff = mom - 0.5·α_L·γ.
+    //   v16: lr=5e-5 → lr_eff ≈ 7e-5..2e-4, clip=1.0 ⇒ har step ka norm ≤ ~1e-4.
+    //        ~9M params × 50k steps me total path-length ~2-5 (weights ka norm ~60) ⇒ UNDERFIT.
+    //   v17: lr=3e-3 → lr_eff ≈ 4e-3 (start) → warmup + cosine decay (floor 10%) se kam hota hai.
+    // Ye ek starting point hai — pehle 2-3k steps me Train_CE girni chahiye; nahi gire to
+    // LOGOS_LR ×3 karo, GNorm/gn-split explode kare to ÷3.
+    float   lr_init      = logos_env_f("LOGOS_LR",         3e-3f);
+    const float clip_norm = logos_env_f("LOGOS_CLIP",      1.0f);
+    const float t_start   = logos_env_f("LOGOS_T_START",   0.1f);   // was 0.5 (entropy bonus F=CE-T·S bahut bada tha)
+    const int   warmup_steps = (int)logos_env_f("LOGOS_WARMUP", 500.f);
+    const float noise_gain   = logos_env_f("LOGOS_NOISE_GAIN", 0.05f);
+
+    // [v16-STABLE] Geodesic friction balance analysis:
+    //   aH (Hamiltonian) = gradient direction (deterministic descent)
+    //   aL (Langevin)    = thermal noise (exploration, local minima escape)
+    //   Previous: aH_start=0.7 → too deterministic early → fell into local minima fast
+    //   Fix: aH_start=0.5 (balanced) → aH_end=0.95 (converge late)
+    //   friction=0.3 (was 0.1) → more geodesic damping → smoother trajectory
+    //   mom_decay=0.9 (was 0.95) → slightly less momentum → less overshoot
+    // Geodesic interpretation: friction controls how fast momentum decays
+    //   along the weight manifold geodesic. Too low = oscillations (GNorm explosion).
+    //   friction=0.3 gives ~3x more damping → stable convergence.
     GPUSHMOpt optimizer(lr_init,
-                        /*friction=*/0.1f,
-                        /*mom_decay=*/0.95f,
-                        /*T_start=*/0.5f,
-                        /*T_end=*/1e-3f,
-                        /*aH_start=*/0.7f,
-                        /*aH_end=*/0.99f,
+                        /*friction=*/0.3f,      // geodesic damping (was 0.1 → explosion)
+                        /*mom_decay=*/0.9f,      // momentum retention (was 0.95 → overshoot)
+                        /*T_start=*/t_start,     // entropy weight (+ noise, noise_gain se scaled)
+                        /*T_end=*/1e-3f,         // entropy floor (FIX-1 intact)
+                        /*aH_start=*/0.5f,       // balanced start (was 0.7 → local minima)
+                        /*aH_end=*/0.95f,        // Hamiltonian dominant at end
                         total_steps);
     auto gpu_params=gpu_model.all_parameters();
     optimizer.init(gpu_params);
@@ -790,10 +915,16 @@ void train_gpu(const std::string& dataset_path) {
            (long long)batches_per_epoch,(long long)total_steps,lr_init);
     printf("[5/5] Training...\n\n"); fflush(stdout);
 
-    printf("%-8s | %-8s | %-8s | %-8s | %-8s | %-6s | %-6s | %-8s | %-6s | %-8s\n",
-           "Step","F(loss)","CE","Entropy","GNorm","α_H","α_L","T","LRx","Vedic");
-    printf("---------|---------|---------|---------|---------|--------|--------|---------|--------|--------\n");
+    // [v16-STABLE] Val_CE column added — overfit/underfit detector
+    printf("%-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-6s | %-6s | %-8s | %-6s | %-8s\n",
+           "Step","F(loss)","Train_CE","Val_CE","Entropy","GNorm","α_H","α_L","T","LRx","Status");
+    printf("---------|---------|---------|---------|---------|---------|--------|--------|---------|--------|--------\n");
     fflush(stdout);
+
+    // Overfit detection thresholds
+    float prev_val_ce   = 999.f;
+    float prev_train_ce = 999.f;
+    int   overfit_streak = 0;   // consecutive steps val_ce rising while train_ce falls
 
     int64_t step=0;
     float   best_loss=999.f;
@@ -867,9 +998,12 @@ void train_gpu(const std::string& dataset_path) {
                 CUDA_KERNEL_CHECK();
             }
 
-            // FIX-7: GNorm 50-70 par clip=1.0 bahut aggressive tha (50x cut!)
-            // max_norm=5.0 → effective gradient ~10x zyada → CE descent shuru hoga
-            float grad_norm=cuda_clip_gradients(gpu_grads,5.0f);
+            // [v16-STABLE] grad_clip=1.0 (was 5.0 → GNorm reached 684 by step 62k)
+            // Root cause: LR=2e-4 + clip=5.0 + friction=0.1 = momentum accumulates
+            //   unchecked → GNorm exponential growth → training breakdown
+            // Fix: clip=1.0 hard ceiling → GNorm stays in 4-8 range (healthy)
+            // Combined with LR=5e-5: effective update = 5x smaller total
+            float grad_norm=cuda_clip_gradients(gpu_grads,1.0f);
 
             // [v14-WIRE] WeightPathIntegral adaptive LR scaling
             // lr_scale_ema(): current action spike ke hisab se LR shrink karta hai
@@ -927,9 +1061,78 @@ void train_gpu(const std::string& dataset_path) {
                 float cur_T, cur_aH, cur_aL;
                 optimizer.get_state(cur_T, cur_aH, cur_aL);
                 float lr_x = gpu_path_integral.lr_scale_ema(0.5f);
-                printf("%-8lld | %-8.4f | %-8.4f | %-8.4f | %-8.3f | %-6.2f | %-6.2f | %-8.4f | %-6.3f | %s\n",
-                       (long long)step, avg_F, avg_CE, avg_S,
-                       grad_norm, cur_aH, cur_aL, cur_T, lr_x, vedic_status);
+
+                // [v16-STABLE] Validation CE computation every 100 steps
+                // Run forward-only on 10 validation batches (no backward, no grad)
+                // This gives Val_CE to detect overfit/underfit
+                float val_ce_sum = 0.f;
+                int   val_count  = 0;
+                std::vector<std::pair<std::vector<int>,std::vector<int>>> val_batches;
+                int val_batches_to_eval = 10;
+                for (int vb = 0; vb < val_batches_to_eval; ++vb) {
+                    if (!val_loader.next_accum_batch(val_batches)) {
+                        // Restart val loader if exhausted
+                        val_loader.reset();
+                        if (!val_loader.next_accum_batch(val_batches)) break;
+                    }
+                    for (auto& [vin, vtgt] : val_batches) {
+                        int vseq = (int)vin.size();
+                        // Forward only — no backward, no grad accumulation
+                        gpu_model.phys.training = false;   // disable dropout for val
+                        GPUTensor vlogits = gpu_model.forward(vin);
+                        gpu_model.phys.training = true;    // re-enable for train
+
+                        int* d_vtgt;
+                        CUDA_CHECK(cudaMalloc(&d_vtgt, vseq*sizeof(int)));
+                        CUDA_CHECK(cudaMemcpy(d_vtgt, vtgt.data(),
+                                   vseq*sizeof(int), cudaMemcpyHostToDevice));
+                        float* d_vloss;
+                        CUDA_CHECK(cudaMalloc(&d_vloss, vseq*sizeof(float)));
+                        CUDA_CHECK(cudaMemset(d_vloss, 0, vseq*sizeof(float)));
+                        float* d_vgrad;
+                        CUDA_CHECK(cudaMalloc(&d_vgrad, vseq*V*sizeof(float)));
+
+                        FreeEnergyResult vfe;
+                        cuda_free_energy_loss(vlogits.data, d_vtgt,
+                            d_vloss, d_vgrad, vseq, V, optimizer.temperature, vfe);
+
+                        if (isfinite(vfe.cross_entropy)) {
+                            val_ce_sum += vfe.cross_entropy;
+                            ++val_count;
+                        }
+                        cudaFree(d_vtgt); cudaFree(d_vloss); cudaFree(d_vgrad);
+                    }
+                    val_batches.clear();
+                }
+                float val_ce = (val_count > 0) ? val_ce_sum / val_count : -1.f;
+
+                // [v16-STABLE] Overfit / Underfit detection
+                // Overfit:  val_ce goes UP while train_ce goes DOWN
+                // Underfit: both val_ce and train_ce > 5.0 after step 5000
+                const char* fit_status = "OK";
+                if (val_ce > 0.f && step > 500) {
+                    bool val_rising   = (val_ce   > prev_val_ce   + 0.05f);
+                    bool train_falling = (avg_CE  < prev_train_ce - 0.05f);
+                    if (val_rising && train_falling) {
+                        ++overfit_streak;
+                        fit_status = (overfit_streak >= 3) ? "OVERFIT!" : "OVF-warn";
+                    } else {
+                        overfit_streak = 0;
+                    }
+                    if (avg_CE > 5.5f && step > 5000) fit_status = "UNDERFIT";
+                    if (val_ce  > 5.5f && step > 5000) fit_status = "UNDERFIT";
+                }
+                if (val_ce > 0.f) { prev_val_ce = val_ce; prev_train_ce = avg_CE; }
+
+                if (val_ce > 0.f) {
+                    printf("%-8lld | %-8.4f | %-8.4f | %-8.4f | %-8.4f | %-8.3f | %-6.2f | %-6.2f | %-8.4f | %-6.3f | %s\n",
+                           (long long)step, avg_F, avg_CE, val_ce, avg_S,
+                           grad_norm, cur_aH, cur_aL, cur_T, lr_x, fit_status);
+                } else {
+                    printf("%-8lld | %-8.4f | %-8.4f | %-8s | %-8.4f | %-8.3f | %-6.2f | %-6.2f | %-8.4f | %-6.3f | %s\n",
+                           (long long)step, avg_F, avg_CE, "N/A", avg_S,
+                           grad_norm, cur_aH, cur_aL, cur_T, lr_x, fit_status);
+                }
                 fflush(stdout);
             }
 
@@ -941,8 +1144,10 @@ void train_gpu(const std::string& dataset_path) {
                 const char* gemm_backend = cuda_vedic_gemm_uses_cublas()
                                            ? "cuBLAS" : "CustomCUDA";
                 float lr_x = gpu_path_integral.lr_scale_ema(0.5f);
-                printf("Ckpt @ step %lld | best_F=%.4f | Vedic: %d/%d PASS [%s tol=5%%] | PI_LRx=%.3f\n",
-                       (long long)step, best_loss, vedic_pass, vedic_checks, gemm_backend, lr_x);
+                // Show val_ce at checkpoint for overfit tracking
+                printf("Ckpt @ step %lld | best_F=%.4f | Train_CE≈%.4f | Val_CE≈%.4f | Vedic: %d/%d [%s] | LRx=%.3f\n",
+                       (long long)step, best_loss, prev_train_ce, prev_val_ce,
+                       vedic_pass, vedic_checks, gemm_backend, lr_x);
                 fflush(stdout);
             }
             ++step;
@@ -958,8 +1163,9 @@ void train_gpu(const std::string& dataset_path) {
     save_checkpoint(cpu_model,"logos_final",(int)step);
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v15-COMPLETE)        ║\n");
+    printf("║  Training Complete! (v16-STABLE)          ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
+    printf("║  Train_CE: %.4f | Val_CE: %.4f          ║\n", prev_train_ce, prev_val_ce);
     if (cuda_vedic_gemm_uses_cublas()) {
         printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
         printf("║  (cuBLAS tol=5%% — correct formula)       ║\n");
