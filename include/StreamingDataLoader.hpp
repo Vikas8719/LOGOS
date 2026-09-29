@@ -265,6 +265,27 @@ public:
         return est_tokens / seq_len;
     }
 
+    // ── reset(): rewind to the beginning of the byte range ───────
+    // train_gpu.cu val_loader.reset() calls ke liye zaroori.
+    // Shard(s) ko byte_offset par wapas le jaata hai aur
+    // curr_chunk_ / curr_pos_ clear karta hai.
+    void reset() {
+        // Stop any in-flight prefetch thread first
+        {
+            std::lock_guard<std::mutex> lk(prefetch_mutex_);
+            prefetch_stop_ = false;   // we are NOT destroying, just rewinding
+            prefetch_ready_ = false;
+        }
+        if (prefetch_thread_.joinable()) prefetch_thread_.join();
+
+        current_shard   = 0;
+        total_tokens_seen = 0;
+        total_steps_done  = 0;
+        _open_current_shard();        // reseek to byte_offset of shard 0
+        _load_next_chunk_sync();      // first chunk synchronous
+        _launch_prefetch();           // background prefetch restart
+    }
+
     // ── Checkpoint: save/restore loader state ─────────────────
     // BUG 6 FIX: OOM-safe checkpointing — save loader position
     // so training can resume without re-reading from start
