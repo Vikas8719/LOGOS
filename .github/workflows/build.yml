@@ -307,7 +307,7 @@ jobs:
     name: "Kaggle GPU Trigger"
     runs-on: ubuntu-22.04
     needs: [math-tests-linux]
-    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -322,7 +322,10 @@ jobs:
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
           if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
-            echo "::error::Kaggle secrets missing - add KAGGLE_USERNAME and KAGGLE_KEY in Settings > Secrets > Actions"
+            echo "::error::Kaggle secrets missing!"
+            echo "::error::Go to: GitHub repo → Settings → Secrets → Actions"
+            echo "::error::Add: KAGGLE_USERNAME=vikas8719  KAGGLE_KEY=<your-key>"
+            echo "::error::Get key from: https://www.kaggle.com/settings → API → Create New Token"
             echo "valid=false" >> $GITHUB_OUTPUT
             exit 1
           fi
@@ -331,6 +334,7 @@ jobs:
           chmod 600 ~/.kaggle/kaggle.json
           echo "valid=true" >> $GITHUB_OUTPUT
           echo "username=$KAGGLE_USERNAME" >> $GITHUB_OUTPUT
+          echo "✅ Secrets present: KAGGLE_USERNAME=${KAGGLE_USERNAME:0:3}*** KAGGLE_KEY=***"
 
       - name: Test Kaggle auth
         if: steps.validate.outputs.valid == 'true'
@@ -349,51 +353,60 @@ jobs:
             "https://www.kaggle.com/api/v1/kernels/list?page=1&pageSize=1")
 
           echo "HTTP status: $HTTP_CODE"
-          cat /tmp/kaggle_auth.json | head -c 200 || true
+          cat /tmp/kaggle_auth.json | head -c 300 || true
 
           if [ "$HTTP_CODE" = "200" ]; then
             echo "auth_ok=true" >> $GITHUB_OUTPUT
-            echo "Auth successful"
+            echo "✅ Kaggle auth OK"
           elif [ "$HTTP_CODE" = "401" ]; then
             echo "auth_ok=false" >> $GITHUB_OUTPUT
-            echo "::error::401 Unauthorized - Your Kaggle API key is expired or invalid"
-            echo "::error::Fix: Go to https://www.kaggle.com/settings > API > Expire API Token > Create New Token"
-            echo "::error::Then update KAGGLE_KEY secret in GitHub: Settings > Secrets > Actions > KAGGLE_KEY"
+            echo "::error::401 Unauthorized — API key expired or wrong"
+            echo "::error::Fix: kaggle.com/settings → API → Expire + Create New Token"
+            echo "::error::Then update KAGGLE_KEY in GitHub Secrets"
             exit 1
           else
             echo "auth_ok=false" >> $GITHUB_OUTPUT
-            echo "::warning::Kaggle API returned HTTP $HTTP_CODE"
+            echo "::error::Kaggle API returned HTTP $HTTP_CODE (network issue?)"
             exit 1
           fi
 
-      - name: Create kernel metadata if missing
+      - name: Write kernel-metadata.json (correct id, no indentation bug)
         if: steps.auth.outputs.auth_ok == 'true'
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           USERNAME_LOWER=$(echo "$KAGGLE_USERNAME" | tr '[:upper:]' '[:lower:]')
           KERNEL_ID="${USERNAME_LOWER}/logos-gpu-training-v3"
-
-          cat > kernel-metadata.json << EOF
-          {
-            "id": "${KERNEL_ID}",
-            "title": "LOGOS GPU Training v3",
-            "code_file": "kaggle_gpu_train.ipynb",
-            "language": "python",
-            "kernel_type": "notebook",
-            "is_private": true,
-            "enable_gpu": true,
-            "enable_internet": true,
-            "dataset_sources": [],
-            "competition_sources": [],
-            "kernel_sources": []
-          }
-          EOF
           echo "Kernel ID: $KERNEL_ID"
-          cat kernel-metadata.json
+
+          # Write with python to avoid heredoc indentation bugs
+          python3 - <<PYEOF
+import json, os
+meta = {
+  "id": os.environ.get("KERNEL_ID", "vikas8719/logos-gpu-training-v3"),
+  "title": "LOGOS GPU Training v3",
+  "code_file": "kaggle_gpu_train.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": True,
+  "enable_gpu": True,
+  "enable_internet": True,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
+with open("kernel-metadata.json", "w") as f:
+    json.dump(meta, f, indent=2)
+print("Written kernel-metadata.json:")
+print(open("kernel-metadata.json").read())
+PYEOF
+        env:
+          KERNEL_ID: ${{ env.KERNEL_ID }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
 
       - name: Push notebook to Kaggle
         if: steps.auth.outputs.auth_ok == 'true'
+        id: push
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
@@ -403,42 +416,48 @@ jobs:
           chmod 600 ~/.kaggle/kaggle.json
 
           USERNAME_LOWER=$(echo "$KAGGLE_USERNAME" | tr '[:upper:]' '[:lower:]')
-          echo "Pushing notebook as ${USERNAME_LOWER}/logos-gpu-training-v3 ..."
+          KERNEL_ID="${USERNAME_LOWER}/logos-gpu-training-v3"
+
+          echo "=== Files being pushed ==="
+          ls -la kaggle_gpu_train.ipynb kernel-metadata.json
+          echo "kernel-metadata.json content:"
+          cat kernel-metadata.json
+          echo ""
+          echo "Pushing as $KERNEL_ID ..."
 
           set +e
           OUTPUT=$(kaggle kernels push -p . 2>&1)
           CODE=$?
           set -e
-          echo "$OUTPUT"
+          echo "Exit code: $CODE"
+          echo "Output: $OUTPUT"
 
           if [ $CODE -eq 0 ]; then
-            echo "Notebook pushed successfully"
-            echo "View at: https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
-            echo ""
-            echo "NOTE: Kaggle runs the notebook asynchronously."
-            echo "Check results at: https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
-
-          elif echo "$OUTPUT" | grep -q "403\|does not resolve\|No such kernel"; then
-            echo "::warning::Kernel does not exist yet on Kaggle"
-            echo "First-time setup required:"
-            echo "  1. Go to https://www.kaggle.com/code"
-            echo "  2. Click 'New Notebook'"
-            echo "  3. Set title exactly: 'LOGOS GPU Training v3'"
-            echo "  4. Enable GPU in Settings"
-            echo "  5. Re-run this CI pipeline"
+            echo "push_ok=true" >> $GITHUB_OUTPUT
+            echo "✅ Notebook pushed to Kaggle!"
+            echo "🔗 https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
+          elif echo "$OUTPUT" | grep -qiE "403|does not resolve|No such kernel|not found"; then
+            echo "push_ok=false" >> $GITHUB_OUTPUT
+            echo "::error::Kernel '$KERNEL_ID' does not exist on Kaggle yet!"
+            echo "::error::ONE-TIME SETUP (do this once manually):"
+            echo "::error::  1. Go to https://www.kaggle.com/code → New Notebook"
+            echo "::error::  2. Click the ⋮ menu → Rename → type exactly: logos-gpu-training-v3"
+            echo "::error::  3. Session Options → Accelerator → GPU T4 x2, Internet ON"
+            echo "::error::  4. Save the empty notebook"
+            echo "::error::  5. Re-push to GitHub — CI will push the real notebook automatically"
             exit 1
-
-          elif echo "$OUTPUT" | grep -q "401"; then
-            echo "::error::401 - API key expired. Regenerate at kaggle.com/settings > API"
+          elif echo "$OUTPUT" | grep -qi "401"; then
+            echo "push_ok=false" >> $GITHUB_OUTPUT
+            echo "::error::401 — API key expired"
             exit 1
-
           else
+            echo "push_ok=false" >> $GITHUB_OUTPUT
             echo "::error::Push failed: $OUTPUT"
             exit 1
           fi
 
-      - name: Poll Kaggle run status (wait up to 5 min for start)
-        if: steps.auth.outputs.auth_ok == 'true'
+      - name: Poll Kaggle run status (20 min max)
+        if: steps.push.outputs.push_ok == 'true'
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
@@ -450,55 +469,27 @@ jobs:
           USERNAME_LOWER=$(echo "$KAGGLE_USERNAME" | tr '[:upper:]' '[:lower:]')
           KERNEL_ID="${USERNAME_LOWER}/logos-gpu-training-v3"
 
-          # ── FIX: Kaggle GPU notebooks sit in QUEUED for 5-15 min ──────────
-          # Previous: 10 × 30s = 5 min total — nearly always still QUEUED.
-          # Root cause: Kaggle queues GPU kernels based on cluster load.
-          #   A fresh push takes 5-20 min to reach RUNNING, sometimes longer.
-          # Fix: Poll up to 20 times × 60s = 20 min max.
-          #   Exit early on RUNNING/COMPLETE/ERROR — don't wait full 20 min.
-          #   A final QUEUED after 20 min is still a successful trigger (async).
-          # ─────────────────────────────────────────────────────────────────────
-          MAX_POLLS=20
-          SLEEP_SEC=60
-
-          echo "Polling kernel status for $KERNEL_ID ..."
-          echo "(max ${MAX_POLLS} polls × ${SLEEP_SEC}s = $((MAX_POLLS * SLEEP_SEC / 60)) min)"
+          echo "Polling $KERNEL_ID (max 20×60s = 20 min)..."
           FINAL_STATUS="unknown"
 
-          for i in $(seq 1 $MAX_POLLS); do
-            sleep $SLEEP_SEC
-            RAW=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null || echo "unknown")
-            STATUS_UPPER=$(echo "$RAW" | tr '[:lower:]' '[:upper:]')
-            echo "[$i/$MAX_POLLS] Status: $RAW"
+          for i in $(seq 1 20); do
+            sleep 60
+            RAW=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null || echo "error")
+            echo "[$i/20] $RAW"
             FINAL_STATUS="$RAW"
-
-            # Exit early the moment training actually starts or finishes
-            if echo "$STATUS_UPPER" | grep -qE "RUNNING|COMPLETE|ERROR|CANCEL"; then
-              echo "✅ Kernel left queue — exiting poll loop early"
+            if echo "$RAW" | grep -qiE "running|complete|error|cancel"; then
+              echo "✅ Left queue early at poll $i"
               break
             fi
           done
 
           echo ""
-          echo "════════════════════════════════════════════"
-          echo "  Kaggle GPU notebook trigger complete"
-          echo "  Final status : $FINAL_STATUS"
-          if echo "$FINAL_STATUS" | grep -qi "QUEUED"; then
-            echo "  ℹ️  Still QUEUED — this is NORMAL for Kaggle GPU."
-            echo "  Kaggle P100/T4 slots fill up; notebook will run when"
-            echo "  a GPU becomes available (usually within 30-60 min)."
-            echo "  CI exits SUCCESS — training is asynchronous."
-          elif echo "$FINAL_STATUS" | grep -qi "RUNNING"; then
-            echo "  🚀 Kernel is RUNNING — GPU training in progress!"
-          elif echo "$FINAL_STATUS" | grep -qi "COMPLETE"; then
-            echo "  ✅ Kernel COMPLETE — check output for results"
-          elif echo "$FINAL_STATUS" | grep -qi "ERROR"; then
-            echo "  ❌ Kernel ERROR — check Kaggle notebook for details"
-          fi
-          echo "  Results: https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
-          echo "════════════════════════════════════════════"
-          # Never exit non-zero here — QUEUED is not a CI failure.
-          # The notebook runs async on Kaggle; CI's job is only to trigger it.
+          echo "══════════════════════════════════════"
+          echo "  Final status: $FINAL_STATUS"
+          echo "  Link: https://www.kaggle.com/code/${USERNAME_LOWER}/logos-gpu-training-v3"
+          echo "══════════════════════════════════════"
+          # QUEUED after 20min = normal for Kaggle GPU. Not a failure.
+          exit 0
 
   summary:
     name: "CI Summary"
