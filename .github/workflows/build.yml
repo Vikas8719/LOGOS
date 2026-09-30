@@ -1,4 +1,4 @@
-name: LOGOS CI v17-BIGDATA
+name: LOGOS CI v18-RESUME
 
 permissions:
   contents: read
@@ -429,7 +429,7 @@ jobs:
           R7: ${{ needs.macos-build.result }}
         run: |
           echo "================================================="
-          echo "  LOGOS CI Summary — v17-BIGDATA"
+          echo "  LOGOS CI Summary — v18-RESUME"
           echo "================================================="
           echo "  T2 Math Linux:        $R1  (Vedic + Physics math)"
           echo "  T2 Math Windows:      $R2"

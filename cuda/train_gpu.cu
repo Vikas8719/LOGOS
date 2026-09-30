@@ -718,13 +718,13 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v17-AUDIT            ║\n");
-    printf("║  ✦ Fixed val-set CE (overfit/underfit)   ║\n");
-    printf("║  ✦ Wikipedia Hindi+English (shuffled)    ║\n");
-    printf("║  ✦ friction fixed (was no-op), noise_gain║\n");
-    printf("║  ✦ warmup+cosine LR, clip, 50k step cap  ║\n");
-    printf("║  ✦ bias grads, V_s, LN2, hyper-emb bwd   ║\n");
-    printf("║  ✦ per-group GNorm diagnostics           ║\n");
+    printf("║  LOGOS GPU Training v18-RESUME           ║\n");
+    printf("║  ✦ RESUME from step 51k to 100k target  ║\n");
+    printf("║  ✦ LR restart 1e-3 (fresh cosine cycle) ║\n");
+    printf("║  ✦ clip_norm=0.3 (was 1.0, GNorm fix)  ║\n");
+    printf("║  ✦ start_step=51001 offset for logging  ║\n");
+    printf("║  ✦ best_F warm-init 2.9551 from prev    ║\n");
+    printf("║  ✦ GNorm explosion prevention: clip 0.3 ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -858,15 +858,18 @@ void train_gpu(const std::string& dataset_path) {
     printf("  Val set: %zu fixed windows x %d tokens\n", fixed_val.size(), SEQ);
     if (fixed_val.empty()) printf("  ⚠️  Val set empty — Val_CE N/A rahega\n");
 
-    // [v17] Steps hard-cap (default 50000). Pehle sirf total_steps compute hota tha,
-    // loop me koi break nahi tha → poora dataset khatam hone tak train chalta rehta.
-    // Ab loop ke top par `step >= total_steps` par break hai.
-    // NOTE: 50k steps × grad_accum × seq tokens ≈ dataset ka sirf shuruaati hissa padhte
-    // hain (Wikipedia bahut bada hai) — isliye dataset file shuffled honi zaroori hai.
-    int EPOCHS=1;
+    // [v18-RESUME] Steps: 51001 se 100000 tak (49000 naye steps)
+    // start_step = 51001: logging offset taaki checkpoints sahi step number dikhayein
+    // total_steps = 100000: absolute target (not delta) — loop step >= total_steps pe break
+    // EPOCHS=2: dataset ek baar aur dekho (Wikipedia 1.5GB, 50k steps mein ~1% tha)
+    // Env override: LOGOS_STEPS se override possible (default 100000)
+    int EPOCHS=2;
     int64_t batches_per_epoch=loader.total_batches_per_epoch();
-    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS",50000.f);
-    int64_t total_steps=std::min(steps_cap, EPOCHS*(batches_per_epoch/grad_accum));
+    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS",100000.f);
+    // [v18-RESUME] Start offset: step counter yahaan se shuru hoga
+    // Kaggle pe prev run ka last step 51400 tha, hum 51001 se resume karte hain
+    const int64_t start_step = (int64_t)logos_env_f("LOGOS_START_STEP", 51001.f);
+    int64_t total_steps=std::min(steps_cap, start_step + EPOCHS*(batches_per_epoch/grad_accum));
     if (total_steps < 1) total_steps = 1;
 
     // [v17] LR analysis: ye optimizer plain SGD-momentum jaisa hai (per-parameter
@@ -876,11 +879,17 @@ void train_gpu(const std::string& dataset_path) {
     //   v17: lr=3e-3 → lr_eff ≈ 4e-3 (start) → warmup + cosine decay (floor 10%) se kam hota hai.
     // Ye ek starting point hai — pehle 2-3k steps me Train_CE girni chahiye; nahi gire to
     // LOGOS_LR ×3 karo, GNorm/gn-split explode kare to ÷3.
-    float   lr_init      = logos_env_f("LOGOS_LR",         3e-3f);
-    const float clip_norm = logos_env_f("LOGOS_CLIP",      1.0f);
-    const float t_start   = logos_env_f("LOGOS_T_START",   0.1f);   // was 0.5 (entropy bonus F=CE-T·S bahut bada tha)
-    const int   warmup_steps = (int)logos_env_f("LOGOS_WARMUP", 500.f);
-    const float noise_gain   = logos_env_f("LOGOS_NOISE_GAIN", 0.05f);
+    // [v18-RESUME] LR restart: pehle 3e-3 tha, ab 1e-3 se fresh cosine shuru
+    // Reason: step 28k ke baad best_F plateau → cosine ne LR ~0 kar diya tha.
+    // Fresh 1e-3 restart → naye learning trajectories, same data different regions.
+    // clip_norm: 1.0 → 0.3  (GNorm step 42k pe 463, step 48k pe 1015 tha → EXPLOSION)
+    // Root cause: cosine-end pe LR near-zero tha but momentum accumulation nahi ruka
+    // 0.3 clip → effective GNorm budget ×3 tighter → stable late training
+    float   lr_init      = logos_env_f("LOGOS_LR",         1e-3f);
+    const float clip_norm = logos_env_f("LOGOS_CLIP",      0.3f);
+    const float t_start   = logos_env_f("LOGOS_T_START",   0.05f);  // aur kam T → entropy bonus reduce
+    const int   warmup_steps = (int)logos_env_f("LOGOS_WARMUP", 300.f);  // shorter warmup (already warm)
+    const float noise_gain   = logos_env_f("LOGOS_NOISE_GAIN", 0.02f);  // noise bhi kam (less exploration needed)
 
     // [v16-STABLE] Geodesic friction balance analysis:
     //   aH (Hamiltonian) = gradient direction (deterministic descent)
@@ -892,14 +901,20 @@ void train_gpu(const std::string& dataset_path) {
     // Geodesic interpretation: friction controls how fast momentum decays
     //   along the weight manifold geodesic. Too low = oscillations (GNorm explosion).
     //   friction=0.3 gives ~3x more damping → stable convergence.
+    // [v18-RESUME] Optimizer tuning for resume phase:
+    // aH_start=0.70 (was 0.5): pehle se converged model → exploration kam, exploitation zyada
+    // aH_end=0.95: same (want Hamiltonian dominant at end)
+    // friction=0.4 (was 0.3): thoda aur damping → GNorm spike prevention
+    // mom_decay=0.85 (was 0.9): momentum thoda less → late-phase overshoot avoid
+    // T_start=0.05 (set above): aur kam entropy bonus → sharper loss landscape
     GPUSHMOpt optimizer(lr_init,
-                        /*friction=*/0.3f,      // geodesic damping (was 0.1 → explosion)
-                        /*mom_decay=*/0.9f,      // momentum retention (was 0.95 → overshoot)
-                        /*T_start=*/t_start,     // entropy weight (+ noise, noise_gain se scaled)
+                        /*friction=*/0.4f,       // more geodesic damping (GNorm explosion prevention)
+                        /*mom_decay=*/0.85f,     // less momentum retention (avoid late overshoot)
+                        /*T_start=*/t_start,     // 0.05 (was 0.1 → entropy bonus kam)
                         /*T_end=*/1e-3f,         // entropy floor (FIX-1 intact)
-                        /*aH_start=*/0.5f,       // balanced start (was 0.7 → local minima)
+                        /*aH_start=*/0.70f,      // already converged → start more Hamiltonian
                         /*aH_end=*/0.95f,        // Hamiltonian dominant at end
-                        total_steps);
+                        total_steps - start_step); // remaining steps ke liye anneal
     auto gpu_params=gpu_model.all_parameters();
     optimizer.init(gpu_params);
     auto gpu_grads=gpu_model.alloc_grad_buffers();
@@ -936,8 +951,13 @@ void train_gpu(const std::string& dataset_path) {
     float prev_train_ce = 999.f;
     int   overfit_streak = 0;   // consecutive steps val_ce rising while train_ce falls
 
-    int64_t step=0;
-    float   best_loss=999.f;
+    // [v18-RESUME] step counter start_step se shuru → checkpoint names sahi rahenge
+    // best_loss warm-init: prev run ka best_F 2.9551 tha (step 28k se plateau)
+    // Naya run agar 2.9551 se better kare tabhi checkpoint "best" mark hoga
+    int64_t step=start_step;
+    float   best_loss = logos_env_f("LOGOS_BEST_F", 2.9551f);  // warm-init from prev best
+    printf("\n[v18-RESUME] start_step=%lld | best_F warm-init=%.4f | target=%lld\n\n",
+           (long long)start_step, best_loss, (long long)total_steps);
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
 
@@ -952,6 +972,12 @@ void train_gpu(const std::string& dataset_path) {
         std::vector<std::pair<std::vector<int>,std::vector<int>>> micro_batches;
 
         while (loader.next_accum_batch(micro_batches)) {
+            // [v18-RESUME] Hard cap: step >= total_steps → stop
+            if (step >= total_steps) {
+                printf("\n[v18-RESUME] Reached total_steps=%lld at step=%lld — stopping.\n",
+                       (long long)total_steps, (long long)step);
+                goto training_done;
+            }
             for (auto* g : gpu_grads)
                 CUDA_CHECK(cudaMemset(g->data,0,g->size*sizeof(float)));
 
@@ -1023,8 +1049,10 @@ void train_gpu(const std::string& dataset_path) {
 
             // Record step norm for path integral (lightweight GPU norm estimate)
             gpu_path_integral.record_step_norm(avg_F, grad_norm * optimizer.lr);
-            // Reset best every 2000 steps (prevent decaying to floor permanently)
-            if (step > 0 && step % 2000 == 0) gpu_path_integral.reset_best();
+            // [v18-RESUME] Reset best every 5000 steps (was 2000)
+            // Late training mein zyada reset → LR unnecessarily drops → slower convergence
+            // 5000 steps = ~1.28M tokens per reset cycle (more stable)
+            if (step > start_step && (step - start_step) % 5000 == 0) gpu_path_integral.reset_best();
 
             if (step % 1000 == 0 && step > 0) {
                 // ── [v11-CLIP FIX] Gunitasamuchayah Verification ──────────────
@@ -1181,6 +1209,7 @@ void train_gpu(const std::string& dataset_path) {
                epoch+1,(long long)step,best_loss,optimizer.alpha_H);
     }
 
+    training_done:  // [v18-RESUME] goto target from step cap check
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaFree(d_targets); cudaFree(d_loss_buf); cudaFree(d_grad_out);
     for (auto* g : gpu_grads) delete g;
@@ -1188,7 +1217,7 @@ void train_gpu(const std::string& dataset_path) {
     save_checkpoint(cpu_model,"logos_final",(int)step);
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v16-STABLE)          ║\n");
+    printf("║  Training Complete! (v18-RESUME)         ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Train_CE: %.4f | Val_CE: %.4f          ║\n", prev_train_ce, prev_val_ce);
     if (cuda_vedic_gemm_uses_cublas()) {
