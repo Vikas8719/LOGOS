@@ -718,13 +718,12 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v18-RESUME           ║\n");
-    printf("║  ✦ RESUME from step 51k to 100k target  ║\n");
-    printf("║  ✦ LR restart 1e-3 (fresh cosine cycle) ║\n");
-    printf("║  ✦ clip_norm=0.3 (was 1.0, GNorm fix)  ║\n");
-    printf("║  ✦ start_step=51001 offset for logging  ║\n");
-    printf("║  ✦ best_F warm-init 2.9551 from prev    ║\n");
-    printf("║  ✦ GNorm explosion prevention: clip 0.3 ║\n");
+    printf("║  LOGOS GPU Training v19-TRUE-RESUME      ║\n");
+    printf("║  ✦ LOGOS_CKPT se actual weights load    ║\n");
+    printf("║  ✦ LOGOS_VOCAB se vocab.bin load        ║\n");
+    printf("║  ✦ LOGOS_START_STEP se step offset      ║\n");
+    printf("║  ✦ LOGOS_BEST_F se best checkpoint      ║\n");
+    printf("║  ✦ clip_norm=0.3 | LR=1e-3              ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -794,6 +793,53 @@ void train_gpu(const std::string& dataset_path) {
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
     LOGOSModel cpu_model(cfg);
+
+    // ── [v19-TRUE-RESUME] Checkpoint + Vocab load ────────────────────────
+    // Kaggle notebook CELL 1 mein set karo:
+    //   os.environ["LOGOS_CKPT"]  = "/kaggle/input/logos-ckpt/logos_gpu_ckpt_step61000.bin"
+    //   os.environ["LOGOS_VOCAB"] = "/kaggle/input/logos-ckpt/vocab.bin"
+    // LOGOS_CKPT set nahi = fresh run (step 0 se)
+    bool resumed = false;
+    {
+        const char* ckpt_env  = std::getenv("LOGOS_CKPT");
+        const char* vocab_env = std::getenv("LOGOS_VOCAB");
+
+        if (ckpt_env && *ckpt_env) {
+            std::string ckpt_path(ckpt_env);
+            std::string vocab_path = (vocab_env && *vocab_env)
+                                     ? std::string(vocab_env) : std::string("vocab.bin");
+
+            printf("  [v19] Checkpoint: %s\n", ckpt_path.c_str());
+            printf("  [v19] Vocab:      %s\n", vocab_path.c_str());
+
+            // vocab.bin pehle load karo — tokenizer rebuild band
+            Tokenizer resume_tok;
+            if (resume_tok.load(vocab_path)) {
+                printf("  ✅ Vocab loaded: %d tokens\n", resume_tok.vocab_size);
+                if (resume_tok.vocab_size != cfg.vocab_size) {
+                    printf("  ℹ️  Vocab size update: %d → %d\n",
+                           cfg.vocab_size, resume_tok.vocab_size);
+                    cfg.vocab_size = resume_tok.vocab_size;
+                }
+                tok = resume_tok;
+            } else {
+                printf("  ⚠️  vocab.bin nahi mili — naya tokenizer use hoga\n");
+            }
+
+            // cpu_model cfg ke saath rebuild (load_checkpoint strict match chahta hai)
+            cpu_model = LOGOSModel(cfg);
+            if (load_checkpoint(cpu_model, ckpt_path)) {
+                resumed = true;
+                printf("  ✅ Weights loaded — TRUE RESUME ✓\n");
+            } else {
+                printf("  ❌ Checkpoint load FAIL (config mismatch?) — fresh weights\n");
+            }
+        } else {
+            printf("  ℹ️  LOGOS_CKPT not set → fresh run\n");
+            printf("      Resume ke liye set karo: LOGOS_CKPT=/path/logos_gpu_ckpt_stepXXXXX.bin\n");
+        }
+    }
+
     ModelGPU   gpu_model(cfg);
     gpu_model.load_from_cpu(cpu_model);
 
@@ -865,10 +911,13 @@ void train_gpu(const std::string& dataset_path) {
     // Env override: LOGOS_STEPS se override possible (default 100000)
     int EPOCHS=2;
     int64_t batches_per_epoch=loader.total_batches_per_epoch();
-    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS",100000.f);
-    // [v18-RESUME] Start offset: step counter yahaan se shuru hoga
-    // Kaggle pe prev run ka last step 51400 tha, hum 51001 se resume karte hain
-    const int64_t start_step = (int64_t)logos_env_f("LOGOS_START_STEP", 51001.f);
+    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS",150000.f);
+    // [v19-TRUE-RESUME] start_step: resumed=true ho to LOGOS_START_STEP env se lo
+    // Kaggle CELL 1 mein: os.environ["LOGOS_START_STEP"] = "61000"  (last checkpoint step)
+    // Fresh run mein: 0 se shuru
+    const int64_t start_step = resumed
+        ? (int64_t)logos_env_f("LOGOS_START_STEP", 0.f)
+        : 0LL;
     int64_t total_steps=std::min(steps_cap, start_step + EPOCHS*(batches_per_epoch/grad_accum));
     if (total_steps < 1) total_steps = 1;
 
@@ -955,9 +1004,15 @@ void train_gpu(const std::string& dataset_path) {
     // best_loss warm-init: prev run ka best_F 2.9551 tha (step 28k se plateau)
     // Naya run agar 2.9551 se better kare tabhi checkpoint "best" mark hoga
     int64_t step=start_step;
-    float   best_loss = logos_env_f("LOGOS_BEST_F", 2.9551f);  // warm-init from prev best
-    printf("\n[v18-RESUME] start_step=%lld | best_F warm-init=%.4f | target=%lld\n\n",
-           (long long)start_step, best_loss, (long long)total_steps);
+    // [v19-TRUE-RESUME] best_loss:
+    //   resumed=true  → LOGOS_BEST_F env se lo (pichle run ka actual best)
+    //   fresh run     → 999.f (koi bhi pehla F isse better hoga)
+    // Kaggle CELL 1: os.environ["LOGOS_BEST_F"] = "2.9551"
+    float   best_loss = resumed
+        ? logos_env_f("LOGOS_BEST_F", 999.f)
+        : 999.f;
+    printf("\n[v19-TRUE-RESUME] resumed=%s | start_step=%lld | best_F=%.4f | target=%lld\n\n",
+           resumed?"YES":"NO", (long long)start_step, best_loss, (long long)total_steps);
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
 
