@@ -9,6 +9,7 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <cstdint>
 
 // Keep the legacy positional-embedding block in the binary layout so existing
 // checkpoints remain readable. RoPE has no learned position tensor, so newly
@@ -49,7 +50,6 @@ static bool discard_legacy_position_slot(std::ifstream& f,
 }
 
 // ── Internal: validate cfg fields from file ──────────────────
-// BUG 3 FIX: All fields checked before ANY allocation or tensor access
 static bool validate_checkpoint_cfg(const ModelConfig& cfg, const std::string& path) {
     auto chk = [&](const char* name, int val, int lo, int hi) -> bool {
         if (val < lo || val > hi) {
@@ -87,9 +87,6 @@ static bool validate_checkpoint_cfg(const ModelConfig& cfg, const std::string& p
     return true;
 }
 
-// ── Internal: check cfg match between file and model ─────────
-// BUG 4 FIX: This is the NEW strict check.
-// Returns true only if all architecture params match exactly.
 static bool cfgs_match(const ModelConfig& from_file,
                         const ModelConfig& model_cfg,
                         const std::string& path)
@@ -114,7 +111,6 @@ static bool cfgs_match(const ModelConfig& from_file,
     return ok;
 }
 
-// ── Internal: read tensor with safe size check ───────────────
 static bool read_tensor_safe(std::ifstream& f, Tensor& t, const std::string& path) {
     auto bytes = static_cast<std::streamsize>(t.total_size * sizeof(float));
     f.read(reinterpret_cast<char*>(t.data.data()), bytes);
@@ -125,21 +121,14 @@ static bool read_tensor_safe(std::ifstream& f, Tensor& t, const std::string& pat
     return true;
 }
 
-// ── Internal: read tensor with clamped size (force mode) ─────
-// Reads min(file_available, tensor_size) — prevents overflow
 static bool read_tensor_clamped(std::ifstream& f, Tensor& t, const std::string& path) {
-    // In force mode we can't know exact file tensor size without re-computing from
-    // file cfg. Best effort: read what model expects, skip if file is shorter.
     auto bytes = static_cast<std::streamsize>(t.total_size * sizeof(float));
     f.read(reinterpret_cast<char*>(t.data.data()), bytes);
     if (f.gcount() < bytes) {
-        // Partial read — zero-fill remainder
         size_t got = static_cast<size_t>(f.gcount());
-        size_t remaining = static_cast<size_t>(bytes) - got;
         std::fill(t.data.begin() + got/sizeof(float), t.data.end(), 0.0f);
         std::cerr << "⚠️  Partial tensor read (" << got << "/" << bytes
                   << " bytes) in: " << path << " — zero-padded\n";
-        // Don't fail — force mode tolerates partial reads
     }
     return true;
 }
@@ -158,7 +147,6 @@ bool save_checkpoint(const LOGOSModel& model,
         return false;
     }
 
-    // Write config (used to validate on load)
     f.write(reinterpret_cast<const char*>(&model.cfg), sizeof(ModelConfig));
 
     auto wt = [&](const Tensor& t) {
@@ -170,7 +158,6 @@ bool save_checkpoint(const LOGOSModel& model,
     write_legacy_position_slot(f, model.cfg);
     wt(model.lm_head);
 
-    // Helper: write a std::vector<float> (for BN running stats)
     auto wv = [&](const std::vector<float>& v) {
         f.write(reinterpret_cast<const char*>(v.data()),
                 static_cast<std::streamsize>(v.size() * sizeof(float)));
@@ -185,9 +172,6 @@ bool save_checkpoint(const LOGOSModel& model,
         wt(block.ffn.W2); wt(block.ffn.b2);
         wt(block.ln1.gamma); wt(block.ln1.beta);
         wt(block.ln2.gamma); wt(block.ln2.beta);
-        // IMPROVEMENT: Save ReynoldsBatchNorm EMA running stats.
-        // Before: running_mean/running_var were NEVER saved → cold BN after every load.
-        // After:  EMA buffers persist → model resumes warm training exactly.
         wv(block.ln1.running_mean); wv(block.ln1.running_var);
         wv(block.ln2.running_mean); wv(block.ln2.running_var);
     }
@@ -202,9 +186,7 @@ bool save_checkpoint(const LOGOSModel& model,
 }
 
 // ============================================================
-//  load_checkpoint — STRICT (BUG 4 FIX)
-//  Requires model cfg to exactly match file cfg.
-//  Returns false on any mismatch — no silent partial loads.
+//  load_checkpoint — STRICT
 // ============================================================
 bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -213,7 +195,6 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         return false;
     }
 
-    // Step 1: Read cfg from file
     ModelConfig file_cfg;
     f.read(reinterpret_cast<char*>(&file_cfg), sizeof(ModelConfig));
     if (!f || f.gcount() != sizeof(ModelConfig)) {
@@ -221,18 +202,12 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         return false;
     }
 
-    // Step 2: Validate cfg fields (BUG 3 FIX — bounds check)
     if (!validate_checkpoint_cfg(file_cfg, path)) return false;
-
-    // Step 3: BUG 4 FIX — STRICT cfg match check
-    // Pehle: mismatch pe warning tha, phir bhi load hota tha → silent overflow
-    // Ab:    mismatch pe false return — caller must fix their model config
     if (!cfgs_match(file_cfg, model.cfg, path)) {
         std::cerr << "❌ load_checkpoint() aborted — cfg mismatch prevents safe load\n";
-        return false;  // Hard abort — no silent buffer overflow
+        return false;
     }
 
-    // Step 4: Read tensors — sizes are safe (cfg verified to match)
     auto rt = [&](Tensor& t) -> bool {
         return read_tensor_safe(f, t, path);
     };
@@ -241,19 +216,16 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     if (!discard_legacy_position_slot(f, file_cfg, path, false)) return false;
     if (!rt(model.lm_head))       return false;
 
-    // Helper: read a std::vector<float> of known size
     auto rv = [&](std::vector<float>& v, const std::string& lbl) -> bool {
         auto bytes = static_cast<std::streamsize>(v.size() * sizeof(float));
         f.read(reinterpret_cast<char*>(v.data()), bytes);
         if (f.gcount() != bytes) {
-            // Older checkpoints won't have BN stats — tolerate gracefully.
-            // Zero-fill (cold BN) and continue: training resumes correctly.
             std::fill(v.begin(), v.end(), 0.0f);
-            f.clear();  // reset EOF so subsequent reads can proceed
+            f.clear();
             std::cerr << "⚠️  BN running stat '" << lbl
                       << "' missing in checkpoint (older format) — zero-initialised\n";
         }
-        return true;  // always non-fatal for BN stats
+        return true;
     };
 
     for (auto& block : model.layers) {
@@ -272,13 +244,10 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         if (!rt(block.ln1.beta))   return false;
         if (!rt(block.ln2.gamma))  return false;
         if (!rt(block.ln2.beta))   return false;
-        // IMPROVEMENT: Restore Reynolds BN EMA stats (warm resume).
-        // Older checkpoints silently zero-fill (cold start — safe fallback).
         rv(block.ln1.running_mean, "ln1.running_mean");
         rv(block.ln1.running_var,  "ln1.running_var");
         rv(block.ln2.running_mean, "ln2.running_mean");
         rv(block.ln2.running_var,  "ln2.running_var");
-        // Mark as initialized so eval path uses running stats (not batch stats)
         block.ln1.initialized = true;
         block.ln2.initialized = true;
     }
@@ -296,10 +265,7 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
 }
 
 // ============================================================
-//  load_checkpoint_force — PERMISSIVE (use with caution)
-//  Allows cfg mismatch — reads into existing model tensors.
-//  Tensors read safely (no overflow) — may zero-pad if file is shorter.
-//  Use for: vocab resize, architecture experiments, partial weight loading.
+//  load_checkpoint_force — PERMISSIVE
 // ============================================================
 bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -317,7 +283,6 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
 
     if (!validate_checkpoint_cfg(file_cfg, path)) return false;
 
-    // Warn about mismatch but proceed
     if (file_cfg.vocab_size  != model.cfg.vocab_size  ||
         file_cfg.d_model     != model.cfg.d_model     ||
         file_cfg.num_layers  != model.cfg.num_layers)
@@ -327,10 +292,8 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
                   << " L=" << file_cfg.num_layers << "\n";
         std::cerr << "   Model: vocab=" << model.cfg.vocab_size << " d=" << model.cfg.d_model
                   << " L=" << model.cfg.num_layers << "\n";
-        std::cerr << "   Result may be incorrect — use only for experimentation\n";
     }
 
-    // Read with clamping — no overflow possible
     auto rt = [&](Tensor& t) -> bool {
         return read_tensor_clamped(f, t, path);
     };
@@ -358,6 +321,130 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     }
 
     std::cout << "⚠️  Checkpoint force-loaded: " << path << "\n";
+    return true;
+}
+
+// ============================================================
+//  save_optimizer_state  (v21-OPTSTATE)
+//  Saves GPUSHMOpt velocity buffers + WeightPathIntegral EMA
+//  File: {base_path}_step{step}.optstate
+// ============================================================
+static constexpr uint32_t OPTSTATE_MAGIC   = 0x4F505431u;  // "OPT1"
+static constexpr uint32_t OPTSTATE_VERSION = 1u;
+
+bool save_optimizer_state(const OptimizerState& state,
+                          const std::string& base_path,
+                          int step)
+{
+    std::string path = base_path + "_step" + std::to_string(step) + ".optstate";
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "⚠️  Cannot save optimizer state: " << path
+                  << " (training continues, next resume will be cold)\n";
+        return false;
+    }
+
+    // Header
+    uint32_t magic   = OPTSTATE_MAGIC;
+    uint32_t version = OPTSTATE_VERSION;
+    int64_t  n_params = static_cast<int64_t>(state.velocities.size());
+    f.write(reinterpret_cast<const char*>(&magic),    sizeof(magic));
+    f.write(reinterpret_cast<const char*>(&version),  sizeof(version));
+    f.write(reinterpret_cast<const char*>(&n_params), sizeof(n_params));
+
+    // Per-parameter velocity vectors
+    for (const auto& vel : state.velocities) {
+        uint32_t sz = static_cast<uint32_t>(vel.size());
+        f.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+        f.write(reinterpret_cast<const char*>(vel.data()),
+                static_cast<std::streamsize>(sz * sizeof(float)));
+    }
+
+    // Footer: WeightPathIntegral EMA state
+    f.write(reinterpret_cast<const char*>(&state.ema_action),    sizeof(float));
+    f.write(reinterpret_cast<const char*>(&state.log_amplitude), sizeof(float));
+    f.write(reinterpret_cast<const char*>(&state.step_count),    sizeof(int64_t));
+
+    if (!f) {
+        std::cerr << "❌ Write error: " << path << "\n";
+        return false;
+    }
+    std::cout << "✅ Optimizer state saved: " << path
+              << " (" << n_params << " param groups)\n";
+    return true;
+}
+
+// ============================================================
+//  load_optimizer_state  (v21-OPTSTATE)
+//  Returns false gracefully if file missing (older checkpoint compat)
+// ============================================================
+bool load_optimizer_state(OptimizerState& state,
+                          const std::string& base_path,
+                          int step)
+{
+    std::string path = base_path + "_step" + std::to_string(step) + ".optstate";
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        // Older checkpoint — no optstate file, cold optimizer start
+        std::cout << "  ℹ️  No optimizer state found (" << path
+                  << ") — optimizer starts cold (normal for step 60000 checkpoint)\n";
+        return false;
+    }
+
+    // Read + validate header
+    uint32_t magic = 0, version = 0;
+    int64_t  n_params = 0;
+    f.read(reinterpret_cast<char*>(&magic),    sizeof(magic));
+    f.read(reinterpret_cast<char*>(&version),  sizeof(version));
+    f.read(reinterpret_cast<char*>(&n_params), sizeof(n_params));
+
+    if (magic != OPTSTATE_MAGIC) {
+        std::cerr << "❌ Optimizer state corrupt (bad magic): " << path << "\n";
+        return false;
+    }
+    if (version != OPTSTATE_VERSION) {
+        std::cerr << "⚠️  Optimizer state version mismatch (file=" << version
+                  << " expected=" << OPTSTATE_VERSION << ") — skipping\n";
+        return false;
+    }
+    if (n_params <= 0 || n_params > 100000) {
+        std::cerr << "❌ Optimizer state corrupt (n_params=" << n_params << ")\n";
+        return false;
+    }
+
+    // Per-parameter velocity vectors
+    state.velocities.resize(static_cast<size_t>(n_params));
+    for (auto& vel : state.velocities) {
+        uint32_t sz = 0;
+        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+        if (!f || sz == 0 || sz > 100000000u) {
+            std::cerr << "❌ Optimizer state corrupt (vel size=" << sz << ")\n";
+            return false;
+        }
+        vel.resize(sz);
+        f.read(reinterpret_cast<char*>(vel.data()),
+               static_cast<std::streamsize>(sz * sizeof(float)));
+        if (static_cast<size_t>(f.gcount()) != sz * sizeof(float)) {
+            std::cerr << "❌ Optimizer state truncated mid-velocity\n";
+            return false;
+        }
+    }
+
+    // Footer: WeightPathIntegral EMA
+    f.read(reinterpret_cast<char*>(&state.ema_action),    sizeof(float));
+    f.read(reinterpret_cast<char*>(&state.log_amplitude), sizeof(float));
+    f.read(reinterpret_cast<char*>(&state.step_count),    sizeof(int64_t));
+
+    if (!f) {
+        // Footer missing (very old optstate) — weights loaded, EMA cold
+        std::cerr << "⚠️  Optimizer EMA footer missing — velocities loaded, EMA cold\n";
+        state.ema_action = 0.0f; state.log_amplitude = 0.0f; state.step_count = 0;
+    }
+
+    std::cout << "✅ Optimizer state loaded: " << path
+              << " (" << n_params << " param groups"
+              << " | ema_action=" << state.ema_action
+              << " | steps=" << state.step_count << ")\n";
     return true;
 }
 

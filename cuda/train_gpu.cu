@@ -840,6 +840,10 @@ void train_gpu(const std::string& dataset_path) {
         }
     }
 
+    // [v21-OPTSTATE] Optimizer state — load kiya jaayega optimizer.init() ke baad
+    OptimizerState opt_state_loaded;
+    bool opt_state_found = false;
+
     ModelGPU   gpu_model(cfg);
     gpu_model.load_from_cpu(cpu_model);
 
@@ -968,6 +972,55 @@ void train_gpu(const std::string& dataset_path) {
     optimizer.init(gpu_params);
     auto gpu_grads=gpu_model.alloc_grad_buffers();
 
+    // [v14-WIRE] WeightPathIntegral — optimizer init ke BAAD, optstate load se PEHLE declare
+    WeightPathIntegral gpu_path_integral(/*hbar=*/1.0f, /*history=*/500);
+    float gpu_lr_scale = 1.0f;
+
+    // [v21-OPTSTATE] Optimizer warm resume:
+    // .optstate file se velocity buffers GPU pe copy karo
+    // Base path = checkpoint path bina "_step{N}.bin" suffix ke
+    if (resumed && start_step > 0) {
+        std::string ckpt_env_str(std::getenv("LOGOS_CKPT") ? std::getenv("LOGOS_CKPT") : "");
+        std::string base_path = ckpt_env_str;
+        std::string step_suffix = "_step" + std::to_string((int)start_step) + ".bin";
+        if (base_path.size() >= step_suffix.size() &&
+            base_path.substr(base_path.size() - step_suffix.size()) == step_suffix) {
+            base_path = base_path.substr(0, base_path.size() - step_suffix.size());
+        } else {
+            if (base_path.size() > 4 && base_path.substr(base_path.size()-4) == ".bin")
+                base_path = base_path.substr(0, base_path.size()-4);
+        }
+        opt_state_found = load_optimizer_state(opt_state_loaded, base_path, (int)start_step);
+        if (opt_state_found) {
+            if (opt_state_loaded.velocities.size() == optimizer.d_velocity.size()) {
+                for (int i = 0; i < (int)optimizer.d_velocity.size(); ++i) {
+                    const auto& cpu_vel = opt_state_loaded.velocities[i];
+                    int gpu_sz = optimizer.sizes[i];
+                    if ((int)cpu_vel.size() == gpu_sz) {
+                        CUDA_CHECK(cudaMemcpy(optimizer.d_velocity[i],
+                                              cpu_vel.data(),
+                                              gpu_sz * sizeof(float),
+                                              cudaMemcpyHostToDevice));
+                    } else {
+                        printf("  ⚠️  Vel size mismatch param %d (file=%zu gpu=%d) — skipping\n",
+                               i, cpu_vel.size(), gpu_sz);
+                    }
+                }
+                // WeightPathIntegral EMA restore
+                gpu_path_integral.ema_action    = opt_state_loaded.ema_action;
+                gpu_path_integral.log_amplitude  = opt_state_loaded.log_amplitude;
+                gpu_path_integral.ema_ready      = (opt_state_loaded.step_count > 0);
+                printf("  ✅ Optimizer state restored — WARM RESUME ✓\n");
+                printf("     ema_action=%.4f | log_amp=%.4f | steps=%lld\n",
+                       opt_state_loaded.ema_action, opt_state_loaded.log_amplitude,
+                       (long long)opt_state_loaded.step_count);
+            } else {
+                printf("  ⚠️  Optimizer param count mismatch (file=%zu model=%zu) — cold start\n",
+                       opt_state_loaded.velocities.size(), optimizer.d_velocity.size());
+            }
+        }
+    }
+
     int D=cfg.d_model, V=cfg.vocab_size, D4=4*D;
     int* d_targets;
     CUDA_CHECK(cudaMalloc(&d_targets,SEQ*sizeof(int)));
@@ -1015,12 +1068,6 @@ void train_gpu(const std::string& dataset_path) {
            resumed?"YES":"NO", (long long)start_step, best_loss, (long long)total_steps);
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
-
-    // [v14-WIRE] WeightPathIntegral for GPU training
-    // Tracks Feynman amplitude of weight trajectory → adaptive LR scaling
-    // record_step_norm() used (lightweight: no CPU param snapshots needed)
-    WeightPathIntegral gpu_path_integral(/*hbar=*/1.0f, /*history=*/500);
-    float gpu_lr_scale = 1.0f;   // updated every step via path_integral
 
     for (int epoch=0;epoch<EPOCHS;++epoch) {
         printf("\n-- Epoch %d/%d --\n",epoch+1,EPOCHS); fflush(stdout);
@@ -1246,6 +1293,24 @@ void train_gpu(const std::string& dataset_path) {
                 CUDA_CHECK(cudaDeviceSynchronize());
                 gpu_model.sync_to_cpu(cpu_model);
                 save_checkpoint(cpu_model,"logos_gpu_ckpt",(int)step);
+
+                // [v21-OPTSTATE] Optimizer velocity GPU→CPU copy + save
+                {
+                    OptimizerState save_state;
+                    save_state.velocities.resize(optimizer.d_velocity.size());
+                    for (int i = 0; i < (int)optimizer.d_velocity.size(); ++i) {
+                        int sz = optimizer.sizes[i];
+                        save_state.velocities[i].resize(sz);
+                        CUDA_CHECK(cudaMemcpy(save_state.velocities[i].data(),
+                                              optimizer.d_velocity[i],
+                                              sz * sizeof(float),
+                                              cudaMemcpyDeviceToHost));
+                    }
+                    save_state.ema_action    = gpu_path_integral.ema_action;
+                    save_state.log_amplitude = gpu_path_integral.log_amplitude;
+                    save_state.step_count    = static_cast<int64_t>(gpu_path_integral.step_count);
+                    save_optimizer_state(save_state, "logos_gpu_ckpt", (int)step);
+                }
                 // [v11-CLIP] Show cuBLAS context so Vedic PASS/FAIL is interpretable
                 // [v17-FIX] tol=5% dono backends ke liye (FIX-11: correct formula ke baad
                 //   cuBLAS FP error sirf 0.1-2% reh gaya, purani 30% ki zarurat nahi)
@@ -1270,6 +1335,24 @@ void train_gpu(const std::string& dataset_path) {
     for (auto* g : gpu_grads) delete g;
     gpu_model.sync_to_cpu(cpu_model);
     save_checkpoint(cpu_model,"logos_final",(int)step);
+
+    // [v21-OPTSTATE] Final optimizer state save
+    {
+        OptimizerState final_state;
+        final_state.velocities.resize(optimizer.d_velocity.size());
+        for (int i = 0; i < (int)optimizer.d_velocity.size(); ++i) {
+            int sz = optimizer.sizes[i];
+            final_state.velocities[i].resize(sz);
+            CUDA_CHECK(cudaMemcpy(final_state.velocities[i].data(),
+                                  optimizer.d_velocity[i],
+                                  sz * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+        }
+        final_state.ema_action    = gpu_path_integral.ema_action;
+        final_state.log_amplitude = gpu_path_integral.log_amplitude;
+        final_state.step_count    = static_cast<int64_t>(gpu_path_integral.step_count);
+        save_optimizer_state(final_state, "logos_final", (int)step);
+    }
 
     printf("\n╔══════════════════════════════════════════╗\n");
     printf("║  Training Complete! (v18-RESUME)         ║\n");
