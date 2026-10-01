@@ -1453,10 +1453,32 @@ std::vector<FeynmanBeam> generate_feynman(
 void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
                   int max_new=64, int beam_width=4, float hbar=1.0f, int top_k=50)
 {
+    // [v21] LOGOS_VOCAB env se vocab path lo — hardcoded "vocab.bin" band
+    const char* vocab_env = std::getenv("LOGOS_VOCAB");
+    std::string vocab_path = (vocab_env && *vocab_env)
+                             ? std::string(vocab_env) : std::string("vocab.bin");
+    printf("  Loading vocab: %s\n", vocab_path.c_str());
+
     Tokenizer tok;
-    if (!tok.load("vocab.bin")) { fprintf(stderr,"❌ vocab.bin not found\n"); return; }
+    if (!tok.load(vocab_path)) {
+        // Fallback: current dir mein try karo
+        if (!tok.load("vocab.bin")) {
+            fprintf(stderr,"❌ load: cannot open %s\n", vocab_path.c_str());
+            fprintf(stderr,"❌ vocab.bin not found\n");
+            fprintf(stderr,"   Set LOGOS_VOCAB=/path/to/vocab.bin\n");
+            return;
+        }
+    }
+    printf("  ✅ Vocab loaded: %d tokens\n", tok.vocab_size);
+    // [v21] Config env se lo ya checkpoint se auto-detect
+    // Training config: d=256 L=6 H=8 seq=256 (patched by notebook CELL 4)
     ModelConfig cfg; cfg.vocab_size=tok.vocab_size;
-    cfg.d_model=128; cfg.num_heads=4; cfg.num_layers=4; cfg.max_seq_len=128;
+    cfg.d_model     = (int)logos_env_f("LOGOS_D_MODEL",   256.f);
+    cfg.num_heads   = (int)logos_env_f("LOGOS_N_HEADS",    8.f);
+    cfg.num_layers  = (int)logos_env_f("LOGOS_N_LAYERS",   6.f);
+    cfg.max_seq_len = (int)logos_env_f("LOGOS_SEQ_LEN",  256.f);
+    printf("  Config: d=%d L=%d H=%d seq=%d vocab=%d\n",
+           cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size);
     LOGOSModel cpu_model(cfg);
     if (ckpt_path!="none"&&!ckpt_path.empty()) load_checkpoint(cpu_model,ckpt_path);
     HyperConfig hyper_cfg; hyper_cfg.enabled=true; hyper_cfg.curvature=1.0f;
