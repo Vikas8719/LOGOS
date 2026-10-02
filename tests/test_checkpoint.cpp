@@ -23,13 +23,33 @@ int main() {
         return 1;
     }
 
+    // expected_bytes must match save_checkpoint layout exactly:
+    //   [ModelConfig]
+    //   [embedding floats]
+    //   [legacy position block: max_seq_len * d_model floats]
+    //   [lm_head floats]
+    //   per layer:
+    //     [per-head W_Q, W_K, W_V, W_O]
+    //     [W_proj]
+    //     [ffn.W1, ffn.b1, ffn.W2, ffn.b2]
+    //     [ln1.gamma, ln1.beta]
+    //     [ln2.gamma, ln2.beta]
+    //     [ln1.running_mean, ln1.running_var]   ← ReynoldsBatchNorm stats
+    //     [ln2.running_mean, ln2.running_var]   ← ReynoldsBatchNorm stats
     size_t expected_bytes = sizeof(ModelConfig) +
         static_cast<size_t>(cfg.max_seq_len) * cfg.d_model * sizeof(float);
     for (const Tensor* parameter : source.parameters())
         expected_bytes += static_cast<size_t>(parameter->total_size) * sizeof(float);
+    // Add ReynoldsBatchNorm running_mean + running_var for each layer (ln1 + ln2)
+    // Each running stat vector has d_model floats
+    expected_bytes += static_cast<size_t>(cfg.num_layers) * 4 *
+                      static_cast<size_t>(cfg.d_model) * sizeof(float);
+
     if (std::filesystem::file_size(file) != expected_bytes) {
         std::remove(file.c_str());
-        std::cerr << "checkpoint no longer reserves the legacy position block\n";
+        std::cerr << "checkpoint size mismatch: got "
+                  << std::filesystem::file_size(file)
+                  << " expected " << expected_bytes << "\n";
         return 1;
     }
 
