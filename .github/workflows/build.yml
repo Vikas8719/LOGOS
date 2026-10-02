@@ -1,4 +1,4 @@
-name: LOGOS CI v20-CTEST
+name: LOGOS CI v21-CTEST
 
 permissions:
   contents: read
@@ -94,6 +94,8 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — Windows
+  #  NOTE: PowerShell does NOT support backslash line continuation.
+  #  All cmake/build commands must be on a single line.
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-windows:
     name: "CPU Tests — Windows (T2 Math + T2b Checkpoint)"
@@ -102,10 +104,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: |
-          cmake -B build -G "MinGW Makefiles" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
+        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
       - name: Build
         run: cmake --build build --target test_math_unit test_checkpoint --parallel 4
@@ -116,6 +115,7 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — macOS
+  #  T4_Large_Data_Scale registered in CTest → must build test_large_data_scale
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-macos:
     name: "CPU Tests — macOS (T2 Math + T2b Checkpoint)"
@@ -130,7 +130,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
 
       - name: Build
-        run: cmake --build build --target test_math_unit test_checkpoint --parallel $(sysctl -n hw.logicalcpu)
+        run: cmake --build build --target test_math_unit test_checkpoint test_large_data_scale --parallel $(sysctl -n hw.logicalcpu)
 
       - name: CTest — T2 Math + T2b Checkpoint
         working-directory: build
@@ -352,6 +352,8 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  WINDOWS BUILD
+  #  NOTE: PowerShell does NOT support backslash line continuation.
+  #  All cmake commands must be on a single line.
   # ═══════════════════════════════════════════════════════════════
   windows-build:
     name: "Windows Build"
@@ -362,10 +364,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: |
-          cmake -B build -G "MinGW Makefiles" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
 
       - name: Build
         run: cmake --build build --parallel 4
@@ -514,7 +513,7 @@ jobs:
           R_MAC:     ${{ needs.macos-build.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v20-CTEST"
+          echo "  LOGOS CI Summary — v21-CTEST"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -544,11 +543,13 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
-          echo "  Changes in v20:"
-          echo "    ✅ BUG FIX: test_checkpoint added to build targets (Linux/Win/macOS)"
-          echo "    ✅ T2b_Checkpoint was 'Not Run' — executable wasn't being built"
-          echo "    ✅ All 3 CPU platforms now build + run T2b_Checkpoint"
-          echo "    ✅ Job names updated to reflect T2b coverage"
+          echo "  Changes in v21:"
+          echo "    ✅ BUG FIX: T2b_Checkpoint — expected_bytes now includes"
+          echo "       ReynoldsBatchNorm running_mean+var (num_layers×4×d_model floats)"
+          echo "    ✅ BUG FIX: Windows cmake — backslash continuation removed"
+          echo "       (PowerShell does not support it). Single-line cmake commands."
+          echo "    ✅ BUG FIX: macOS T4 — test_large_data_scale added to build"
+          echo "       (was registered in CTest but binary not being built)"
           echo ""
           echo "════════════════════════════════════════════════════"
 
