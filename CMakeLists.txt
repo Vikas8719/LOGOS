@@ -1,10 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(LOGOS VERSION 0.10.0 LANGUAGES CXX)
-# v0.10.0 — 6 Physics Components + M11-M16 Tests
-# Build fixes:
-#   test_syntax_build: src/main.cpp REMOVED (duplicate main), Checkpoint.cpp ADDED
-#   logos_gpu:         src/Checkpoint.cpp ADDED (save_checkpoint/load_checkpoint)
-#   test_math_unit:    now includes Attention.hpp + LayerNorm.hpp + FeedForward.hpp
+project(LOGOS VERSION 0.11.0 LANGUAGES CXX)
+# v0.11.0 — CTest fully wired: T5 cuda_kernels added
+#   T5 covers: add_bias_kernel cross-file launch, AMP path,
+#   training/validation forward modes, SHM optimizer, adjoint
+#   gradient checks (ns_advect, ns_diffuse), FP16 cast clamp,
+#   free_energy_loss numerical gradient, expmap0 ball constraint,
+#   Gunitasamuchayah large-matrix, E2E forward+loss+step.
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,6 +62,10 @@ if(CMAKE_CUDA_COMPILER)
         set(CMAKE_CUDA_ARCHITECTURES "60;70;75;80;86;89;90"
             CACHE STRING "CUDA architectures" FORCE)
         message(STATUS "CUDA arch: RELEASE — ${CMAKE_CUDA_ARCHITECTURES}")
+        message(STATUS "  sm_90 = H100 SXM/PCIe (Hopper)")
+        message(STATUS "  sm_89 = RTX 4090 (Ada Lovelace)")
+        message(STATUS "  sm_86 = A10/A30/RTX 3090 (Ampere)")
+        message(STATUS "  sm_80 = A100 (Ampere)")
     else()
         set(CMAKE_CUDA_ARCHITECTURES "native"
             CACHE STRING "CUDA architectures" FORCE)
@@ -75,6 +80,7 @@ if(CMAKE_CUDA_COMPILER)
             -Xcompiler=-O3
             --ptxas-options=-v
             --extended-lambda
+            --expt-relaxed-constexpr
         >
         $<$<COMPILE_LANGUAGE:CXX>:-O3>
     )
@@ -84,7 +90,7 @@ if(CMAKE_CUDA_COMPILER)
         cuda/train_gpu.cu
         cuda/VedicGEMM.cu
         cuda/ModelGPU.cu
-        src/Checkpoint.cpp      # FIX: save_checkpoint / load_checkpoint
+        src/Checkpoint.cpp
     )
     target_include_directories(logos_gpu PRIVATE include cuda)
     target_compile_options(logos_gpu PRIVATE ${LOGOS_CUDA_FLAGS})
@@ -94,9 +100,6 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
     # ── TEST 1: Syntax & Build Test ───────────────────────────
-    # Tests: CUDA device, GPUTensor RAII, all kernels, full pipeline
-    # FIX: src/main.cpp REMOVED (duplicate main) — test has its own main()
-    # FIX: src/Checkpoint.cpp ADDED — provides save_checkpoint / load_checkpoint
     add_executable(test_syntax_build
         tests/test_syntax_build.cu
         cuda/VedicGEMM.cu
@@ -111,15 +114,14 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
-    # ── TEST 2: Mathematical Unit Test ────────────────────────
-    # Tests: CPU math only — no CUDA dependency, pure math correctness
+    # ── TEST 2: Mathematical Unit Test (CPU-only) ─────────────
     add_executable(test_math_unit
         tests/test_math_unit.cpp
     )
     target_include_directories(test_math_unit PRIVATE include tests)
     logos_set_cpu_test_options(test_math_unit)
-    # No CUDA needed for math unit tests — pure CPU
 
+    # ── TEST 2b: Checkpoint roundtrip ────────────────────────
     add_executable(test_checkpoint
         tests/test_checkpoint.cpp
         src/Checkpoint.cpp
@@ -128,7 +130,6 @@ if(CMAKE_CUDA_COMPILER)
     logos_set_cpu_test_options(test_checkpoint)
 
     # ── TEST 3: Memory & Bounds Stress Test ───────────────────
-    # Tests: VRAM limits, 1M+ data, boundary reads/writes, leak detection
     add_executable(test_memory_stress
         tests/test_memory_stress.cu
         cuda/VedicGEMM.cu
@@ -142,8 +143,6 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
     # ── TEST 4: Large Data Scale & Production Test ────────────
-    # Tests: 1TB int64_t, chunked pipeline, grad accum, multi-shard,
-    #        smoke test, GPU large vocab — CI/CD production readiness
     add_executable(test_large_data_scale
         tests/test_large_data_scale.cu
         cuda/VedicGEMM.cu
@@ -157,37 +156,67 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
+    # ── TEST 5: CUDA Kernel Correctness ──────────────────────
+    # add_bias_kernel cross-file launch verify (the VedicGEMM.cuh fix),
+    # AMP bias path, training/validation forward modes, SHM optimizer,
+    # adjoint gradient checks, FP16 cast, free_energy grad, E2E step.
+    add_executable(test_cuda_kernels
+        tests/test_cuda_kernels.cu
+        cuda/VedicGEMM.cu
+        cuda/ModelGPU.cu
+    )
+    target_include_directories(test_cuda_kernels PRIVATE include cuda tests)
+    target_compile_options(test_cuda_kernels PRIVATE ${LOGOS_CUDA_FLAGS})
+    target_link_libraries(test_cuda_kernels PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_compile_definitions(test_cuda_kernels PRIVATE
+        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
+
     # ── CTest integration ─────────────────────────────────────
     enable_testing()
 
-    add_test(NAME "T2_Math_Unit"
-             COMMAND test_math_unit)
-    add_test(NAME "Checkpoint_Roundtrip" COMMAND test_checkpoint)
+    # ── CPU tests (always run, no GPU needed) ─────────────────
+    add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
+    add_test(NAME "T2b_Checkpoint"      COMMAND test_checkpoint)
+    set_tests_properties("T2_Math_Unit"   PROPERTIES TIMEOUT 60)
+    set_tests_properties("T2b_Checkpoint" PROPERTIES TIMEOUT 60)
 
-    add_test(NAME "T1_Syntax_Build"
-             COMMAND test_syntax_build)
+    # ── GPU tests (require CUDA device) ──────────────────────
+    # LABELS used by CI to run GPU-only subset:
+    #   ctest -L GPU --output-on-failure
+    add_test(NAME "T1_Syntax_Build"     COMMAND test_syntax_build)
+    add_test(NAME "T3_Memory_Stress"    COMMAND test_memory_stress)
+    add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
+    add_test(NAME "T5_CUDA_Kernels"     COMMAND test_cuda_kernels)
 
-    add_test(NAME "T3_Memory_Stress"
-             COMMAND test_memory_stress)
+    set_tests_properties("T1_Syntax_Build"     PROPERTIES TIMEOUT 120  LABELS "GPU")
+    set_tests_properties("T3_Memory_Stress"    PROPERTIES TIMEOUT 300  LABELS "GPU")
+    set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600  LABELS "GPU")
+    set_tests_properties("T5_CUDA_Kernels"     PROPERTIES TIMEOUT 180  LABELS "GPU")
 
-    add_test(NAME "T4_Large_Data_Scale"
-             COMMAND test_large_data_scale)
+    # ── CTest resource guard: GPU tests serialize on device 0 ──
+    # Prevents two GPU tests from fighting over VRAM on single-GPU runners
+    set_tests_properties(
+        "T1_Syntax_Build"
+        "T3_Memory_Stress"
+        "T4_Large_Data_Scale"
+        "T5_CUDA_Kernels"
+        PROPERTIES RESOURCE_LOCK "GPU_DEVICE_0"
+    )
 
-    # Timeouts: math=60s, syntax=120s, memory=300s, large_data=600s
-    set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
-    set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
-    set_tests_properties("T1_Syntax_Build"     PROPERTIES TIMEOUT 120)
-    set_tests_properties("T3_Memory_Stress"    PROPERTIES TIMEOUT 300)
-    set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
-
-    message(STATUS "Tests: test_syntax_build, test_math_unit, test_memory_stress, test_large_data_scale")
-    message(STATUS "Run:   ctest --output-on-failure")
-    message(STATUS "Or:    ./build/test_math_unit && ./build/test_syntax_build && ./build/test_memory_stress && ./build/test_large_data_scale")
+    message(STATUS "")
+    message(STATUS "CTest targets:")
+    message(STATUS "  CPU (always): T2_Math_Unit, T2b_Checkpoint")
+    message(STATUS "  GPU (need CUDA device): T1 T3 T4 T5")
+    message(STATUS "  Run all:      ctest --output-on-failure")
+    message(STATUS "  Run GPU only: ctest -L GPU --output-on-failure")
+    message(STATUS "  Run CPU only: ctest -LE GPU --output-on-failure")
+    message(STATUS "")
 
 else()
     message(STATUS "⚠️  CUDA not found — CPU-only build")
 
-    # Math unit test still works without CUDA
+    # CPU-only targets
     add_executable(test_math_unit
         tests/test_math_unit.cpp
     )
@@ -201,15 +230,12 @@ else()
     target_include_directories(test_checkpoint PRIVATE include)
     logos_set_cpu_test_options(test_checkpoint)
 
-    # ── TEST 4 (CPU-only build) ───────────────────────────────
-    # test_large_data_scale.cu compiles as CXX without CUDA
-    # HAS_CUDA=0 disables GPU sections automatically
+    # test_large_data_scale compiles as CXX in CPU-only mode
     add_executable(test_large_data_scale
         tests/test_large_data_scale.cu
         src/Checkpoint.cpp
     )
     target_include_directories(test_large_data_scale PRIVATE include tests)
-    # Rename .cu to allow CXX compiler (no nvcc needed)
     set_source_files_properties(
         tests/test_large_data_scale.cu
         PROPERTIES LANGUAGE CXX
@@ -218,13 +244,13 @@ else()
 
     enable_testing()
     add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
-    add_test(NAME "Checkpoint_Roundtrip" COMMAND test_checkpoint)
+    add_test(NAME "T2b_Checkpoint"      COMMAND test_checkpoint)
     add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
     set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
-    set_tests_properties("Checkpoint_Roundtrip" PROPERTIES TIMEOUT 60)
+    set_tests_properties("T2b_Checkpoint"      PROPERTIES TIMEOUT 60)
     set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
 
-    message(STATUS "CPU-only tests: test_math_unit, test_checkpoint, test_large_data_scale")
+    message(STATUS "CPU-only tests: T2_Math_Unit, T2b_Checkpoint, T4_Large_Data_Scale")
 endif()
 
 install(TARGETS logos DESTINATION bin)
@@ -237,9 +263,11 @@ message(STATUS "Build targets:")
 message(STATUS "  logos                  — CPU training")
 if(CMAKE_CUDA_COMPILER)
 message(STATUS "  logos_gpu              — GPU training (Phase 1+2)")
-message(STATUS "  test_syntax_build      — Test 1: CUDA syntax + GPU kernels")
-message(STATUS "  test_math_unit         — Test 2: Vedic math formulas vs modern")
-message(STATUS "  test_memory_stress     — Test 3: 1M+ data, VRAM leak, bounds")
-message(STATUS "  test_large_data_scale  — Test 4: 1TB scale, production CI/CD")
+message(STATUS "  test_syntax_build      — T1: CUDA syntax + GPU kernels")
+message(STATUS "  test_math_unit         — T2: Vedic math formulas (CPU)")
+message(STATUS "  test_checkpoint        — T2b: checkpoint roundtrip (CPU)")
+message(STATUS "  test_memory_stress     — T3: 1M+ data, VRAM leak, bounds")
+message(STATUS "  test_large_data_scale  — T4: 1TB scale, production CI/CD")
+message(STATUS "  test_cuda_kernels      — T5: kernel correctness + cross-file")
 endif()
 message(STATUS "")

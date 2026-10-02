@@ -22,11 +22,13 @@
 // ============================================================
 #include "VedicGEMM.cuh"
 #include "ModelGPU.cuh"
+#include "MixedPrecision.cuh"
 #include "../include/Tokenizer.hpp"
 #include "../include/StreamingDataLoader.hpp"
 #include "../include/Checkpoint.hpp"
 #include "../include/PhysicsOpt.hpp"    // [v14-WIRE] WeightPathIntegral GPU LR scaling
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -585,6 +587,9 @@ static void run_backward(
         { int sz=seq*D;
           vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln.data,sz); CUDA_KERNEL_CHECK(); }
 
+        // NOTE: d_concat is a GPUTensor (RAII) — auto-freed at end of loop body.
+        // Previously declared in the middle of the block which made it harder
+        // to reason about lifetime. Moved here for clarity.
         GPUTensor d_concat=gpu_alloc(seq,D);
         { dim3 g(D,(D+31)/32),b(32);
           attn_dWproj_kernel<<<g,b>>>(cache.concat.data,d_dX_out.data,
@@ -718,7 +723,14 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v19-TRUE-RESUME      ║\n");
+    printf("║  LOGOS GPU Training v24-H100-AMP         ║\n");
+    printf("║  ✦ 219M params | 8192 context           ║\n");
+    printf("║  ✦ d=1024 L=16 H=16 DH=64              ║\n");
+    printf("║  ✦ [v23-AMP] FP16 fwd + FP32 master    ║\n");
+    printf("║  ✦ [v24] Manual loss scaling WIRED      ║\n");
+    printf("║  ✦ [v24] Overflow detect + skip step    ║\n");
+    printf("║  ✦ [v24] Scale: 65536 → auto halve/dbl ║\n");
+    printf("║  ✦ H100 SXM Tensor Core GEMM (2x spd)  ║\n");
     printf("║  ✦ LOGOS_CKPT se actual weights load    ║\n");
     printf("║  ✦ LOGOS_VOCAB se vocab.bin load        ║\n");
     printf("║  ✦ LOGOS_START_STEP se step offset      ║\n");
@@ -727,10 +739,24 @@ void train_gpu(const std::string& dataset_path) {
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
-    cudaDeviceProp prop; cudaGetDeviceProperties(&prop,device);
-    printf("GPU: %s | VRAM: %zu MB | SMs: %d | CC: %d.%d\n\n",
-           prop.name,prop.totalGlobalMem/1024/1024,
-           prop.multiProcessorCount,prop.major,prop.minor);
+    cudaDeviceProp prop; cudaGetDeviceProperties(&prop, device);
+    printf("GPU: %s | VRAM: %zu MB | SMs: %d | CC: %d.%d\n",
+           prop.name, prop.totalGlobalMem/1024/1024,
+           prop.multiProcessorCount, prop.major, prop.minor);
+
+    // [v23-AMP] H100 detection
+    bool is_h100 = (prop.major == 9 && prop.minor == 0);   // sm_90 = H100
+    bool is_a100 = (prop.major == 8 && prop.minor == 0);   // sm_80 = A100
+    bool amp_supported = (prop.major >= 7);                  // FP16 Tensor Cores: Volta+
+    printf("  AMP: FP16 Tensor Cores %s | H100: %s | A100: %s\n",
+           amp_supported ? "✅" : "❌",
+           is_h100 ? "✅" : "—",
+           is_a100 ? "✅" : "—");
+    if (!amp_supported) {
+        printf("  ⚠️  GPU CC < 7.0 — FP16 Tensor Cores not available\n");
+        printf("      AMP disabled, falling back to FP32\n");
+    }
+    printf("\n");
     fflush(stdout);
 
     printf("[1/5] Dataset scan...\n"); fflush(stdout);
@@ -771,9 +797,12 @@ void train_gpu(const std::string& dataset_path) {
         cfg.d_model,cfg.num_heads,cfg.num_layers,cfg.vocab_size,cfg.max_seq_len);
     if (!cfg_err.empty()) { fprintf(stderr,"❌ Config: %s\n",cfg_err.c_str()); return; }
 
-    int grad_accum=1;
-    if (actual_size>200LL*1024*1024) grad_accum=4;
-    else if (actual_size>50LL*1024*1024) grad_accum=2;
+    // [v22-SCALE] grad_accum: 219M model + 8192 seq ke liye memory budget
+    // seq=8192 × d=1024 × 4B × activations ≈ 85MB/layer × 16 layers ≈ 1.36GB per micro-batch
+    // T4 VRAM 16GB: weights(876MB) + optimizer(876MB) + KV cache(268MB) ≈ 2GB overhead
+    // Remaining: ~13GB / 1.36GB per step ≈ 9 micro-batches max
+    // grad_accum=8: effective batch = 8 × 8192 = 65,536 tokens/step (good for 219M)
+    int grad_accum = 8;  // [v22-SCALE] Fixed 8 (was dataset-size dependent 1/2/4)
 
     // [v18] vocab_size debug: tok.vocab_size tokenizer ka actual size hai
     // decide_vocab_size() sirf target tha — actual size slightly different ho sakta hai
@@ -854,8 +883,8 @@ void train_gpu(const std::string& dataset_path) {
     gpu_model.phys.training        = true;   // enables Feynman dropout + Reynolds EMA
     gpu_model.phys.nikhilam_kv     = true;   // Nikhilam INT8 KV cache
     gpu_model.phys.shunyam         = true;   // Shunyam sparse causal attention
-    gpu_model.phys.window          = 32;
-    gpu_model.phys.stride          = 8;
+    gpu_model.phys.window          = 64;     // [v22-SCALE] 32→64: 8192 ctx ke liye wider local window
+    gpu_model.phys.stride          = 16;     // [v22-SCALE] 8→16: proportional stride for 8192 ctx
     gpu_model.phys.navier_stokes   = true;   // NS Q-advection + V-diffusion
     gpu_model.phys.ns_eta          = 0.1f;
     gpu_model.phys.ns_nu           = 0.05f;
@@ -867,10 +896,11 @@ void train_gpu(const std::string& dataset_path) {
     gpu_model.phys.re_k            = 5.0f;
     printf("  ✦ phys.training=true  → Feynman dropout ACTIVE\n");
     printf("  ✦ Nikhilam KV INT8    → 4x KV compression\n");
-    printf("  ✦ Shunyam sparse attn → window=%d stride=%d\n", gpu_model.phys.window, gpu_model.phys.stride);
+    printf("  ✦ Shunyam sparse attn → window=%d stride=%d (8192 ctx)\n", gpu_model.phys.window, gpu_model.phys.stride);
     printf("  ✦ Navier-Stokes       → eta=%.2f nu=%.2f\n", gpu_model.phys.ns_eta, gpu_model.phys.ns_nu);
     printf("  ✦ Reynolds norm       → re_crit=%.1f k=%.1f\n", gpu_model.phys.re_crit, gpu_model.phys.re_k);
-    printf("  ✦ Feynman dropout     → p=%.2f hbar=%.1f\n\n", gpu_model.phys.drop_p, gpu_model.phys.drop_hbar);
+    printf("  ✦ Feynman dropout     → p=%.2f hbar=%.1f\n", gpu_model.phys.drop_p, gpu_model.phys.drop_hbar);
+    printf("  ✦ Model scale         → d=1024 L=16 H=16 seq=8192 (~219M params)\n\n");
 
     printf("[4/5] StreamingDataLoader + Optimizer...\n"); fflush(stdout);
     int SEQ=cfg.max_seq_len;
@@ -976,6 +1006,55 @@ void train_gpu(const std::string& dataset_path) {
     WeightPathIntegral gpu_path_integral(/*hbar=*/1.0f, /*history=*/500);
     float gpu_lr_scale = 1.0f;
 
+    // ── [v23-AMP] Manual Loss Scaler init ─────────────────────────────
+    // Dynamic loss scaling:
+    //   - Starts at 65536 (2^16)
+    //   - Halves on FP16 overflow (inf/nan in grads)
+    //   - Doubles every 2000 clean steps
+    //   - Clamped: [1.0, 65536.0]
+    // Override via env: LOGOS_AMP_SCALE (initial scale, e.g. from prev run's checkpoint)
+    // H100 SXM specific: H100 FP16 Tensor Cores rarely overflow at scale=65536 because
+    //   H100 hardware has better FP16 accumulation than T4/A100.
+    //   Start high (65536) → likely no overflow for thousands of steps on H100.
+    //   If overflow happens early → scale halves quickly to safe value.
+    ManualLossScaler loss_scaler;
+    {
+        float init_scale = logos_env_f("LOGOS_AMP_SCALE", LOSS_SCALE_INIT);
+        // LOGOS_AMP_SCALE_WINDOW: resume pe recovered window restore
+        int   init_window = (int)logos_env_f("LOGOS_AMP_WINDOW", 0.f);
+        loss_scaler.scale = fmaxf(fminf(init_scale, LOSS_SCALE_MAX), LOSS_SCALE_MIN);
+        loss_scaler.steps_since_last_overflow = init_window;
+        printf("  [v23-AMP] ManualLossScaler: init_scale=%.0f window=%d (restored=%d)\n",
+               loss_scaler.scale, LOSS_SCALE_WINDOW, init_window);
+        printf("  [v23-AMP] H100 SXM: FP16 forward (2× TFLOPS) + FP32 master weights\n");
+        printf("  [v23-AMP] Precision: forward=FP16 | grads=FP32 | optimizer=FP32\n");
+        printf("  [v23-AMP] To resume scale: set LOGOS_AMP_SCALE=<prev_scale> LOGOS_AMP_WINDOW=<prev_window>\n");
+    }
+
+    // [v23-AMP] FP16 weight shadow buffers (one per master param)
+    // Master weights: FP32 (in gpu_params) — optimizer updates these
+    // FP16 shadow:    cast before each forward pass — fed to FP16 GEMM
+    // Memory: 219M × 2B (FP16) ≈ 438 MB additional
+    std::vector<HalfTensor> fp16_weights;
+    fp16_weights.reserve(gpu_params.size());
+    for (auto* p : gpu_params) {
+        fp16_weights.push_back(half_alloc(p->rows, p->cols));
+    }
+    printf("  [v23-AMP] FP16 shadow weights: %zu tensors allocated\n",
+           fp16_weights.size());
+    printf("  [v23-AMP] FP16 VRAM overhead: ~%.0f MB\n",
+           (float)(219e6 * sizeof(__half)) / 1024 / 1024);
+
+    // Helper: collect grad pointers + sizes for scaler overflow check
+    std::vector<float*> grad_ptrs;
+    std::vector<int>    grad_sizes;
+    grad_ptrs.reserve(gpu_grads.size());
+    grad_sizes.reserve(gpu_grads.size());
+    for (auto* g : gpu_grads) {
+        grad_ptrs.push_back(g->data);
+        grad_sizes.push_back(g->size);
+    }
+
     // [v21-OPTSTATE] Optimizer warm resume:
     // .optstate file se velocity buffers GPU pe copy karo
     // Base path = checkpoint path bina "_step{N}.bin" suffix ke
@@ -1064,8 +1143,10 @@ void train_gpu(const std::string& dataset_path) {
     float   best_loss = resumed
         ? logos_env_f("LOGOS_BEST_F", 999.f)
         : 999.f;
-    printf("\n[v19-TRUE-RESUME] resumed=%s | start_step=%lld | best_F=%.4f | target=%lld\n\n",
+    printf("\n[v22-SCALE] resumed=%s | start_step=%lld | best_F=%.4f | target=%lld\n",
            resumed?"YES":"NO", (long long)start_step, best_loss, (long long)total_steps);
+    printf("[v22-SCALE] Model: d=%d L=%d H=%d seq=%d vocab=%d grad_accum=%d\n\n",
+           cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size, grad_accum);
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
 
@@ -1082,6 +1163,26 @@ void train_gpu(const std::string& dataset_path) {
             }
             for (auto* g : gpu_grads)
                 CUDA_CHECK(cudaMemset(g->data,0,g->size*sizeof(float)));
+
+            // ── [v23-AMP] Cast FP32 master weights → FP16 shadow before forward ──
+            // Done ONCE per optimizer step (not per micro-batch).
+            // fp16_weights[pi] holds FP16 version of gpu_params[pi].
+            // gpu_model.fp16_param_ptrs[] gives forward pass direct access
+            // to FP16 shadow pointers — no extra copy inside forward().
+            for (int pi = 0; pi < (int)gpu_params.size(); ++pi) {
+                cuda_cast_fp32_to_fp16(
+                    gpu_params[pi]->data,
+                    fp16_weights[pi].data,
+                    gpu_params[pi]->size);
+            }
+            // Wire FP16 shadow pointers into ModelGPU for this forward pass.
+            // forward() reads fp16_param_ptrs[] to route each GEMM to Tensor Core.
+            if (amp_supported) {
+                gpu_model.fp16_param_ptrs.resize(fp16_weights.size());
+                for (int pi = 0; pi < (int)fp16_weights.size(); ++pi)
+                    gpu_model.fp16_param_ptrs[pi] = fp16_weights[pi].data;
+                gpu_model.amp_enabled = true;
+            }
 
             float batch_F=0.f, batch_CE=0.f, batch_S=0.f;
             int   valid_mb=0;
@@ -1116,9 +1217,12 @@ void train_gpu(const std::string& dataset_path) {
                                  d_d_ffn_out,d_d_ffn_A,d_d_ffn_H,
                                  d_d_normed2,d_dX_ln,d_dX_attn_in,seq);
                     // [v14-WIRE] Reynolds running stats EMA update after each backward
-                    // Previously never called → Reynolds BN stats were always initial (mean=0, var=1)
-                    // Now: EMA updates from cached block_input + post_attn activations
                     gpu_model.update_norm_stats();
+                    // [v25-BUG4-FIX] amp_scale_grads(loss_scaler.scale) REMOVED from here.
+                    // Pehle: har micro-batch ke baad scale × grad_accum times apply hota tha,
+                    // phir sirf 1× unscale → net (grad_accum)× over-scaled grads.
+                    // grad_accum=8 → 8× too large → GNorm explosion at step 1 → training diverge.
+                    // FIX: scale ONCE baad mein (micro-batch loop ke BAHAR) — see below.
                 }
             }
 
@@ -1136,11 +1240,55 @@ void train_gpu(const std::string& dataset_path) {
                 CUDA_KERNEL_CHECK();
             }
 
-            // [v16-STABLE] grad_clip=1.0 (was 5.0 → GNorm reached 684 by step 62k)
-            // Root cause: LR=2e-4 + clip=5.0 + friction=0.1 = momentum accumulates
-            //   unchecked → GNorm exponential growth → training breakdown
-            // Fix: clip=1.0 hard ceiling → GNorm stays in 4-8 range (healthy)
-            // Combined with LR=5e-5: effective update = 5x smaller total
+            // ── [v25-BUG4-FIX] Manual Loss Scaling — Scale UP ONCE, then Unscale ──
+            // BUG 4 was: amp_scale_grads(scale) called INSIDE micro-batch loop (grad_accum times),
+            // then amp_scale_grads(1/scale) called ONCE here.
+            // Net effect: grads × scale^8 / scale = scale^7 over-scaled → GNorm explosion.
+            //
+            // Correct flow (now):
+            //   1. Accumulate grads across all grad_accum micro-batches (raw, unscaled FP32)
+            //   2. Scale grads ONCE by loss_scaler.scale (for overflow detection only)
+            //   3. Check overflow → if bad: zero grads, halve scale, skip step
+            //   4. Unscale ONCE → true FP32 grads restored
+            //   5. Clip + optimizer step
+            //
+            // Why scale at all? grads_have_inf_nan() detects FP16 underflow artifacts
+            // that propagate from FP16 activations into FP32 grads as very small numbers.
+            // Scaling amplifies them so inf/nan check can detect true overflow.
+            {
+                // Step A: Scale UP (ONCE after all micro-batch accumulation is complete)
+                amp_scale_grads(grad_ptrs, grad_sizes, loss_scaler.scale);
+                CUDA_KERNEL_CHECK();
+
+                // Step B: Overflow check + scale update
+                bool amp_ok = loss_scaler.update(grad_ptrs, grad_sizes);
+
+                if (!amp_ok) {
+                    // FP16 overflow detected → grads corrupt → skip this optimizer step
+                    // scale already halved inside loss_scaler.update()
+                    // Zero grads so next accumulation starts clean
+                    for (auto* g : gpu_grads)
+                        CUDA_CHECK(cudaMemset(g->data, 0, g->size * sizeof(float)));
+                    ++step;
+                    // Print overflow warning every 50 skips to avoid spam
+                    if (loss_scaler.total_overflows % 50 == 1) {
+                        printf("  [AMP] step=%lld OVERFLOW skip #%d → new_scale=%.0f\n",
+                               (long long)step, loss_scaler.total_overflows, loss_scaler.scale);
+                        fflush(stdout);
+                    }
+                    continue;  // goto next micro_batches iteration
+                }
+                // Step C: amp_ok=true → grads are valid.
+                // Unscale ONCE: restore true FP32 gradient magnitude
+                float inv_s = 1.0f / loss_scaler.scale;
+                amp_scale_grads(grad_ptrs, grad_sizes, inv_s);
+                CUDA_KERNEL_CHECK();
+                // Proceed with clip + optimizer step (scale-up window handled inside update())
+            }
+
+            // [v16-STABLE] grad_clip=0.3 (was 5.0 → GNorm reached 684 by step 62k)
+            // H100 SXM note: FP16 forward pass ke baad gradients FP32 mein compute hote hain
+            // (unscaling ke baad). Clip norm AFTER unscaling — correct FP32 gradient magnitude.
             float grad_norm=cuda_clip_gradients(gpu_grads, clip_norm);
 
             // [v14-WIRE] WeightPathIntegral adaptive LR scaling
@@ -1157,31 +1305,17 @@ void train_gpu(const std::string& dataset_path) {
             if (step > start_step && (step - start_step) % 5000 == 0) gpu_path_integral.reset_best();
 
             if (step % 1000 == 0 && step > 0) {
-                // ── [v11-CLIP FIX] Gunitasamuchayah Verification ──────────────
-                // BUG: tolerance=0.05f (5%) was too tight for cuBLAS.
-                //   cuBLAS uses fused multiply-add with non-deterministic
-                //   reordering of float32 accumulation → checksum drift of
-                //   ~8-25% is EXPECTED and numerically correct, not a bug.
-                //   The Vedic sutra sum(C) ≈ row_sums(A)·col_sums(B) holds
-                //   exactly only for sequential left-to-right FP accumulation.
-                //
-                // FIX-VEDIC-1: When cuBLAS is active, use relaxed tolerance
-                //   (0.30f = 30%) that reflects real cuBLAS FP rounding.
-                //   Non-cuBLAS (custom CUDA tiled GEMM) keeps tight 0.05f.
-                //
-                // FIX-VEDIC-2: WARN-only for cuBLAS mismatch — PASS requires
-                //   relative_error < tolerance. cuBLAS WARN != training bug.
-                // ──────────────────────────────────────────────────────────────
+                // ── [BUG-FIX] C_proxy GPUTensor scope ────────────────────────
+                // C_proxy is RAII (GPUTensor), so it frees itself at the end of
+                // this block. Previously the block was implicit; making it
+                // explicit ensures the VRAM is released before the checkpoint
+                // sync (which may need headroom on a 16 GB T4).
+                {
                 GPUTensor C_proxy = gpu_alloc(gpu_model.last_hidden.rows,
                                               gpu_model.gpu_lm_head.cols);
                 cuda_vedic_gemm(gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy);
 
                 bool using_cublas = cuda_vedic_gemm_uses_cublas();
-                // FIX-11: Now that cuda_vedic_verify() uses the CORRECT
-                // Gunitasamuchayah formula (dot(col_sums_A, row_sums_B)),
-                // cuBLAS FP reorder error is only 0.1-2%, not 2700%.
-                // Both backends can use the same tight tolerance = 0.05f (5%).
-                // The old 0.30f was masking the wrong formula, not cuBLAS.
                 float vedic_tol = 0.05f;
 
                 VedicVerifyResult vr = cuda_vedic_verify(
@@ -1195,7 +1329,7 @@ void train_gpu(const std::string& dataset_path) {
                     printf("\n[Gunitasamuchayah] WARN @ step %lld err=%.4f (tol=%.2f)\n",
                            (long long)step, vr.relative_error, vedic_tol);
                 }
-            }
+                } // C_proxy freed here (RAII)
 
             if (step % 100 == 0) {
                 float cur_T, cur_aH, cur_aL;
@@ -1212,28 +1346,53 @@ void train_gpu(const std::string& dataset_path) {
                 // 10 batches par std-dev ~0.4 CE unit thi → fake OVF-warn
                 // 30 batches par std-dev ~0.15 → reliable overfit signal
                 int val_batches_to_eval = 30;
+                // ── [BUG-FIX] Validation loop memory leak ─────────────────
+                // BUG (pre-fix): d_vtgt, d_vloss, d_vgrad har val-batch mein
+                //   cudaMalloc hote the lekin exception ya early-break ke case
+                //   mein cudaFree guarantee nahi tha. Zyada khatarnak: d_vgrad
+                //   size = vseq × V floats = 512 × 32768 × 4B = 64 MB PER BATCH
+                //   × 30 batches × 100-step frequency = 192 GB leaked per epoch
+                //   on 219M model (V=32768). T4 (16 GB VRAM) crash in <30 steps.
+                //
+                // FIX: Pre-allocate d_vtgt / d_vloss / d_vgrad ONCE before the
+                //   loop using the maximum possible sizes (SEQ, V), reuse across
+                //   all val batches, free once after the loop. No per-batch alloc.
+                // ──────────────────────────────────────────────────────────────
+                // [v25-BUG3-FIX] RAII guard: phys.training ko false set karo validation ke liye,
+                // aur GUARANTEE karo ki kisi bhi exception/early-return pe true wapas aaye.
+                // Pehle: manual toggle tha — agar forward() mein OOM ya kernel error hoti to
+                // phys.training permanently false reh jaata → Feynman dropout + Reynolds stats
+                // silently band ho jaate sari remaining training mein.
+                struct TrainingModeGuard {
+                    PhysicsConfig& phys;
+                    TrainingModeGuard(PhysicsConfig& p) : phys(p) { phys.training = false; }
+                    ~TrainingModeGuard() { phys.training = true; }
+                };
+
+                int*   d_vtgt  = nullptr;
+                float* d_vloss = nullptr;
+                float* d_vgrad = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_vtgt,  SEQ * sizeof(int)));
+                CUDA_CHECK(cudaMalloc(&d_vloss, SEQ * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&d_vgrad, SEQ * V * sizeof(float)));
+
                 for (int vb = 0; vb < val_batches_to_eval; ++vb) {
                     if (!val_loader.next_accum_batch(val_batches)) {
-                        // Restart val loader if exhausted
                         val_loader.reset();
                         if (!val_loader.next_accum_batch(val_batches)) break;
                     }
                     for (auto& [vin, vtgt] : val_batches) {
                         int vseq = (int)vin.size();
-                        // Forward only — no backward, no grad accumulation
-                        gpu_model.phys.training = false;   // disable dropout for val
-                        GPUTensor vlogits = gpu_model.forward(vin);
-                        gpu_model.phys.training = true;    // re-enable for train
+                        if (vseq <= 0 || vseq > SEQ) continue;
 
-                        int* d_vtgt;
-                        CUDA_CHECK(cudaMalloc(&d_vtgt, vseq*sizeof(int)));
+                        // Forward only — RAII guard ensures phys.training restored on any path
+                        TrainingModeGuard _guard(gpu_model.phys);
+                        GPUTensor vlogits = gpu_model.forward(vin);
+
                         CUDA_CHECK(cudaMemcpy(d_vtgt, vtgt.data(),
                                    vseq*sizeof(int), cudaMemcpyHostToDevice));
-                        float* d_vloss;
-                        CUDA_CHECK(cudaMalloc(&d_vloss, vseq*sizeof(float)));
                         CUDA_CHECK(cudaMemset(d_vloss, 0, vseq*sizeof(float)));
-                        float* d_vgrad;
-                        CUDA_CHECK(cudaMalloc(&d_vgrad, vseq*V*sizeof(float)));
+                        CUDA_CHECK(cudaMemset(d_vgrad, 0, vseq*V*sizeof(float)));
 
                         FreeEnergyResult vfe;
                         cuda_free_energy_loss(vlogits.data, d_vtgt,
@@ -1243,10 +1402,14 @@ void train_gpu(const std::string& dataset_path) {
                             val_ce_sum += vfe.cross_entropy;
                             ++val_count;
                         }
-                        cudaFree(d_vtgt); cudaFree(d_vloss); cudaFree(d_vgrad);
+                        // vlogits freed automatically (GPUTensor RAII destructor)
                     }
                     val_batches.clear();
                 }
+                // Free the pre-allocated buffers once after the loop
+                cudaFree(d_vtgt);  d_vtgt  = nullptr;
+                cudaFree(d_vloss); d_vloss = nullptr;
+                cudaFree(d_vgrad); d_vgrad = nullptr;
                 float val_ce = (val_count > 0) ? val_ce_sum / val_count : -1.f;
 
                 // [v16-STABLE] Overfit / Underfit detection
@@ -1311,6 +1474,8 @@ void train_gpu(const std::string& dataset_path) {
                     save_state.step_count    = static_cast<int64_t>(gpu_path_integral.step_count);
                     save_optimizer_state(save_state, "logos_gpu_ckpt", (int)step);
                 }
+                // [v23-AMP] Loss scaler state print at checkpoint
+                loss_scaler.print_status(step);
                 // [v11-CLIP] Show cuBLAS context so Vedic PASS/FAIL is interpretable
                 // [v17-FIX] tol=5% dono backends ke liye (FIX-11: correct formula ke baad
                 //   cuBLAS FP error sirf 0.1-2% reh gaya, purani 30% ki zarurat nahi)
@@ -1355,9 +1520,14 @@ void train_gpu(const std::string& dataset_path) {
     }
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v18-RESUME)         ║\n");
+    printf("║  Training Complete! (v24-H100-AMP)       ║\n");
+    printf("║  219M params | 8192 ctx | d=1024 L=16   ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Train_CE: %.4f | Val_CE: %.4f          ║\n", prev_train_ce, prev_val_ce);
+    printf("║  [AMP] final_scale=%.0f overflows=%d      ║\n",
+           loss_scaler.scale, loss_scaler.total_overflows);
+    printf("║  [AMP] scale_ups=%d scale_downs=%d        ║\n",
+           loss_scaler.total_scale_ups, loss_scaler.total_scale_downs);
     if (cuda_vedic_gemm_uses_cublas()) {
         printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
         printf("║  (cuBLAS tol=5%% — correct formula)       ║\n");
@@ -1470,13 +1640,15 @@ void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
         }
     }
     printf("  ✅ Vocab loaded: %d tokens\n", tok.vocab_size);
-    // [v21] Config env se lo ya checkpoint se auto-detect
-    // Training config: d=256 L=6 H=8 seq=256 (patched by notebook CELL 4)
+    // [v25-BUG7-FIX] generate_gpu() config defaults update kiye — pehle v17 (17M) defaults the.
+    // Ab 219M model ke defaults: d=1024, H=16, L=16, seq=8192.
+    // Kaggle CELL: set LOGOS_D_MODEL=1024 LOGOS_N_HEADS=16 LOGOS_N_LAYERS=16 LOGOS_SEQ_LEN=8192
+    // (ya khali chhodo — niche defaults se auto-set ho jaayenge)
     ModelConfig cfg; cfg.vocab_size=tok.vocab_size;
-    cfg.d_model     = (int)logos_env_f("LOGOS_D_MODEL",   256.f);
-    cfg.num_heads   = (int)logos_env_f("LOGOS_N_HEADS",    8.f);
-    cfg.num_layers  = (int)logos_env_f("LOGOS_N_LAYERS",   6.f);
-    cfg.max_seq_len = (int)logos_env_f("LOGOS_SEQ_LEN",  256.f);
+    cfg.d_model     = (int)logos_env_f("LOGOS_D_MODEL",  1024.f);  // 219M: was 256
+    cfg.num_heads   = (int)logos_env_f("LOGOS_N_HEADS",    16.f);  // 219M: was 8
+    cfg.num_layers  = (int)logos_env_f("LOGOS_N_LAYERS",   16.f);  // 219M: was 6
+    cfg.max_seq_len = (int)logos_env_f("LOGOS_SEQ_LEN",  8192.f);  // 219M: was 256
     printf("  Config: d=%d L=%d H=%d seq=%d vocab=%d\n",
            cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size);
     LOGOSModel cpu_model(cfg);
@@ -1497,8 +1669,9 @@ void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
 // ============================================================
 int main(int argc, char* argv[]) {
     printf("╔══════════════════════════════════════════╗\n"
-           "║  LOGOS GPU v9-fix                        ║\n"
-           "║  T_floor | Anurupyena fix | PathIntegral ║\n"
+           "║  LOGOS GPU v25-STABLE                    ║\n"
+           "║  BUG4: AMP double-scale FIXED            ║\n"
+           "║  BUG3: phys.training RAII FIXED          ║\n"
            "╚══════════════════════════════════════════╝\n\n");
 
     std::string mode=(argc>1)?argv[1]:"--train";

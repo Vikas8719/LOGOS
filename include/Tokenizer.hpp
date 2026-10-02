@@ -1,28 +1,7 @@
 #pragma once
 // ============================================================
 //  LOGOS — Tokenizer.hpp  (header-only, #pragma once protected)
-//
-//  FIX v2: FAST BPE using word-frequency dictionary
-//    Pehle (slow): corpus = vector of ALL words (millions of entries)
-//      - Har merge iteration mein poori corpus scan hoti thi
-//      - O(merges × total_word_tokens) → 32MB par bahut slow
-//    Ab (fast): word_freq = {word_chars → count}  (unique words only)
-//      - Har merge iteration sirf unique word types scan karta hai
-//      - pair_freq[pair] += word_freq[word] * occurrences_in_word
-//      - ~10k-50k unique words vs millions of raw word tokens
-//      - 50-100x speedup on large corpora
-//
-//  FIX v1: Secure binary format for vocab.bin
-//    "LGVB" magic + v1 version + strict bounds on every read.
-//
-//  BPE (Byte Pair Encoding) — Sennrich 2015 + frequency dict optimization:
-//    1. 256 char base vocab + 4 special tokens
-//    2. Build word_freq: unique word → count (one-time O(N) scan)
-//    3. Represent each word as vector<string> of subword tokens
-//    4. Count pair frequencies using word_freq weights (fast!)
-//    5. Merge best pair everywhere, update only affected words
-//    6. Stop when target_vocab reached or no pair freq >= 2
-// ============================================================
+
 #include "Tensor.hpp"
 #include <string>
 #include <vector>

@@ -329,12 +329,15 @@ static void test_lds4_vocab_at_1tb() {
     std::cout << "    10MB+  → vocab=" << v_10mb << "\n";
     std::cout << "    Small  → vocab=" << v_small << "\n";
 
+    // [v25-BUG2-FIX] v22-SCALE ne decide_vocab_size() ko FIXED 8192 kar diya
+    // (dataset size se independent). Purane tests 4096/2048/1024 expect karte the →
+    // CI fail karta tha. Ab sab 8192 expect karo — consistent with 219M model embedding.
     TEST("decide_vocab_size: 1TB → 8192",     v_1tb  == 8192);
     TEST("decide_vocab_size: 200GB → 8192",   v_200gb == 8192);
     TEST("decide_vocab_size: 200MB → 8192",   v_200mb == 8192);
-    TEST("decide_vocab_size: 50MB → 4096",    v_50mb == 4096);
-    TEST("decide_vocab_size: 10MB → 2048",    v_10mb == 2048);
-    TEST("decide_vocab_size: small → 1024",   v_small == 1024);
+    TEST("decide_vocab_size: 50MB → 8192",    v_50mb == 8192);
+    TEST("decide_vocab_size: 10MB → 8192",    v_10mb == 8192);
+    TEST("decide_vocab_size: small → 8192",   v_small == 8192);
 }
 
 // ============================================================
@@ -361,16 +364,18 @@ static void test_lds5_model_config_at_1tb() {
               << " L=" << cfg_tiny.num_layers
               << " seq=" << cfg_tiny.max_seq_len << "\n";
 
-    // All configs must be valid (d_model divisible by num_heads)
+    // [v25-BUG2-FIX] v22-SCALE ne decide_model_config() ko FIXED 219M config kar diya
+    // (1024/16/16/8192) — dataset size se independent. Sab configs same honge.
+    // Pehle: 1TB > 200M model expect karta tha → ab sab fixed = same values.
     TEST("1TB config: d_model % num_heads == 0",  cfg_1tb.d_model  % cfg_1tb.num_heads  == 0);
     TEST("200M config: d_model % num_heads == 0", cfg_200m.d_model % cfg_200m.num_heads == 0);
     TEST("50M config: d_model % num_heads == 0",  cfg_50m.d_model  % cfg_50m.num_heads  == 0);
     TEST("10M config: d_model % num_heads == 0",  cfg_10m.d_model  % cfg_10m.num_heads  == 0);
     TEST("tiny config: d_model % num_heads == 0", cfg_tiny.d_model % cfg_tiny.num_heads == 0);
 
-    // 1TB should give largest model
-    TEST("1TB model >= 200M model (d_model)",     cfg_1tb.d_model  >= cfg_200m.d_model);
-    TEST("1TB model >= 200M model (num_layers)",  cfg_1tb.num_layers >= cfg_200m.num_layers);
+    // All configs now return same fixed 219M architecture (d=1024, L=16, H=16, seq=8192)
+    TEST("All configs: d_model == 1024 (fixed 219M)",  cfg_1tb.d_model  == 1024 && cfg_tiny.d_model  == 1024);
+    TEST("All configs: num_layers == 16 (fixed 219M)", cfg_1tb.num_layers == 16 && cfg_tiny.num_layers == 16);
     TEST("All configs: max_seq_len > 0",
          cfg_1tb.max_seq_len > 0 && cfg_tiny.max_seq_len > 0);
 }

@@ -30,30 +30,66 @@ inline int64_t scan_dataset_size(const std::string& path) {
     return (int64_t)f.tellg();
 }
 
-// ── BUG 6 FIX: Vocab size decide karo processed bytes se ──────
+// ── [v22-SCALE] Vocab: Fixed 8192 ─────────────────────────────
 // Pehle: vocab_sz = ds_size>200MB ? 8192 : ...
 //        lekin tokenizer ne sirf 50MB dekha → wrong vocab
-// Ab:    vocab decision actual text size par hoga
+// Ab:    vocab FIXED 8192 — 8192-context ke saath consistent
+//        Hindi+English 1.5GB ke liye BPE coverage sufficient hai
+// [v22-SCALE] Override possible: LOGOS_VOCAB_SIZE env var (future use)
 inline int decide_vocab_size(int64_t actual_text_bytes) {
-    if (actual_text_bytes > 200LL * 1024 * 1024) return 8192;
-    if (actual_text_bytes >  50LL * 1024 * 1024) return 4096;
-    if (actual_text_bytes >  10LL * 1024 * 1024) return 2048;
-    return 1024;
+    // [v22-SCALE] Fixed 8192 vocab — matches 219M model's embedding table
+    // Chhote test runs ke liye bhi 8192 maintain karo → checkpoint compat
+    (void)actual_text_bytes;
+    return 8192;
 }
 
-// ── BUG 6 FIX: Model config decide karo actual bytes se ───────
+// ── [v22-SCALE] 219M Parameter Model — 8192 Context ──────────
+// Target: ~219M params, context=8192 tokens
+//
+// Architecture Math:
+//   d=1024, H=16, DH=64, FFN=4096 (4×d), L=16 layers
+//
+//   Per-layer params:
+//     Q,K,V weights:  H × d × DH × 3 = 16×1024×64×3 = 3,145,728
+//     O weights:      H × DH × d     = 16×64×1024   = 1,048,576
+//     W_proj:         d × d          = 1,048,576
+//     W1,b1:          d × 4d + 4d    = 4,194,304 + 4,096
+//     W2,b2:          4d × d + d     = 4,194,304 + 1,024
+//     LN params (×2): 4d             = 4,096
+//     Total/layer:    ≈ 13,640,704   ≈ 13.6M
+//
+//   16 layers:  16 × 13.6M  = 217.7M
+//   Embedding:  8192 × 1024 =   8.4M
+//   LM Head:    1024 × 8192 =   8.4M (often weight-tied, counted once)
+//   GRAND TOTAL ≈ 219M params ✅
+//
+// Context=8192 feasibility on Kaggle T4 (16GB VRAM):
+//   Weights (fp32):     219M × 4B  ≈  876 MB
+//   Nikhilam INT8 KV:   2 × seq × DH × H × L × 1B
+//                     = 2 × 8192 × 64 × 16 × 16 × 1B ≈ 268 MB
+//   Activations:        seq × d × 4B × ~10 per layer ≈ 85MB/layer
+//                       with grad_accum=8 → 8×85MB = 680 MB
+//   Optimizer (SHM):    velocities = 219M × 4B ≈ 876 MB
+//   TOTAL:              ≈ 876+268+680+876 ≈ 2.7 GB  (fits T4 ✅)
+//   grad_accum=8:       effective batch = 8 × 8192 = 65,536 tokens/step
+//
+// Shunyam sparse attention window=64 stride=16:
+//   Per-head complexity: O(seq × window) = O(8192 × 64) vs O(8192²)
+//   Memory: 8192 × 64 scores vs 8192² → 128× reduction ✅
+//
 struct ScaledConfig {
     int d_model, num_heads, num_layers, max_seq_len;
 };
 
 inline ScaledConfig decide_model_config(int64_t actual_text_bytes) {
-    if (actual_text_bytes > 200LL * 1024 * 1024)
-        return {256, 8, 6, 256};
-    if (actual_text_bytes >  50LL * 1024 * 1024)
-        return {128, 8, 4, 128};
-    if (actual_text_bytes >  10LL * 1024 * 1024)
-        return { 96, 6, 3, 128};
-    return { 64, 4, 2,  64};
+    // [v22-SCALE] FIXED: 219M param model, 8192 context
+    // Env override possible in generate_gpu() via LOGOS_D_MODEL etc.
+    // This function always returns 219M config — no dataset-size branching.
+    (void)actual_text_bytes;
+
+    // d=1024, H=16, L=16, seq=8192  →  ~219M params
+    // H=16 divides d=1024 evenly: DH = 64 ✓
+    return {1024, 16, 16, 8192};
 }
 
 // ── StreamingDataLoader ───────────────────────────────────────

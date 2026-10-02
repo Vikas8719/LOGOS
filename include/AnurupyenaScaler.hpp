@@ -1,26 +1,5 @@
 #pragma once
 // ============================================================
-//  LOGOS — AnurupyenaScaler.hpp
-//  Vedic Sutra: Āṇurūpyeṇa (अणुरूप्येण) — "In Proportion To"
-//
-//  FIX-2: Stable default parameters
-//    Pehle: target_rms=1.0, max_scale=100
-//      → grad_rms = 0.0028 → scale = 1.0/0.0028 = 357x → explosion
-//    Ab:    target_rms=0.01, max_scale=10
-//      → grad_rms = 0.0028 → scale = 0.01/0.0028 = 3.6x → stable
-//      → At most 10x boost, which is safe with clip_gradients(1.0)
-//
-//  Why target_rms=0.01?
-//    Real transformer gradient RMS is typically 1e-3 to 1e-2.
-//    Setting target at 0.01 keeps gradients in their natural range
-//    while equalizing across param groups. This prevents:
-//      1. Embedding grads (naturally tiny) being over-boosted
-//      2. LM-head grads (naturally large) being over-shrunk
-//
-//  max_scale=10 is the safety net:
-//    Even if a layer has grad_rms=0.001, scale = 0.01/0.001 = 10x max.
-//    This keeps the optimizer step bounded to clip_gradients budget.
-// ============================================================
 #include "Tensor.hpp"
 #include <cmath>
 #include <vector>

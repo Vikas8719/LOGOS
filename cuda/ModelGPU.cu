@@ -940,12 +940,93 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
     CUDA_CHECK(cudaMemcpy(d_token_ids,safe.data(),seq*sizeof(int),cudaMemcpyHostToDevice));
     free_layer_cache();
 
+    // ── [v24-H100-AMP] Param index tracker ───────────────────────────────
+    // fp16_param_ptrs[] is parallel to all_parameters().
+    // We walk it in the SAME ORDER as all_parameters() during forward.
+    // Index layout (same as all_parameters()):
+    //   0 = embedding, 1 = pos_embedding, 2 = lm_head
+    //   per layer l, PPL = H*4+9 params:
+    //     base = 3 + l*PPL
+    //     base+h*4+0 = W_Q[h]
+    //     base+h*4+1 = W_K[h]
+    //     base+h*4+2 = W_V[h]
+    //     base+h*4+3 = W_O[h]
+    //     base+H*4+0 = W_proj
+    //     base+H*4+1 = W1, +2=b1, +3=W2, +4=b2
+    //     base+H*4+5 = ln1g, +6=ln1b, +7=ln2g, +8=ln2b
+    //
+    // amp_gemm_fp32out: FP16 A × FP16 B → FP32 C  (GEMM only, not bias/LN)
+    // amp_gemm_bias:    FP16 A × FP16 W → FP32 C + FP32 bias  (FFN bias add)
+    // Fallback (amp_enabled=false or ptr==nullptr): FP32 cuda_vedic_gemm()
+    const bool amp = amp_enabled && !fp16_param_ptrs.empty();
+    int pi = 0;  // param index, incremented as we visit each parameter
+
+    // Helper lambda: GEMM A(FP32,seq×K) × W(FP16 shadow or FP32,K×N) → C(FP32,seq×N)
+    // When AMP on: cublasGemmEx FP16→FP32 (Tensor Core, 2× speed on H100)
+    // When AMP off: cuda_vedic_gemm (FP32, standard path)
+    // NOTE: A is always FP32 (activations); only W uses FP16 shadow
+    auto amp_gemm = [&](const GPUTensor& A_fp32,
+                        const GPUTensor& W_fp32, int param_idx,
+                        GPUTensor& C_fp32) {
+        if (amp && param_idx < (int)fp16_param_ptrs.size()
+            && fp16_param_ptrs[param_idx] != nullptr) {
+            // [v24] H100 Tensor Core path: FP16 W × FP32 A
+            // cuBLAS COMPUTE_32F: accumulation in FP32 → accuracy preserved
+            // A_fp32 is activation (always FP32); W_fp32 used only for shape
+            int M = A_fp32.rows, K = A_fp32.cols, N = W_fp32.cols;
+            // Cast activation A to FP16 on-the-fly (temp buffer)
+            // Then: FP16_A × FP16_W → FP32_C (Tensor Core path)
+            __half* d_A16;
+            CUDA_CHECK(cudaMalloc(&d_A16, M * K * sizeof(__half)));
+            cast_fp32_to_fp16_kernel<<<(M*K+255)/256,256>>>(
+                A_fp32.data, d_A16, M*K);
+            CUDA_KERNEL_CHECK();
+            cuda_gemm_fp16_fp32out(
+                d_A16, M, K,
+                fp16_param_ptrs[param_idx], N,
+                C_fp32.data);
+            cudaFree(d_A16);
+        } else {
+            cuda_vedic_gemm(A_fp32, W_fp32, C_fp32);
+        }
+    };
+
+    // Same but with FP32 bias add after GEMM
+    auto amp_gemm_bias = [&](const GPUTensor& A_fp32,
+                             const GPUTensor& W_fp32, int param_w_idx,
+                             const GPUTensor& bias,
+                             GPUTensor& C_fp32) {
+        if (amp && param_w_idx < (int)fp16_param_ptrs.size()
+            && fp16_param_ptrs[param_w_idx] != nullptr) {
+            int M = A_fp32.rows, K = A_fp32.cols, N = W_fp32.cols;
+            __half* d_A16;
+            CUDA_CHECK(cudaMalloc(&d_A16, M * K * sizeof(__half)));
+            cast_fp32_to_fp16_kernel<<<(M*K+255)/256,256>>>(
+                A_fp32.data, d_A16, M*K);
+            CUDA_KERNEL_CHECK();
+            cuda_gemm_fp16_fp32out(
+                d_A16, M, K,
+                fp16_param_ptrs[param_w_idx], N,
+                C_fp32.data);
+            cudaFree(d_A16);
+            // Add FP32 bias (bias stays FP32 — it's small, no precision issue)
+            int sz = M * N;
+            add_bias_kernel<<<(sz+255)/256,256>>>(C_fp32.data, bias.data, M, N);
+            CUDA_KERNEL_CHECK();
+        } else {
+            cuda_vedic_gemm_bias(A_fp32, W_fp32, bias, C_fp32);
+        }
+    };
+
+    // ── Embedding lookup + positional (FP32 always) ──────────
+    // pi=0 (embedding), pi=1 (pos_embedding) — skip in GEMM, just track
     GPUTensor X=gpu_alloc(seq,D);
     {
         dim3 grid(seq,(D+31)/32); dim3 block(32);
         embedding_kernel<<<grid,block>>>(d_token_ids,gpu_embedding.data,gpu_pos_embedding.data,X.data,seq,D,V);
         CUDA_KERNEL_CHECK();
     }
+    pi += 2;  // skip embedding(0) + pos_embedding(1)
 
     // Poincare expmap; pre-map cached for exact backward
     if (hyper_cfg.enabled) {
@@ -959,6 +1040,13 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
         auto& blk=gpu_blocks[l];
         auto& cache=layer_cache[l];
 
+        // param base for this layer (skip lm_head=2, then per-layer PPL=H*4+9)
+        // pi is now at 2 + l*(H*4+9) before layer l's params start
+        // Layout: W_Q[0..H-1], W_K[0..H-1], W_V[0..H-1], W_O[0..H-1],
+        //         W_proj, W1, b1, W2, b2, ln1g, ln1b, ln2g, ln2b
+        int layer_base_pi = 2 + 1 + l * (H*4 + 9);  // +1 for lm_head
+        // (we track pi manually below — layer_base_pi for clarity)
+
         cache.block_input=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.block_input.data,X.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
 
@@ -971,9 +1059,23 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
 
         for (int h=0;h<H;++h) {
             auto& hc=cache.heads[h];
-            hc.Q=gpu_alloc(seq,DH); cuda_vedic_gemm(cache.normed1,blk.W_Q[h],hc.Q);
-            hc.K=gpu_alloc(seq,DH); cuda_vedic_gemm(cache.normed1,blk.W_K[h],hc.K);
-            hc.V=gpu_alloc(seq,DH); cuda_vedic_gemm(cache.normed1,blk.W_V[h],hc.V);
+            // W_Q[h]: pi = layer_base_pi + h*4 + 0
+            // W_K[h]: pi = layer_base_pi + h*4 + 1
+            // W_V[h]: pi = layer_base_pi + h*4 + 2
+            // W_O[h]: pi = layer_base_pi + h*4 + 3
+            int pWQ = layer_base_pi + h*4 + 0;
+            int pWK = layer_base_pi + h*4 + 1;
+            int pWV = layer_base_pi + h*4 + 2;
+            int pWO = layer_base_pi + h*4 + 3;
+
+            hc.Q=gpu_alloc(seq,DH);
+            amp_gemm(cache.normed1, blk.W_Q[h], pWQ, hc.Q);
+
+            hc.K=gpu_alloc(seq,DH);
+            amp_gemm(cache.normed1, blk.W_K[h], pWK, hc.K);
+
+            hc.V=gpu_alloc(seq,DH);
+            amp_gemm(cache.normed1, blk.W_V[h], pWV, hc.V);
 
             // Nikhilam INT8 K/V saved for stats; attention uses float32 (no forward/backward mismatch)
             if (phys.nikhilam_kv) { hc.K_int8=nikhilam_compress(hc.K); hc.V_int8=nikhilam_compress(hc.V); }
@@ -994,7 +1096,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             { dim3 tg((seq+15)/16,(DH+15)/16); dim3 tb(16,16);
               gpu_transpose_kernel<<<tg,tb>>>(hc.K.data,K_T.data,seq,DH); CUDA_KERNEL_CHECK(); }
             GPUTensor scores=gpu_alloc(seq,seq);
-            cuda_vedic_gemm(hc.Q_adv,K_T,scores);
+            cuda_vedic_gemm(hc.Q_adv,K_T,scores);  // attention scores: FP32 (small, no AMP needed)
 
             // Shunyam sparse mask (causal-only fallback for short seq)
             { dim3 g(seq,(seq+31)/32); dim3 b(32);
@@ -1008,18 +1110,27 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             cuda_boltzmann_softmax(scores,hc.attn_probs,seq,seq,sqrtf((float)DH));
 
             hc.head_out=gpu_alloc(seq,DH);
-            cuda_vedic_gemm(hc.attn_probs,hc.V_s,hc.head_out);
+            cuda_vedic_gemm(hc.attn_probs,hc.V_s,hc.head_out);  // attn*V: FP32
 
             GPUTensor head_proj=gpu_alloc(seq,D);
-            cuda_vedic_gemm(hc.head_out,blk.W_O[h],head_proj);
+            amp_gemm(hc.head_out, blk.W_O[h], pWO, head_proj);
+
             int sz=seq*D,th=256;
             residual_add_kernel<<<(sz+th-1)/th,th>>>(concat.data,head_proj.data,sz); CUDA_KERNEL_CHECK();
         }
 
+        // W_proj: pi = layer_base_pi + H*4 + 0
+        int pWproj = layer_base_pi + H*4 + 0;
+        int pW1    = layer_base_pi + H*4 + 1;
+        int pb1    = layer_base_pi + H*4 + 2;  // bias — stays FP32, no AMP GEMM
+        int pW2    = layer_base_pi + H*4 + 3;
+        int pb2    = layer_base_pi + H*4 + 4;  // bias — stays FP32
+
         cache.concat=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.concat.data,concat.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
         GPUTensor mha_out=gpu_alloc(seq,D);
-        cuda_vedic_gemm(concat,blk.W_proj,mha_out);
+        amp_gemm(concat, blk.W_proj, pWproj, mha_out);
+
         cache.attn_out=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.attn_out.data,mha_out.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
         { int sz=seq*D,th=256; residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,mha_out.data,sz); CUDA_KERNEL_CHECK(); }
@@ -1031,8 +1142,9 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
         cache.normed2=gpu_alloc(seq,D);
         apply_norm(X,blk.ln2_gamma,blk.ln2_beta,cache.normed2,cache.ln2_w,2*l+1,seq);
 
+        // FFN W1 (with bias): FP16 GEMM + FP32 bias
         cache.ffn_H=gpu_alloc(seq,4*D);
-        cuda_vedic_gemm_bias(cache.normed2,blk.W1,blk.b1,cache.ffn_H);
+        amp_gemm_bias(cache.normed2, blk.W1, pW1, blk.b1, cache.ffn_H);
 
         cache.ffn_A=gpu_alloc(seq,4*D);
         CUDA_CHECK(cudaMemcpy(cache.ffn_A.data,cache.ffn_H.data,seq*4*D*sizeof(float),cudaMemcpyDeviceToDevice));
@@ -1048,14 +1160,17 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             dropout_seed=dropout_seed*1664525u+1013904223u+(unsigned)l;
         }
 
+        // FFN W2 (with bias): FP16 GEMM + FP32 bias
         GPUTensor ffn_out=gpu_alloc(seq,D);
-        cuda_vedic_gemm_bias(cache.ffn_A,blk.W2,blk.b2,ffn_out);
+        amp_gemm_bias(cache.ffn_A, blk.W2, pW2, blk.b2, ffn_out);
+
         { int sz=seq*D,th=256; residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,ffn_out.data,sz); CUDA_KERNEL_CHECK(); }
     }
 
     last_hidden=std::move(X);
     GPUTensor logits=gpu_alloc(seq,V);
-    cuda_vedic_gemm(last_hidden,gpu_lm_head,logits);
+    // LM head: pi=2 (lm_head)
+    amp_gemm(last_hidden, gpu_lm_head, 2, logits);
     CUDA_KERNEL_CHECK();
     return logits;
 }
