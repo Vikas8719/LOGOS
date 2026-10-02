@@ -1,4 +1,4 @@
-name: LOGOS CI v19-CTEST
+name: LOGOS CI v20-CTEST
 
 permissions:
   contents: read
@@ -17,8 +17,8 @@ concurrency:
 #  JOB OVERVIEW
 #  ┌──────────────────────────────────────────────────────────────┐
 #  │  cpu-tests-linux   → T2 Math + T2b Checkpoint (no GPU)      │
-#  │  cpu-tests-windows → T2 Math (MinGW, no GPU)                │
-#  │  cpu-tests-macos   → T2 Math (arm64, no GPU)                │
+#  │  cpu-tests-windows → T2 Math + T2b Checkpoint (MinGW)       │
+#  │  cpu-tests-macos   → T2 Math + T2b Checkpoint (arm64)       │
 #  │  gpu-tests         → T1+T3+T4+T5 via ctest -L GPU           │
 #  │                        T5 = add_bias_kernel cross-file fix,  │
 #  │                             AMP path, adjoint grad checks,   │
@@ -63,7 +63,7 @@ jobs:
       - name: Build CPU targets
         run: |
           cmake --build build \
-            --target test_math_unit test_large_data_scale logos \
+            --target test_math_unit test_checkpoint test_large_data_scale logos \
             --parallel $(nproc)
 
       # ctest: run CPU tests only (exclude GPU label)
@@ -96,7 +96,7 @@ jobs:
   #  CPU TESTS — Windows
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-windows:
-    name: "CPU Tests — Windows (T2 Math)"
+    name: "CPU Tests — Windows (T2 Math + T2b Checkpoint)"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -108,9 +108,9 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
       - name: Build
-        run: cmake --build build --target test_math_unit --parallel 4
+        run: cmake --build build --target test_math_unit test_checkpoint --parallel 4
 
-      - name: CTest — T2 Math
+      - name: CTest — T2 Math + T2b Checkpoint
         working-directory: build
         run: ctest --output-on-failure -LE "GPU" --timeout 120
 
@@ -118,7 +118,7 @@ jobs:
   #  CPU TESTS — macOS
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-macos:
-    name: "CPU Tests — macOS (T2 Math)"
+    name: "CPU Tests — macOS (T2 Math + T2b Checkpoint)"
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -130,9 +130,9 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
 
       - name: Build
-        run: cmake --build build --target test_math_unit --parallel $(sysctl -n hw.logicalcpu)
+        run: cmake --build build --target test_math_unit test_checkpoint --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: CTest — T2 Math
+      - name: CTest — T2 Math + T2b Checkpoint
         working-directory: build
         run: ctest --output-on-failure -LE "GPU" --timeout 120
 
@@ -216,7 +216,7 @@ jobs:
         if: steps.cuda.outputs.available == 'false'
         run: |
           cmake --build build \
-            --target logos test_math_unit test_large_data_scale \
+            --target logos test_math_unit test_checkpoint test_large_data_scale \
             --parallel $(nproc)
 
       # ── CTest GPU run ─────────────────────────────────────────
@@ -514,7 +514,7 @@ jobs:
           R_MAC:     ${{ needs.macos-build.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v19-CTEST"
+          echo "  LOGOS CI Summary — v20-CTEST"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -544,14 +544,11 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
-          echo "  Changes in v19:"
-          echo "    ✅ T5 test_cuda_kernels added to CTest (K1-K12)"
-          echo "    ✅ ctest replaces manual ./build/test_* scripts"
-          echo "    ✅ ctest -L GPU / -LE GPU labels split GPU vs CPU"
-          echo "    ✅ RESOURCE_LOCK: GPU tests serialize (no VRAM race)"
-          echo "    ✅ compute-sanitizer on T5 (non-blocking)"
-          echo "    ✅ add_bias_kernel extern __global__ fix in VedicGEMM.cuh"
-          echo "    ✅ K1 directly verifies that fix at runtime"
+          echo "  Changes in v20:"
+          echo "    ✅ BUG FIX: test_checkpoint added to build targets (Linux/Win/macOS)"
+          echo "    ✅ T2b_Checkpoint was 'Not Run' — executable wasn't being built"
+          echo "    ✅ All 3 CPU platforms now build + run T2b_Checkpoint"
+          echo "    ✅ Job names updated to reflect T2b coverage"
           echo ""
           echo "════════════════════════════════════════════════════"
 
