@@ -77,8 +77,17 @@ static int g_pass = 0, g_fail = 0;
 } while(0)
 
 static std::string tmp_file(const std::string& name) {
-    // CI/CD safe temp path
+    // CI/CD safe temp path — cross-platform
+#ifdef _WIN32
+    // On Windows, use TEMP env var (e.g. C:\Users\RUNNER~1\AppData\Local\Temp)
+    // Fall back to current directory if TEMP is not set
+    const char* tmp_dir = std::getenv("TEMP");
+    if (!tmp_dir) tmp_dir = std::getenv("TMP");
+    if (!tmp_dir) tmp_dir = ".";
+    return std::string(tmp_dir) + "\\logos_test_" + name;
+#else
     return "/tmp/logos_test_" + name;
+#endif
 }
 
 // ── Generate synthetic text file of given size ─────────────────
@@ -523,8 +532,7 @@ static void test_lds8_checkpoint_large_step() {
     bool weights_match = false;
 
     try {
-        save_checkpoint(model, ckpt_base, large_step);
-        save_ok = true;
+        save_ok = save_checkpoint(model, ckpt_base, large_step);
 
         LOGOSModel model2(cfg);
         // Load — filename should contain the large step number
@@ -570,7 +578,8 @@ static void test_lds9_unified_loader_threshold() {
 
     // Medium file (> 64MB) → StreamingDataLoader
     // CI: use 65MB to trigger threshold without heavy IO
-    const int64_t MEDIUM = 65LL * 1024 * 1024;  // 65MB
+    // Windows CI runners have slower I/O — keep at 65MB but note it
+    const int64_t MEDIUM = 65LL * 1024 * 1024;  // 65MB (just above 64MB threshold)
     std::string medium_path = make_tmp_text("medium.txt", MEDIUM);
 
     if (small_path.empty() || medium_path.empty()) {
@@ -793,8 +802,7 @@ static void test_lds11_production_smoke() {
 
         // ── Checkpoint ───────────────────────────────────────
         std::string ckpt = tmp_file("smoke_ckpt");
-        save_checkpoint(model, ckpt, 5);
-        ckpt_ok = true;
+        ckpt_ok = save_checkpoint(model, ckpt, 5);
 
         // ── Reload ───────────────────────────────────────────
         LOGOSModel model2(cfg);

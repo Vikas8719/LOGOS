@@ -1,4 +1,4 @@
-name: LOGOS CI v21-CTEST
+name: LOGOS CI v23-CTEST
 
 permissions:
   contents: read
@@ -107,11 +107,11 @@ jobs:
         run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
       - name: Build
-        run: cmake --build build --target test_math_unit test_checkpoint --parallel 4
+        run: cmake --build build --target test_math_unit test_checkpoint test_large_data_scale --parallel 4
 
-      - name: CTest — T2 Math + T2b Checkpoint
+      - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 120
+        run: ctest --output-on-failure -LE "GPU" --timeout 600
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — macOS
@@ -513,7 +513,7 @@ jobs:
           R_MAC:     ${{ needs.macos-build.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v21-CTEST"
+          echo "  LOGOS CI Summary — v23-CTEST"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -542,6 +542,19 @@ jobs:
           echo "  Kaggle GPU Trigger:   async (non-blocking)"
           echo ""
           echo "════════════════════════════════════════════════════"
+          echo ""
+          echo "  Changes in v23:"
+          echo "    ✅ BUG FIX: Windows /tmp/ path — tmp_file() ab cross-platform hai"
+          echo "       Windows par TEMP/TMP env var use karta hai, Linux par /tmp/"
+          echo "       Fixes: LDS2 LDS3 LDS8 LDS9 LDS10 LDS11 (all file-creation FAILs)"
+          echo "    ✅ BUG FIX: save_checkpoint return value now checked in LDS8 + LDS11"
+          echo "       (save_ok = true was set unconditionally before — silent fail masked)"
+          echo ""
+          echo "  Changes in v22:"
+          echo "    ✅ BUG FIX: Windows T4 — test_large_data_scale added to build"
+          echo "       (was registered in CTest via -LE GPU but binary not being built"
+          echo "        → 'Not Run' → exit code 1). Fixed by adding it to Build step."
+          echo "    ✅ CTest timeout on Windows increased to 600s for T4."
           echo ""
           echo "  Changes in v21:"
           echo "    ✅ BUG FIX: T2b_Checkpoint — expected_bytes now includes"
