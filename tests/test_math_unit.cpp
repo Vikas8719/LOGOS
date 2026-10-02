@@ -294,11 +294,11 @@ static void test_m2_gunitasamuchayah() {
         std::vector<int> vals = {0, 1, 50, 63, 127, -1, -50, -127};
         bool ok = true;
         for (int v : vals) {
-            int complement  = base - std::abs(v);
+            int complement    = base - std::abs(v);
             int reconstructed = (v >= 0 ? 1 : -1) * (base - complement);
             if (reconstructed != v) ok = false;
         }
-        TEST("Nikhilam: base - (base - x) = x (complement identity)", ok);
+        TEST("Nikhilam: base - (base - |x|) reconstructs x for all test values", ok);
     }
 }
 
@@ -479,14 +479,20 @@ static void test_m6_nikhilam_complement() {
     }
     TEST("No clipping for |v| < absmax", no_clip);
 
-    // d) Nikhilam: 9's complement property — for digits summing to 9
-    // In decimal: 7 + 3 = 10 (Nikhilam: complement of 7 in base 10 is 3)
-    // In our int8: complement of q is (127 - q)
-    // Double complement: 127 - (127 - q) = q ✅
+    // d) Nikhilam: 9's complement property — double complement = identity
+    // In int8: complement of q is (127 - q); double = 127-(127-q) = q
     int q_test = 45;
     int complement = base - q_test;
     int double_complement = base - complement;
-    TEST("Nikhilam: 127 - (127 - q) == q", double_complement == q_test);
+    TEST("Nikhilam: 127 - (127 - q) == q (runtime check)", double_complement == q_test);
+    // Also verify it holds for edge values at runtime
+    {
+        bool edge_ok = true;
+        for (int q : {0, 1, 63, 126, 127}) {
+            if ((base - (base - q)) != q) { edge_ok = false; break; }
+        }
+        TEST("Nikhilam: double complement identity holds for edge values", edge_ok);
+    }
 
     std::cout << "    scale=" << scale << " max_quant_err=" << max_quant_err << "\n";
 }

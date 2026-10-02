@@ -238,6 +238,9 @@ static void test_lds2_chunked_pipeline() {
     TEST("Chunked pipeline: all chunks processed",    chunks_ok == N_CHUNKS);
     TEST("Chunked pipeline: tokens extracted > 0",   total_tokens > 0);
     TEST("Chunked pipeline: batches > 0",            total_batches > 0);
+    // NOTE: This test is intentionally always-true — it guards against panics/crashes
+    // that would unwind the stack. If the loop above completes without throwing,
+    // the binary itself did not crash. The meaningful assertions are the three above.
     TEST("Chunked pipeline: no crash in 100 chunks", true);
 
     std::filesystem::remove(path);
@@ -304,14 +307,20 @@ static void test_lds3_loader_state_large_offset() {
         }
 
         std::cout << "    Batches after large-offset restore: " << batches_after << "\n";
-        ok = (saved_tokens > 0) && (large_state.total_tokens_seen > INT_MAX);
+        // ok requires: (1) actually consumed some batches before save → saved_tokens > 0
+        //              (2) large int64_t value stored correctly (> INT_MAX)
+        //              (3) restore_state didn't crash (batches_after >= 0 always)
+        ok = (batches_read > 0) &&        // we actually consumed data before save
+             (saved_tokens > 0) &&        // tokens were counted
+             (large_state.total_tokens_seen > (int64_t)INT_MAX);  // int64_t holds large value
     } catch (const std::exception& e) {
         std::cerr << "    Exception: " << e.what() << "\n";
     }
 
     TEST("Loader state: int64_t token count holds 1TB scale", ok);
+    // Verify the struct field itself holds > INT_MAX at runtime (not just the literal)
     TEST("Loader state: total_steps_done > INT_MAX works",
-         (4294967296LL > (int64_t)INT_MAX));
+         ok);  // already checked inside ok: large_state.total_tokens_seen > INT_MAX
 
     std::filesystem::remove(path);
 }
@@ -420,7 +429,9 @@ static void test_lds6_forward_stability_cpu() {
 
     std::cout << "    200 forward passes: " << (any_nan ? "NaN at step " + std::to_string(nan_at) : "all finite") << "\n";
     TEST("CPU 200 iterations: no NaN",    !any_nan);
-    TEST("CPU 200 iterations: no crash",  true);
+    // "no crash" is verified by reaching this line after the loop
+    // Add a meaningful check: all 200 iterations completed (nan_at == -1)
+    TEST("CPU 200 iterations: all 200 completed (not cut short by NaN)", nan_at == -1);
 }
 
 // ============================================================
@@ -632,12 +643,13 @@ static void test_lds9_unified_loader_threshold() {
         std::cerr << "    Medium loader exception: " << e.what() << "\n";
     }
 
-    TEST("UnifiedDataLoader: small file → DataLoader (no crash)",     small_ok);
+    TEST("UnifiedDataLoader: small file → DataLoader (no crash)",       small_ok);
     TEST("UnifiedDataLoader: medium file → StreamingLoader (no crash)", medium_ok);
     TEST("UnifiedDataLoader: small batches extracted",                  small_batches_ok);
     TEST("UnifiedDataLoader: medium batches extracted",                 medium_batches_ok);
-    TEST("UnifiedDataLoader: actual_text_size > 0 for both",
-         SMALL > 0 && MEDIUM > 0);
+    // Verify BOTH loaders actually produced data — not just "no crash"
+    TEST("UnifiedDataLoader: both loaders produced batches",
+         small_batches_ok && medium_batches_ok);
 
     std::filesystem::remove(small_path);
     std::filesystem::remove(medium_path);
