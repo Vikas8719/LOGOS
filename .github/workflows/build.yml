@@ -1,4 +1,4 @@
-name: LOGOS CI v23-CTEST
+name: LOGOS CI v24-CTEST
 
 permissions:
   contents: read
@@ -14,21 +14,17 @@ concurrency:
   cancel-in-progress: true
 
 # ─────────────────────────────────────────────────────────────────
-#  JOB OVERVIEW
+#  JOB OVERVIEW  (v24 — unified structure, Linux visible in UI)
 #  ┌──────────────────────────────────────────────────────────────┐
-#  │  cpu-tests-linux   → T2 Math + T2b Checkpoint (no GPU)      │
-#  │  cpu-tests-windows → T2 Math + T2b Checkpoint (MinGW)       │
-#  │  cpu-tests-macos   → T2 Math + T2b Checkpoint (arm64)       │
+#  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
+#  │  cpu-tests-windows → T2 Math + T2b Checkpoint + T4 LDS      │
+#  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  gpu-tests         → T1+T3+T4+T5 via ctest -L GPU           │
-#  │                        T5 = add_bias_kernel cross-file fix,  │
-#  │                             AMP path, adjoint grad checks,   │
-#  │                             training/validation modes, SHM   │
-#  │  training-pipeline → E2E train+eval (CPU, no GPU needed)     │
+#  │  linux-build       → full Linux build + E2E smoke            │
 #  │  windows-build     → full Windows build smoke                │
 #  │  macos-build       → full macOS build smoke                  │
 #  │  kaggle-gpu-trigger→ async Kaggle GPU notebook push          │
-#  │  summary           → final gate (fails if any critical job   │
-#  │                        failed)                               │
+#  │  summary           → final CI gate                           │
 #  └──────────────────────────────────────────────────────────────┘
 # ─────────────────────────────────────────────────────────────────
 
@@ -36,11 +32,10 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — Linux
-  #  Runs: T2_Math_Unit + T2b_Checkpoint via ctest (no GPU)
-  #  Also builds + runs logos --test/--forward/--benchmark
+  #  T2_Math_Unit + T2b_Checkpoint + T4_Large_Data_Scale
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-linux:
-    name: "CPU Tests — Linux (T2 Math + T2b Checkpoint)"
+    name: "CPU Tests — Linux (T2 + T2b + T4)"
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -66,39 +61,16 @@ jobs:
             --target test_math_unit test_checkpoint test_large_data_scale logos \
             --parallel $(nproc)
 
-      # ctest: run CPU tests only (exclude GPU label)
-      - name: CTest — CPU tests (T2 Math + T2b Checkpoint)
+      - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
-        run: |
-          ctest --output-on-failure \
-                -LE "GPU" \
-                --timeout 120 \
-                -j 1
-        # -LE "GPU" = exclude tests labelled GPU
-
-      - name: T4 Large Data Scale (CPU build)
-        run: |
-          echo "=== T4: 1TB scale, chunked pipeline, production smoke ==="
-          timeout 600 ./build/test_large_data_scale 2>&1 | tee /tmp/lds_out.txt
-          EXIT=${PIPESTATUS[0]}
-          FAILS=$(grep -c "❌" /tmp/lds_out.txt || true)
-          echo "T4 exit=$EXIT fails=$FAILS"
-          [ $EXIT -ne 0 ] || [ "$FAILS" -gt 0 ] && { echo "❌ T4 FAILED"; exit 1; }
-          echo "✅ T4 PASSED"
-
-      - name: logos CPU smoke
-        run: |
-          ./build/logos --test
-          ./build/logos --forward
-          ./build/logos --benchmark
+        run: ctest --output-on-failure -LE "GPU" --timeout 600 -j 1
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — Windows
   #  NOTE: PowerShell does NOT support backslash line continuation.
-  #  All cmake/build commands must be on a single line.
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-windows:
-    name: "CPU Tests — Windows (T2 Math + T2b Checkpoint)"
+    name: "CPU Tests — Windows (T2 + T2b + T4)"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,10 +87,9 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — macOS
-  #  T4_Large_Data_Scale registered in CTest → must build test_large_data_scale
   # ═══════════════════════════════════════════════════════════════
   cpu-tests-macos:
-    name: "CPU Tests — macOS (T2 Math + T2b Checkpoint)"
+    name: "CPU Tests — macOS (T2 + T2b + T4)"
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -132,28 +103,13 @@ jobs:
       - name: Build
         run: cmake --build build --target test_math_unit test_checkpoint test_large_data_scale --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: CTest — T2 Math + T2b Checkpoint
+      - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 120
+        run: ctest --output-on-failure -LE "GPU" --timeout 600
 
   # ═══════════════════════════════════════════════════════════════
   #  GPU TESTS
   #  Runs T1+T3+T4+T5 via: ctest -L GPU --output-on-failure
-  #  Falls back to CPU targets if no CUDA runner.
-  #
-  #  T5 (test_cuda_kernels) specifically covers:
-  #    K1  add_bias_kernel cross-file launch (the VedicGEMM.cuh fix)
-  #    K2  cuda_vedic_gemm_bias vs GEMM+add_bias equivalence
-  #    K3  Validation forward (phys.training=false, deterministic)
-  #    K4  Training forward  (phys.training=true, stochastic dropout)
-  #    K5  shm_hybrid_kernel Hamiltonian optimizer
-  #    K6  cast_fp32_to_fp16_kernel clamp
-  #    K7  ns_advect adjoint (exact transpose-Jacobian)
-  #    K8  ns_diffuse adjoint
-  #    K9  free_energy_loss numerical gradient check
-  #    K10 expmap0_kernel Poincaré ball constraint
-  #    K11 Gunitasamuchayah large-matrix
-  #    K12 E2E forward→loss→SHM optimizer step
   # ═══════════════════════════════════════════════════════════════
   gpu-tests:
     name: "GPU Tests (T1+T3+T4+T5 via ctest)"
@@ -182,7 +138,6 @@ jobs:
             echo "⚠️  No CUDA — GPU tests will be skipped (non-blocking)"
           fi
 
-      # ── Configure ─────────────────────────────────────────────
       - name: Configure (with CUDA)
         if: steps.cuda.outputs.available == 'true'
         run: |
@@ -199,7 +154,6 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      # ── Build ─────────────────────────────────────────────────
       - name: Build all GPU targets
         if: steps.cuda.outputs.available == 'true'
         run: |
@@ -219,31 +173,10 @@ jobs:
             --target logos test_math_unit test_checkpoint test_large_data_scale \
             --parallel $(nproc)
 
-      # ── CTest GPU run ─────────────────────────────────────────
-      # All GPU tests serialise on RESOURCE_LOCK "GPU_DEVICE_0"
-      # so they don't fight for VRAM on a single-GPU runner.
       - name: CTest — GPU tests (T1 T3 T4 T5)
         if: steps.cuda.outputs.available == 'true'
         working-directory: build
         run: |
-          echo "=== Running GPU CTest suite ==="
-          echo "  T1: Syntax & Build"
-          echo "  T3: Memory Stress"
-          echo "  T4: Large Data Scale"
-          echo "  T5: CUDA Kernel Correctness"
-          echo "      K1  add_bias_kernel cross-file launch"
-          echo "      K2  GEMM+bias equivalence"
-          echo "      K3  Validation forward (deterministic)"
-          echo "      K4  Training forward (stochastic dropout)"
-          echo "      K5  SHM Hamiltonian optimizer"
-          echo "      K6  FP16 cast + clamp"
-          echo "      K7  ns_advect adjoint"
-          echo "      K8  ns_diffuse adjoint"
-          echo "      K9  free_energy_loss gradient"
-          echo "      K10 expmap0 Poincaré ball"
-          echo "      K11 Gunitasamuchayah large matrix"
-          echo "      K12 E2E forward→loss→step"
-          echo "=============================================="
           ctest --output-on-failure \
                 -L "GPU" \
                 --timeout 600 \
@@ -251,31 +184,23 @@ jobs:
                 --test-output-size-passed 8192 \
                 --test-output-size-failed 65536
 
-      # ── CPU-only CTest fallback ───────────────────────────────
       - name: CTest — CPU fallback (no CUDA runner)
         if: steps.cuda.outputs.available == 'false'
         working-directory: build
-        run: |
-          echo "No CUDA — running CPU-only tests"
-          ctest --output-on-failure -LE "GPU" --timeout 120 -j 1
+        run: ctest --output-on-failure -LE "GPU" --timeout 600 -j 1
 
-      # ── cuda-memcheck (optional, non-blocking) ────────────────
       - name: compute-sanitizer memcheck on T5
         if: steps.cuda.outputs.available == 'true'
         continue-on-error: true
         run: |
           if command -v compute-sanitizer &>/dev/null; then
-            echo "=== compute-sanitizer memcheck on test_cuda_kernels ==="
             timeout 300 compute-sanitizer \
-              --tool memcheck \
-              --leak-check full \
-              --error-exitcode 1 \
+              --tool memcheck --leak-check full --error-exitcode 1 \
               ./build/test_cuda_kernels 2>&1 | tail -80
           else
-            echo "compute-sanitizer not available (CUDA < 11.3 or not installed)"
+            echo "compute-sanitizer not available"
           fi
 
-      # ── CTest XML report ─────────────────────────────────────
       - name: Upload CTest results
         if: always() && steps.cuda.outputs.available == 'true'
         uses: actions/upload-artifact@v4
@@ -286,10 +211,11 @@ jobs:
           retention-days: 7
 
   # ═══════════════════════════════════════════════════════════════
-  #  TRAINING PIPELINE (CPU, E2E)
+  #  LINUX BUILD — Full build + E2E training smoke
+  #  (Replaces old training-pipeline job — now visible in UI)
   # ═══════════════════════════════════════════════════════════════
-  training-pipeline:
-    name: "Training Pipeline — CPU E2E"
+  linux-build:
+    name: "Linux Build + E2E Training"
     runs-on: ubuntu-22.04
     needs: [cpu-tests-linux]
     if: always()
@@ -312,15 +238,11 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
           cmake --build build --parallel $(nproc)
 
-      - name: CTest CPU-only
-        working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 120
-
-      - name: T4 production readiness check
+      - name: logos CPU smoke
         run: |
-          echo "=== T4: production smoke before training ==="
-          timeout 600 ./build/test_large_data_scale
-          echo "✅ T4 passed — safe to train"
+          ./build/logos --test
+          ./build/logos --forward
+          ./build/logos --benchmark
 
       - name: Prepare dataset
         run: |
@@ -352,8 +274,6 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  WINDOWS BUILD
-  #  NOTE: PowerShell does NOT support backslash line continuation.
-  #  All cmake commands must be on a single line.
   # ═══════════════════════════════════════════════════════════════
   windows-build:
     name: "Windows Build"
@@ -371,7 +291,7 @@ jobs:
 
       - name: CTest CPU
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 120
+        run: ctest --output-on-failure -LE "GPU" --timeout 600
 
       - name: logos smoke
         run: |
@@ -408,7 +328,7 @@ jobs:
 
       - name: CTest CPU
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 120
+        run: ctest --output-on-failure -LE "GPU" --timeout 600
 
       - name: logos smoke
         run: |
@@ -497,88 +417,67 @@ jobs:
       - cpu-tests-windows
       - cpu-tests-macos
       - gpu-tests
-      - training-pipeline
+      - linux-build
       - windows-build
       - macos-build
     if: always()
     steps:
       - name: Print results + gate
         env:
-          R_CPU_LX: ${{ needs.cpu-tests-linux.result }}
+          R_CPU_LX:  ${{ needs.cpu-tests-linux.result }}
           R_CPU_WIN: ${{ needs.cpu-tests-windows.result }}
           R_CPU_MAC: ${{ needs.cpu-tests-macos.result }}
           R_GPU:     ${{ needs.gpu-tests.result }}
-          R_TRAIN:   ${{ needs.training-pipeline.result }}
-          R_WIN:     ${{ needs.windows-build.result }}
-          R_MAC:     ${{ needs.macos-build.result }}
+          R_LX_BLD:  ${{ needs.linux-build.result }}
+          R_WIN_BLD: ${{ needs.windows-build.result }}
+          R_MAC_BLD: ${{ needs.macos-build.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v23-CTEST"
+          echo "  LOGOS CI Summary — v24-CTEST"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
           echo "  CPU Tests Windows:    $R_CPU_WIN"
           echo "  CPU Tests macOS:      $R_CPU_MAC"
           echo "  GPU Tests (ctest):    $R_GPU"
-          echo "    T1 Syntax Build"
-          echo "    T3 Memory Stress"
-          echo "    T4 Large Data Scale"
-          echo "    T5 CUDA Kernels ← NEW"
-          echo "       K1 add_bias_kernel cross-file (VedicGEMM.cuh fix)"
-          echo "       K2 GEMM+bias equivalence"
-          echo "       K3 Validation forward (deterministic)"
-          echo "       K4 Training forward (stochastic dropout)"
-          echo "       K5 SHM Hamiltonian optimizer"
-          echo "       K6 FP16 cast + clamp"
-          echo "       K7 ns_advect adjoint"
-          echo "       K8 ns_diffuse adjoint"
-          echo "       K9 free_energy_loss gradient"
-          echo "       K10 expmap0 Poincaré ball"
-          echo "       K11 Gunitasamuchayah large matrix"
-          echo "       K12 E2E forward→loss→SHM step"
-          echo "  Training E2E:         $R_TRAIN"
-          echo "  Windows Build:        $R_WIN"
-          echo "  macOS Build:          $R_MAC"
+          echo "  Linux Build + E2E:    $R_LX_BLD"
+          echo "  Windows Build:        $R_WIN_BLD"
+          echo "  macOS Build:          $R_MAC_BLD"
           echo "  Kaggle GPU Trigger:   async (non-blocking)"
+          echo ""
+          echo "  CTest coverage:"
+          echo "    T2  Math Unit (CPU)"
+          echo "    T2b Checkpoint roundtrip (CPU)"
+          echo "    T4  Large Data Scale (CPU — all 3 platforms)"
+          echo "    T1  Syntax Build  (GPU)"
+          echo "    T3  Memory Stress (GPU)"
+          echo "    T5  CUDA Kernels  (GPU)"
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
+          echo "  Changes in v24:"
+          echo "    ✅ UI FIX: training-pipeline renamed → linux-build"
+          echo "       (now visible alongside Windows Build + macOS Build in CI)"
+          echo "    ✅ UNIFIED: All 3 CPU test jobs now run T4 with timeout=600s"
+          echo "       (Linux was 120s in CTest step → T4 could silently time out)"
+          echo "    ✅ CLEANUP: Removed redundant T4 shell step from Linux job"
+          echo "       (CTest already runs T4; duplicate bash step had a logic bug)"
+          echo "    ✅ CLEANUP: gpu-tests CPU-fallback CTest timeout set to 600s"
+          echo ""
           echo "  Changes in v23:"
-          echo "    ✅ BUG FIX: Windows /tmp/ path — tmp_file() ab cross-platform hai"
-          echo "       Windows par TEMP/TMP env var use karta hai, Linux par /tmp/"
-          echo "       Fixes: LDS2 LDS3 LDS8 LDS9 LDS10 LDS11 (all file-creation FAILs)"
-          echo "    ✅ BUG FIX: save_checkpoint return value now checked in LDS8 + LDS11"
-          echo "       (save_ok = true was set unconditionally before — silent fail masked)"
-          echo ""
-          echo "  Changes in v22:"
-          echo "    ✅ BUG FIX: Windows T4 — test_large_data_scale added to build"
-          echo "       (was registered in CTest via -LE GPU but binary not being built"
-          echo "        → 'Not Run' → exit code 1). Fixed by adding it to Build step."
-          echo "    ✅ CTest timeout on Windows increased to 600s for T4."
-          echo ""
-          echo "  Changes in v21:"
-          echo "    ✅ BUG FIX: T2b_Checkpoint — expected_bytes now includes"
-          echo "       ReynoldsBatchNorm running_mean+var (num_layers×4×d_model floats)"
-          echo "    ✅ BUG FIX: Windows cmake — backslash continuation removed"
-          echo "       (PowerShell does not support it). Single-line cmake commands."
-          echo "    ✅ BUG FIX: macOS T4 — test_large_data_scale added to build"
-          echo "       (was registered in CTest but binary not being built)"
+          echo "    ✅ BUG FIX: Windows /tmp/ path → tmp_file() cross-platform"
+          echo "    ✅ BUG FIX: save_checkpoint return value checked in LDS8+LDS11"
           echo ""
           echo "════════════════════════════════════════════════════"
 
-          # Critical gates: CPU must pass, GPU non-blocking (no runner)
           FAIL=false
           for r in "$R_CPU_LX" "$R_CPU_WIN" "$R_CPU_MAC" \
-                   "$R_TRAIN" "$R_WIN" "$R_MAC"; do
+                   "$R_LX_BLD" "$R_WIN_BLD" "$R_MAC_BLD"; do
             [ "$r" = "failure" ] && FAIL=true
           done
 
-          # GPU tests: if runner had CUDA and tests ran → must pass
-          # If runner had no CUDA → skipped gracefully (non-blocking)
           if [ "$R_GPU" = "failure" ]; then
-            echo "⚠️  GPU tests failed — check if CUDA runner was available"
-            echo "    If runner had no GPU, this is expected (non-blocking)"
-            echo "    If runner had GPU, treat as blocking"
+            echo "⚠️  GPU tests failed (non-blocking if no CUDA runner)"
           fi
 
           if [ "$FAIL" = "true" ]; then
