@@ -899,19 +899,11 @@ std::string validate_model_config(int d_model, int num_heads, int num_layers,
 //  Leverages H100 SXM Tensor Cores: 2x throughput vs FP32 GEMM
 // ============================================================
 
-// [v23-AMP] FP32 tensor → FP16 copy (for weight shadow)
-void cuda_cast_fp32_to_fp16(const float* src, __half* dst, int n) {
-    int blocks = (n + 255) / 256;
-    cast_fp32_to_fp16_kernel<<<blocks, 256>>>(src, dst, n);
-    CUDA_KERNEL_CHECK();
-}
-
-// [v23-AMP] FP16 tensor → FP32 copy (for gradient accumulation)
-void cuda_cast_fp16_to_fp32(const __half* src, float* dst, int n) {
-    int blocks = (n + 255) / 256;
-    cast_fp16_to_fp32_kernel<<<blocks, 256>>>(src, dst, n);
-    CUDA_KERNEL_CHECK();
-}
+// [v23-AMP] cuda_cast_fp32_to_fp16 / cuda_cast_fp16_to_fp32 are now
+// defined as inline wrappers in MixedPrecision.cuh (included above).
+// Removed standalone definitions here to avoid ODR violations — the
+// inline definitions in the header are the single source of truth.
+// VedicGEMM.cu includes MixedPrecision.cuh, so callers see them fine.
 
 // [v23-AMP] Mixed precision GEMM: FP16 A×B → FP32 C
 // Primary path for H100 forward pass GEMM

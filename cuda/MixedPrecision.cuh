@@ -135,6 +135,16 @@ inline HalfTensor half_alloc(int rows, int cols) {
 //  CONVERSION KERNELS
 // ============================================================
 
+// [ODR-FIX v2] Anonymous namespace: NVCC treats __global__ kernels inside
+// anonymous namespace as having internal linkage — both the kernel PTX symbol
+// AND the host-side __device_stub__ wrapper stay translation-unit-private.
+// This is stronger than `static __global__`: `static` suppresses the kernel
+// symbol but NVCC still emits a global __device_stub__ wrapper, causing ODR
+// violations at link time when multiple .cu files include this header.
+// Anonymous namespace prevents both the kernel symbol AND the stub from
+// appearing in the global namespace.
+namespace {
+
 // FP32 → FP16 (cast, with clamp to FP16 range to prevent inf)
 __global__ void cast_fp32_to_fp16_kernel(
     const float* __restrict__ src,
@@ -160,6 +170,8 @@ __global__ void cast_fp16_to_fp32_kernel(
     if (i >= n) return;
     dst[i] = __half2float(src[i]);
 }
+
+} // anonymous namespace (cast kernels)
 
 // ── Host wrappers for conversion ──────────────────────────────
 inline void cast_fp32_to_fp16(const float* src, __half* dst, int n,
@@ -215,6 +227,8 @@ inline void amp_scale_grads(const std::vector<float*>& grad_ptrs,
 //  LOSS SCALING KERNELS
 // ============================================================
 
+namespace {
+
 // Scale gradients in-place: grad *= scale_factor (FP32)
 // Used BEFORE backward to amplify (scale up)
 // Used AFTER backward to reduce (scale down = /scale)
@@ -239,6 +253,8 @@ __global__ void check_inf_nan_kernel(
     if (i >= n) return;
     if (!isfinite(data[i])) atomicOr(flag, 1);
 }
+
+} // anonymous namespace (loss scaling kernels)
 
 // ── Host wrapper: scale FP32 tensor ─────────────────────────
 inline void scale_tensor(float* data, float scale, int n,
@@ -438,6 +454,7 @@ public:
 //  Critical: LN MUST accumulate mean/var in FP32 to avoid precision loss
 //  (FP16 variance of d=1024 values → catastrophic cancellation)
 // ============================================================
+namespace {
 __global__ void layernorm_fp16_kernel(
     const __half* __restrict__ X,      // (seq × d) FP16 input
     const float*  __restrict__ gamma,  // (d,) FP32 scale — master param
@@ -492,12 +509,14 @@ __global__ void layernorm_fp16_kernel(
         y[j] = __float2half(yf);
     }
 }
+} // anonymous namespace (layernorm_fp16_kernel)
 
 // ============================================================
 //  MIXED PRECISION EMBEDDING LOOKUP
 //  Token IDs → FP32 embeddings → cast to FP16
 //  Master embedding stays FP32; FP16 copy fed to transformer
 // ============================================================
+namespace {
 __global__ void embedding_lookup_fp16_kernel(
     const int*   __restrict__ token_ids,   // (seq,)
     const float* __restrict__ embedding,   // (vocab × d) FP32 master
@@ -515,12 +534,14 @@ __global__ void embedding_lookup_fp16_kernel(
     v = fmaxf(fminf(v, 65504.0f), -65504.0f);
     out[s * d + di] = __float2half(v);
 }
+} // anonymous namespace (embedding_lookup_fp16_kernel)
 
 // ============================================================
 //  SOFTMAX (FP16 input → FP32 output for loss computation)
 //  Loss kernel needs FP32 logits for numerical stability
 //  FP16 logits → FP32 softmax → FP32 CE/entropy → FP16 grad (scaled)
 // ============================================================
+namespace {
 __global__ void logits_fp16_to_fp32_kernel(
     const __half* __restrict__ logits_fp16,   // (seq × vocab) FP16
     float*        __restrict__ logits_fp32,   // (seq × vocab) FP32
@@ -545,6 +566,7 @@ __global__ void fp32_grad_to_fp16_scaled_kernel(
     v = fmaxf(fminf(v, 65504.0f), -65504.0f);
     grad_fp16[i] = __float2half(v);
 }
+} // anonymous namespace (logits/grad kernels)
 
 // ============================================================
 //  AMP STATUS STRUCT — for logging/monitoring

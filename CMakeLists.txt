@@ -85,16 +85,39 @@ if(CMAKE_CUDA_COMPILER)
         $<$<COMPILE_LANGUAGE:CXX>:-O3>
     )
 
-    # ── GPU Training executable ───────────────────────────────
-    add_executable(logos_gpu
-        cuda/train_gpu.cu
+    # ── [v27-ODR-FIX] logos_core STATIC LIBRARY ──────────────
+    # ROOT CAUSE of "multiple definition" linker errors:
+    #   VedicGEMM.cu + ModelGPU.cu har executable mein alag compile ho rahe the.
+    #   Anonymous namespace kernels (MixedPrecision.cuh) ODR se safe hain,
+    #   lekin NVCC __device_stub__ wrappers (cast_fp32_to_fp16_kernel etc.)
+    #   tab bhi global scope mein emit hote hain jab VedicGEMM.cu + ModelGPU.cu
+    #   dono ek hi executable mein linked hote hain — ek TU se aaya stub
+    #   doosre TU ka stub se collide karta hai.
+    # FIX: VedicGEMM.cu + ModelGPU.cu ek baar compile karo (static library),
+    #   phir har executable sirf apni test .cu file + logos_core link kare.
+    #   Ek hi .o file = zero duplicate symbols = no linker error.
+    add_library(logos_core STATIC
         cuda/VedicGEMM.cu
         cuda/ModelGPU.cu
         src/Checkpoint.cpp
     )
+    target_include_directories(logos_core PUBLIC include cuda)
+    target_compile_options(logos_core PRIVATE ${LOGOS_CUDA_FLAGS})
+    target_link_libraries(logos_core PUBLIC ${LOGOS_CUDA_LIBRARIES})
+    target_compile_definitions(logos_core PUBLIC
+        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
+    set_target_properties(logos_core PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+
+    # ── GPU Training executable ───────────────────────────────
+    add_executable(logos_gpu
+        cuda/train_gpu.cu
+    )
     target_include_directories(logos_gpu PRIVATE include cuda)
     target_compile_options(logos_gpu PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(logos_gpu PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_link_libraries(logos_gpu PRIVATE logos_core)
     target_compile_definitions(logos_gpu PRIVATE
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
@@ -102,13 +125,10 @@ if(CMAKE_CUDA_COMPILER)
     # ── TEST 1: Syntax & Build Test ───────────────────────────
     add_executable(test_syntax_build
         tests/test_syntax_build.cu
-        cuda/VedicGEMM.cu
-        cuda/ModelGPU.cu
-        src/Checkpoint.cpp
     )
     target_include_directories(test_syntax_build PRIVATE include cuda tests)
     target_compile_options(test_syntax_build PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(test_syntax_build PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_link_libraries(test_syntax_build PRIVATE logos_core)
     target_compile_definitions(test_syntax_build PRIVATE
         LOGOS_TEST_BUILD=1
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
@@ -132,12 +152,10 @@ if(CMAKE_CUDA_COMPILER)
     # ── TEST 3: Memory & Bounds Stress Test ───────────────────
     add_executable(test_memory_stress
         tests/test_memory_stress.cu
-        cuda/VedicGEMM.cu
-        cuda/ModelGPU.cu
     )
     target_include_directories(test_memory_stress PRIVATE include cuda tests)
     target_compile_options(test_memory_stress PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(test_memory_stress PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_link_libraries(test_memory_stress PRIVATE logos_core)
     target_compile_definitions(test_memory_stress PRIVATE
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
@@ -145,13 +163,10 @@ if(CMAKE_CUDA_COMPILER)
     # ── TEST 4: Large Data Scale & Production Test ────────────
     add_executable(test_large_data_scale
         tests/test_large_data_scale.cu
-        cuda/VedicGEMM.cu
-        cuda/ModelGPU.cu
-        src/Checkpoint.cpp
     )
     target_include_directories(test_large_data_scale PRIVATE include cuda tests)
     target_compile_options(test_large_data_scale PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(test_large_data_scale PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_link_libraries(test_large_data_scale PRIVATE logos_core)
     target_compile_definitions(test_large_data_scale PRIVATE
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
@@ -162,12 +177,10 @@ if(CMAKE_CUDA_COMPILER)
     # adjoint gradient checks, FP16 cast, free_energy grad, E2E step.
     add_executable(test_cuda_kernels
         tests/test_cuda_kernels.cu
-        cuda/VedicGEMM.cu
-        cuda/ModelGPU.cu
     )
     target_include_directories(test_cuda_kernels PRIVATE include cuda tests)
     target_compile_options(test_cuda_kernels PRIVATE ${LOGOS_CUDA_FLAGS})
-    target_link_libraries(test_cuda_kernels PRIVATE ${LOGOS_CUDA_LIBRARIES})
+    target_link_libraries(test_cuda_kernels PRIVATE logos_core)
     target_compile_definitions(test_cuda_kernels PRIVATE
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
