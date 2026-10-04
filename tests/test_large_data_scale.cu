@@ -36,6 +36,7 @@
 #ifdef __CUDACC__
 #include "../cuda/VedicGEMM.cuh"
 #include "../cuda/ModelGPU.cuh"
+#include "../cuda/MixedPrecision.cuh"   // [FIX] cast_fp32_to_fp16_kernel — ModelGPU forward mein use hota hai
 #include <cuda_runtime.h>
 #define HAS_CUDA 1
 #else

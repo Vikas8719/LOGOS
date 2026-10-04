@@ -24,6 +24,7 @@
 // ============================================================
 #include "../cuda/VedicGEMM.cuh"
 #include "../cuda/ModelGPU.cuh"
+#include "../cuda/MixedPrecision.cuh"   // [FIX] cast_fp32_to_fp16_kernel + scale_tensor — ModelGPU forward mein use hota hai
 #include "../include/Model.hpp"
 
 #include <cuda_runtime.h>

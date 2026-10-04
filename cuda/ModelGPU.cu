@@ -6,6 +6,7 @@
 // ============================================================
 #include "ModelGPU.cuh"
 #include "VedicGEMM.cuh"
+#include "MixedPrecision.cuh"   // [BUG-FIX] cast_fp32_to_fp16_kernel ModelGPU.cu line 772,792 mein use hota hai
 #include <cuda_runtime.h>
 #include <cmath>
 #include <iostream>
