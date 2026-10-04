@@ -188,6 +188,11 @@ inline void cuda_cast_fp16_to_fp32(const __half* src, float* dst, int n,
     cast_fp16_to_fp32(src, dst, n, stream);
 }
 
+// ── [BUG5-FIX] scale_tensor forward declaration ──────────────
+// amp_scale_grads() (neeche) scale_tensor() use karta hai jo definition mein
+// baad mein aata hai. Forward declare karo taaki compiler usse jaane.
+inline void scale_tensor(float* data, float scale, int n, cudaStream_t stream = 0);
+
 // ── Bulk gradient scaling helper ──────────────────────────────
 // [v23-AMP] Gradient amplify/unscale batch operation.
 // Usage:

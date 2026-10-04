@@ -948,7 +948,7 @@ void train_gpu(const std::string& dataset_path) {
     else if (is_a100) chunk_mb_default = 32LL;
     int64_t chunk_mb_env = (int64_t)logos_env_f("LOGOS_CHUNK_MB", (float)chunk_mb_default);
     // Clamp: [1, 256] MB — 256MB se bada = single chunk me too many tokens, RAM pressure
-    chunk_mb_env = std::max(1LL, std::min(256LL, chunk_mb_env));
+    chunk_mb_env = std::max((int64_t)1, std::min((int64_t)256, chunk_mb_env));
     const int64_t CHUNK_BYTES = chunk_mb_env * 1024LL * 1024LL;
     printf("  Chunk size: %lld MB (auto: H100=64 A100=32 T4=4 | override: LOGOS_CHUNK_MB)\n",
            (long long)chunk_mb_env);
@@ -1374,7 +1374,7 @@ void train_gpu(const std::string& dataset_path) {
             //   export LOGOS_CKPT_FREQ=1000   (T4 — default)
             int64_t ckpt_freq_default = is_h100 ? 5000LL : 1000LL;
             int64_t ckpt_freq = (int64_t)logos_env_f("LOGOS_CKPT_FREQ", (float)ckpt_freq_default);
-            ckpt_freq = std::max(100LL, std::min(50000LL, ckpt_freq));  // clamp: [100, 50k]
+            ckpt_freq = std::max((int64_t)100, std::min((int64_t)50000, ckpt_freq));  // clamp: [100, 50k]
 
             if (step % ckpt_freq == 0 && step > 0) {
                 // ── [BUG-FIX] C_proxy GPUTensor scope ────────────────────────
@@ -1435,8 +1435,8 @@ void train_gpu(const std::string& dataset_path) {
                 // phys.training permanently false reh jaata → Feynman dropout + Reynolds stats
                 // silently band ho jaate sari remaining training mein.
                 struct TrainingModeGuard {
-                    PhysicsConfig& phys;
-                    TrainingModeGuard(PhysicsConfig& p) : phys(p) { phys.training = false; }
+                    GPUPhysicsConfig& phys;
+                    TrainingModeGuard(GPUPhysicsConfig& p) : phys(p) { phys.training = false; }
                     ~TrainingModeGuard() { phys.training = true; }
                 };
 

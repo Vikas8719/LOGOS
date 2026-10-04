@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>   // [BUG1-FIX] __half type ke liye — VedicGEMM line 218-224 undefined
 #include <vector>
 #include <stdexcept>
 #include <cstdio>
@@ -215,8 +216,11 @@ __global__ void shm_hybrid_kernel(
 std::string validate_model_config(int d_model, int num_heads, int num_layers, int vocab_size, int max_seq_len);
 
 // FP16/FP32 conversion and mixed precision GEMM (H100 Tensor Core)
-void cuda_cast_fp32_to_fp16(const float* src, __half* dst, int n);
-void cuda_cast_fp16_to_fp32(const __half* src, float* dst, int n);
+// [BUG4-FIX] cuda_cast_fp32_to_fp16 / cuda_cast_fp16_to_fp32 declarations REMOVED —
+// MixedPrecision.cuh mein inline definitions hain (cuda_ prefix wrappers).
+// Duplicate declaration → ambiguous call error at link time.
+// train_gpu.cu #includes MixedPrecision.cuh AFTER VedicGEMM.cuh, isliye definitions
+// wahan se milti hain — yahan redeclaration ki zarurat nahi.
 void cuda_gemm_fp16_fp32out(const __half* A, int M, int K, const __half* B, int N, float* C, float alpha=1.f, float beta=0.f);
 void cuda_gemm_fp16_fp16out(const __half* A, int M, int K, const __half* B, int N, __half* C, float alpha=1.f, float beta=0.f);
 void cuda_layernorm_fp16(const __half* X, const float* gamma, const float* beta, __half* Y, int seq, int d, float eps=1e-5f);
