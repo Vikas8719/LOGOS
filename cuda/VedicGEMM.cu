@@ -715,14 +715,13 @@ float cuda_clip_gradients(std::vector<GPUTensor*>& grads, float max_norm) {
     float total_norm_sq=0.0f;
     for (auto* g : grads) {
         int sz=g->size, blocks=(sz+threads-1)/threads;
-        float* d_partial;
-        CUDA_CHECK(cudaMalloc(&d_partial, blocks*sizeof(float)));
-        grad_norm_kernel<<<blocks,threads>>>(g->data, d_partial, sz);
+        // [v26-LEAK-FIX] CudaPtr<float>: d_partial auto-freed on exception or loop iteration
+        CudaPtr<float> d_partial(blocks);
+        grad_norm_kernel<<<blocks,threads>>>(g->data, d_partial.get(), sz);
         CUDA_KERNEL_CHECK();
         std::vector<float> h_partial(blocks);
-        CUDA_CHECK(cudaMemcpy(h_partial.data(),d_partial,
-                   blocks*sizeof(float),cudaMemcpyDeviceToHost));
-        cudaFree(d_partial);
+        d_partial.to_host(h_partial.data(), blocks);
+        // d_partial freed automatically here (loop body end)
         for (float v : h_partial) total_norm_sq+=v;
     }
     float total_norm=sqrtf(total_norm_sq+1e-12f);
@@ -770,33 +769,23 @@ VedicVerifyResult cuda_vedic_verify(const GPUTensor& A,
 {
     int M=A.rows, K=A.cols, N=B.cols;
 
-    // GPU buffers
-    float *d_col_sums_A, *d_row_sums_B, *d_sum_C;
-    CUDA_CHECK(cudaMalloc(&d_col_sums_A, K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_row_sums_B, K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sum_C,      sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_col_sums_A, 0, K * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_row_sums_B, 0, K * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_sum_C,      0, sizeof(float)));
+    // [v26-LEAK-FIX] CudaPtr RAII — all three buffers auto-freed on any exit path
+    CudaPtr<float> d_col_sums_A(K);   // zero-init included
+    CudaPtr<float> d_row_sums_B(K);
+    CudaPtr<float> d_sum_C(1);
 
     // 1. col_sums_A[k] = Σ_m A[m,k]
-    //    Reuse col_sum_kernel: treats A as (M rows, K cols)
-    //    col_sum_kernel(A, col_sums, rows=M, cols=K): col j = Σ_i A[i*K+j]
-    //    → gives us col_sums_A[k] = Σ_m A[m,k]  ✅
-    col_sum_kernel<<<K, 256>>>(A.data, d_col_sums_A, M, K);
+    col_sum_kernel<<<K, 256>>>(A.data, d_col_sums_A.get(), M, K);
     CUDA_KERNEL_CHECK();
 
     // 2. row_sums_B[k] = Σ_n B[k,n]
-    //    Reuse row_sum_kernel: treats B as (K rows, N cols)
-    //    row_sum_kernel(B, row_sums, rows=K, cols=N): row i = Σ_j B[i*N+j]
-    //    → gives us row_sums_B[k] = Σ_n B[k,n]  ✅
-    row_sum_kernel<<<K, 256>>>(B.data, d_row_sums_B, K, N);
+    row_sum_kernel<<<K, 256>>>(B.data, d_row_sums_B.get(), K, N);
     CUDA_KERNEL_CHECK();
 
     // 3. sum(C) = Σ_m Σ_n C[m,n]
     {
         int sz = C.size, blk = (sz + 255) / 256;
-        array_sum_kernel<<<blk, 256>>>(C.data, d_sum_C, sz);
+        array_sum_kernel<<<blk, 256>>>(C.data, d_sum_C.get(), sz);
         CUDA_KERNEL_CHECK();
     }
 
@@ -804,22 +793,16 @@ VedicVerifyResult cuda_vedic_verify(const GPUTensor& A,
 
     // 4. Pull K-length vectors to host and compute dot product
     std::vector<float> h_col_A(K), h_row_B(K);
-    CUDA_CHECK(cudaMemcpy(h_col_A.data(), d_col_sums_A, K*sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_row_B.data(), d_row_sums_B, K*sizeof(float), cudaMemcpyDeviceToHost));
+    d_col_sums_A.to_host(h_col_A.data(), K);
+    d_row_sums_B.to_host(h_row_B.data(), K);
 
     // Vedic prediction: dot(col_sums_A, row_sums_B)
-    // = Σ_k (Σ_m A[m,k]) * (Σ_n B[k,n])
-    // = sum(C)  [exactly, for real arithmetic]
-    double checksum_vedic = 0.0;   // double for K-length dot (avoids FP accumulation error)
+    double checksum_vedic = 0.0;
     for (int k = 0; k < K; ++k)
         checksum_vedic += (double)h_col_A[k] * (double)h_row_B[k];
 
-    float h_sum_C = 0.0f;
-    CUDA_CHECK(cudaMemcpy(&h_sum_C, d_sum_C, sizeof(float), cudaMemcpyDeviceToHost));
-
-    cudaFree(d_col_sums_A);
-    cudaFree(d_row_sums_B);
-    cudaFree(d_sum_C);
+    float h_sum_C = d_sum_C.scalar();
+    // All CudaPtr buffers freed automatically here
 
     VedicVerifyResult res;
     res.checksum_C     = h_sum_C;

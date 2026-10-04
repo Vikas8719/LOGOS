@@ -461,32 +461,63 @@ private:
         if (prefetch_stop_) return;
 
         prefetch_thread_ = std::thread([this]() {
-            auto tokens = _read_and_tokenize_chunk();
+            // [v27-H100-TWEAK3] Exception safety in prefetch thread.
+            // Pehle: tokenizer throw kare (malformed UTF-8, OOM, file error) to
+            //   exception lambda se escape hoti thi → std::terminate() call hota tha
+            //   → poora training process crash (RunPod pe silent restart, data loss).
+            //   80-100GB data mein corrupt chunk probability non-zero hai.
+            // Fix: try-catch wrap karo. Exception par:
+            //   - prefetch_chunk_ empty chhodte hain (swap_prefetched_chunk false return karega)
+            //   - prefetch_error_ flag set karo + message store karo
+            //   - training loop next step pe empty chunk dekhega → epoch boundary treat karega
+            //     (graceful stall, not crash). User ko stderr par warning milega.
+            try {
+                auto tokens = _read_and_tokenize_chunk();
 
-            if (tokens.empty() && shard_eof_) {
-                // Try next shard in background
-                int next_shard = current_shard + 1;
-                if (next_shard < (int)shards.size()) {
-                    // Read from next shard (don't modify current_shard yet)
-                    std::ifstream tmp(shards[next_shard].file_path, std::ios::binary);
-                    if (tmp) {
-                        tmp.seekg(shards[next_shard].byte_offset, std::ios::beg);
-                        std::vector<char> buf(static_cast<size_t>(chunk_bytes_));
-                        tmp.read(buf.data(), chunk_bytes_);
-                        std::streamsize got = tmp.gcount();
-                        if (got > 0) {
-                            std::string text(buf.data(), static_cast<size_t>(got));
-                            tokens = tokenizer_ref_->encode(
-                                text, static_cast<int>(got) * 4);
+                if (tokens.empty() && shard_eof_) {
+                    // Try next shard in background
+                    int next_shard = current_shard + 1;
+                    if (next_shard < (int)shards.size()) {
+                        std::ifstream tmp(shards[next_shard].file_path, std::ios::binary);
+                        if (tmp) {
+                            tmp.seekg(shards[next_shard].byte_offset, std::ios::beg);
+                            std::vector<char> buf(static_cast<size_t>(chunk_bytes_));
+                            tmp.read(buf.data(), chunk_bytes_);
+                            std::streamsize got = tmp.gcount();
+                            if (got > 0) {
+                                std::string text(buf.data(), static_cast<size_t>(got));
+                                tokens = tokenizer_ref_->encode(
+                                    text, static_cast<int>(got) * 4);
+                            }
                         }
                     }
                 }
-            }
 
-            std::lock_guard<std::mutex> lock(prefetch_mutex_);
-            prefetch_chunk_ = std::move(tokens);
-            prefetch_ready_ = true;
-            prefetch_cv_.notify_one();
+                std::lock_guard<std::mutex> lock(prefetch_mutex_);
+                prefetch_chunk_ = std::move(tokens);
+                prefetch_ready_ = true;
+                prefetch_cv_.notify_one();
+
+            } catch (const std::exception& ex) {
+                // Tokenizer ya I/O error — log karo, gracefully empty chunk set karo
+                fprintf(stderr,
+                    "\n[PREFETCH WARN] Exception in prefetch thread: %s\n"
+                    "  Training will stall at epoch boundary (data not lost).\n"
+                    "  Check dataset file integrity if this repeats.\n",
+                    ex.what());
+                std::lock_guard<std::mutex> lock(prefetch_mutex_);
+                prefetch_chunk_.clear();   // empty → swap_prefetched_chunk returns false
+                prefetch_ready_ = true;    // unblock waiter so training doesn't hang
+                prefetch_cv_.notify_one();
+            } catch (...) {
+                fprintf(stderr,
+                    "\n[PREFETCH WARN] Unknown exception in prefetch thread.\n"
+                    "  Training will stall at epoch boundary.\n");
+                std::lock_guard<std::mutex> lock(prefetch_mutex_);
+                prefetch_chunk_.clear();
+                prefetch_ready_ = true;
+                prefetch_cv_.notify_one();
+            }
         });
     }
 

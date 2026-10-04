@@ -43,14 +43,39 @@
 // FIX-1: Minimum temperature — entropy regularization always active
 static constexpr float GPU_T_MIN_FLOOR = 1e-3f;
 
-// [v17] Env override: Kaggle notebook se source badle bina LR / clip / T / steps tune kar sako
+// [v17] Env override: Kaggle/RunPod se source badle bina LR / clip / T / steps tune kar sako
 //   LOGOS_LR, LOGOS_CLIP, LOGOS_T_START, LOGOS_STEPS, LOGOS_WARMUP, LOGOS_NOISE_GAIN
+//
+// [v26-BUG14-FIX] Range-validated variant added: logos_env_f_clamped()
+// Pehle: LOGOS_LR=999999 set karo to unmodified value use hota tha → NaN/Inf weights.
+// Fix: har hyperparameter ke liye min/max clamp with warning print.
+// logos_env_f() unchanged (backward compat for non-critical numeric env vars like steps/warmup).
 static float logos_env_f(const char* name, float def) {
     const char* s = std::getenv(name);
     if (!s || !*s) return def;
     char* end = nullptr;
     float v = std::strtof(s, &end);
     return (end != s && std::isfinite(v)) ? v : def;
+}
+
+// Range-validated float env reader: value ko [lo, hi] mein clamp karo with warning.
+// Use karo saare training hyperparameters ke liye jahan extreme values dangerous hain.
+static float logos_env_f_clamped(const char* name, float def, float lo, float hi) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    float v = std::strtof(s, &end);
+    if (end == s || !std::isfinite(v)) {
+        fprintf(stderr, "  [ENV WARN] %s='%s' parse fail — default %.6g used\n", name, s, def);
+        return def;
+    }
+    if (v < lo || v > hi) {
+        float clamped = fmaxf(fminf(v, hi), lo);
+        fprintf(stderr, "  [ENV WARN] %s=%.6g out of [%.6g, %.6g] — clamped to %.6g\n",
+                name, v, lo, hi, clamped);
+        return clamped;
+    }
+    return v;
 }
 
 // ============================================================
@@ -238,20 +263,22 @@ __global__ void sumsq_accum_kernel(const float* __restrict__ g, float* __restric
 }
 
 // Σ g² over grads[b .. e)  — pre-clip group norm ke liye (sqrt caller karta hai)
+// [v26-LEAK-FIX] d_acc RAII via CudaPtr: har CUDA_CHECK ya kernel throw pe guaranteed free.
+// Pehle: raw float* d_acc tha; CUDA_KERNEL_CHECK() throw kare to leak.
+// Yeh function har 1000 steps pe Vedic verify mein call hoti hai — accumulation guaranteed.
 static float grad_group_sumsq(const std::vector<GPUTensor*>& grads, int b, int e)
 {
-    float* d_acc;
-    CUDA_CHECK(cudaMalloc(&d_acc,sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_acc,0,sizeof(float)));
+    CudaPtr<float> d_acc(1);  // 1 float, RAII — zero-init via CudaPtr constructor
+    CUDA_CHECK(cudaMemset(d_acc.get(), 0, sizeof(float)));
     for (int i=b;i<e && i<(int)grads.size();++i) {
         int n=grads[i]->size;
-        sumsq_accum_kernel<<<(n+255)/256,256>>>(grads[i]->data,d_acc,n);
+        sumsq_accum_kernel<<<(n+255)/256,256>>>(grads[i]->data, d_acc.get(), n);
     }
     CUDA_KERNEL_CHECK();
     float h=0.0f;
-    CUDA_CHECK(cudaMemcpy(&h,d_acc,sizeof(float),cudaMemcpyDeviceToHost));
-    cudaFree(d_acc);
+    CUDA_CHECK(cudaMemcpy(&h, d_acc.get(), sizeof(float), cudaMemcpyDeviceToHost));
     return h;
+    // d_acc freed here automatically (CudaPtr destructor)
 }
 
 __global__ void ffn_w2_grad_kernel(
@@ -723,19 +750,19 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v24-H100-AMP         ║\n");
+    printf("║  LOGOS GPU Training v27-H100             ║\n");
     printf("║  ✦ 219M params | 8192 context           ║\n");
     printf("║  ✦ d=1024 L=16 H=16 DH=64              ║\n");
     printf("║  ✦ [v23-AMP] FP16 fwd + FP32 master    ║\n");
     printf("║  ✦ [v24] Manual loss scaling WIRED      ║\n");
-    printf("║  ✦ [v24] Overflow detect + skip step    ║\n");
-    printf("║  ✦ [v24] Scale: 65536 → auto halve/dbl ║\n");
+    printf("║  ✦ [v25] d_A16/d_acc RAII leak fix     ║\n");
+    printf("║  ✦ [v27] d_targets RAII leak fix       ║\n");
+    printf("║  ✦ [v27] NikhilamTensor safe alloc     ║\n");
+    printf("║  ✦ [v27] Adaptive chunk: H100=64MB     ║\n");
+    printf("║  ✦ [v27] Adaptive ckpt: H100=5000 steps║\n");
+    printf("║  ✦ [v27] Prefetch thread exception-safe║\n");
     printf("║  ✦ H100 SXM Tensor Core GEMM (2x spd)  ║\n");
-    printf("║  ✦ LOGOS_CKPT se actual weights load    ║\n");
-    printf("║  ✦ LOGOS_VOCAB se vocab.bin load        ║\n");
-    printf("║  ✦ LOGOS_START_STEP se step offset      ║\n");
-    printf("║  ✦ LOGOS_BEST_F se best checkpoint      ║\n");
-    printf("║  ✦ clip_norm=0.3 | LR=1e-3              ║\n");
+    printf("║  ✦ LOGOS_CHUNK_MB / LOGOS_CKPT_FREQ    ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
 
     int device; cudaGetDevice(&device);
@@ -904,7 +931,27 @@ void train_gpu(const std::string& dataset_path) {
 
     printf("[4/5] StreamingDataLoader + Optimizer...\n"); fflush(stdout);
     int SEQ=cfg.max_seq_len;
-    static constexpr int64_t CHUNK_BYTES=4LL*1024*1024;
+    // [v27-H100-TWEAK1] Adaptive chunk size: GPU throughput ke liye chunk bada chahiye.
+    // T4/Kaggle (16GB): 4MB chunk fine — tokenizer zyada time laga sakta hai, GPU wait karta hai
+    //   but VRAM tight hai to small chunks safer hain.
+    // H100 (80GB): 4MB chunk → tokenizer becomes BOTTLENECK — prefetch thread GPU se slow ho
+    //   jaata hai → GPU IDLE ho jaata hai batch ke beech. 64MB chunk se:
+    //   - 16x zyada tokens per prefetch → prefetch frequency 16x kam
+    //   - GPU almost never waits for data on H100
+    // A100 (40GB): 32MB sweet spot.
+    // Override: LOGOS_CHUNK_MB env var — set karo RunPod pe without recompile.
+    //   e.g. export LOGOS_CHUNK_MB=64   (H100 80GB)
+    //        export LOGOS_CHUNK_MB=32   (A100 40GB)
+    //        export LOGOS_CHUNK_MB=4    (Kaggle T4 — default)
+    int64_t chunk_mb_default = 4LL;
+    if (is_h100) chunk_mb_default = 64LL;
+    else if (is_a100) chunk_mb_default = 32LL;
+    int64_t chunk_mb_env = (int64_t)logos_env_f("LOGOS_CHUNK_MB", (float)chunk_mb_default);
+    // Clamp: [1, 256] MB — 256MB se bada = single chunk me too many tokens, RAM pressure
+    chunk_mb_env = std::max(1LL, std::min(256LL, chunk_mb_env));
+    const int64_t CHUNK_BYTES = chunk_mb_env * 1024LL * 1024LL;
+    printf("  Chunk size: %lld MB (auto: H100=64 A100=32 T4=4 | override: LOGOS_CHUNK_MB)\n",
+           (long long)chunk_mb_env);
 
     // [v16-STABLE] Validation split: 5% of dataset held out
     // First 95% = training, Last 5% = validation (never trained on)
@@ -968,11 +1015,17 @@ void train_gpu(const std::string& dataset_path) {
     // clip_norm: 1.0 → 0.3  (GNorm step 42k pe 463, step 48k pe 1015 tha → EXPLOSION)
     // Root cause: cosine-end pe LR near-zero tha but momentum accumulation nahi ruka
     // 0.3 clip → effective GNorm budget ×3 tighter → stable late training
-    float   lr_init      = logos_env_f("LOGOS_LR",         1e-3f);
-    const float clip_norm = logos_env_f("LOGOS_CLIP",      0.3f);
-    const float t_start   = logos_env_f("LOGOS_T_START",   0.05f);  // aur kam T → entropy bonus reduce
-    const int   warmup_steps = (int)logos_env_f("LOGOS_WARMUP", 300.f);  // shorter warmup (already warm)
-    const float noise_gain   = logos_env_f("LOGOS_NOISE_GAIN", 0.02f);  // noise bhi kam (less exploration needed)
+    // [v26-BUG14-FIX] logos_env_f → logos_env_f_clamped: dangerous values block karo
+    // LOGOS_LR:         [1e-7, 1.0]   — 1e-7 se neeche = no learning; >1.0 = immediate diverge
+    // LOGOS_CLIP:       [0.01, 10.0]  — 0 = no gradient at all; >10 = explosion
+    // LOGOS_T_START:    [1e-4, 1.0]   — >1.0 = entropy dominates loss; <1e-4 = no exploration
+    // LOGOS_WARMUP:     [0, 10000]    — negative = UB; >10k on resume = LR stuck at 0 too long
+    // LOGOS_NOISE_GAIN: [0.0, 1.0]   — >1.0 = noise > gradient → diverge
+    float   lr_init      = logos_env_f_clamped("LOGOS_LR",         1e-3f,  1e-7f, 1.0f);
+    const float clip_norm = logos_env_f_clamped("LOGOS_CLIP",      0.3f,   0.01f, 10.0f);
+    const float t_start   = logos_env_f_clamped("LOGOS_T_START",   0.05f,  1e-4f, 1.0f);
+    const int   warmup_steps = (int)logos_env_f_clamped("LOGOS_WARMUP", 300.f, 0.f, 10000.f);
+    const float noise_gain   = logos_env_f_clamped("LOGOS_NOISE_GAIN", 0.02f, 0.0f, 1.0f);
 
     // [v16-STABLE] Geodesic friction balance analysis:
     //   aH (Hamiltonian) = gradient direction (deterministic descent)
@@ -1019,9 +1072,10 @@ void train_gpu(const std::string& dataset_path) {
     //   If overflow happens early → scale halves quickly to safe value.
     ManualLossScaler loss_scaler;
     {
-        float init_scale = logos_env_f("LOGOS_AMP_SCALE", LOSS_SCALE_INIT);
-        // LOGOS_AMP_SCALE_WINDOW: resume pe recovered window restore
-        int   init_window = (int)logos_env_f("LOGOS_AMP_WINDOW", 0.f);
+        // [v26-BUG14-FIX] AMP scale: [1, 131072] — 0 = division by zero; >131072 = H100 pe bhi overflow
+        float init_scale = logos_env_f_clamped("LOGOS_AMP_SCALE", LOSS_SCALE_INIT, 1.0f, 131072.0f);
+        // LOGOS_AMP_WINDOW: [0, LOSS_SCALE_WINDOW] — negative = UB
+        int   init_window = (int)logos_env_f_clamped("LOGOS_AMP_WINDOW", 0.f, 0.f, (float)LOSS_SCALE_WINDOW);
         loss_scaler.scale = fmaxf(fminf(init_scale, LOSS_SCALE_MAX), LOSS_SCALE_MIN);
         loss_scaler.steps_since_last_overflow = init_window;
         printf("  [v23-AMP] ManualLossScaler: init_scale=%.0f window=%d (restored=%d)\n",
@@ -1101,12 +1155,18 @@ void train_gpu(const std::string& dataset_path) {
     }
 
     int D=cfg.d_model, V=cfg.vocab_size, D4=4*D;
-    int* d_targets;
-    CUDA_CHECK(cudaMalloc(&d_targets,SEQ*sizeof(int)));
-    float* d_loss_buf;
-    CUDA_CHECK(cudaMalloc(&d_loss_buf,SEQ*sizeof(float)));
-    float* d_grad_out;
-    CUDA_CHECK(cudaMalloc(&d_grad_out,SEQ*V*sizeof(float)));
+    // [v27-MEM1-FIX] CudaPtr RAII — pehle raw cudaMalloc tha.
+    // Problem: agar training loop mein CUDA OOM ya kernel exception throw ho to
+    //   training_done: label tak execution nahi pahuncha → cudaFree miss → leak.
+    //   d_grad_out worst-case: SEQ×V×4B = 8192×8192×4 = 256 MB permanently leaked.
+    // Fix: CudaPtr<T> destructors guaranteed run on ANY exit (normal, exception, goto).
+    //   .get() se raw pointer milta hai — downstream code bilkul unchanged.
+    CudaPtr<int>   d_targets_raii(SEQ);
+    CudaPtr<float> d_loss_buf_raii(SEQ);
+    CudaPtr<float> d_grad_out_raii(static_cast<int64_t>(SEQ) * V);
+    int*   d_targets  = d_targets_raii.get();
+    float* d_loss_buf = d_loss_buf_raii.get();
+    float* d_grad_out = d_grad_out_raii.get();
 
     GPUTensor d_logits_grad=gpu_alloc(SEQ,V);
     GPUTensor d_dX_out     =gpu_alloc(SEQ,D);
@@ -1304,13 +1364,24 @@ void train_gpu(const std::string& dataset_path) {
             // 5000 steps = ~1.28M tokens per reset cycle (more stable)
             if (step > start_step && (step - start_step) % 5000 == 0) gpu_path_integral.reset_best();
 
-            if (step % 1000 == 0 && step > 0) {
+            // [v27-H100-TWEAK2] Adaptive checkpoint + Vedic verify frequency.
+            // T4/Kaggle: har 1000 steps → sync_to_cpu() ~2s GPU block = acceptable.
+            // H100 80GB: har 1000 steps → sync_to_cpu() ~5-8s GPU block per step
+            //   = 80-100GB data × 150k steps mein HOURS wasted on CPU sync.
+            //   5000 steps pe checkpoint karo → 5× less overhead.
+            // Override: LOGOS_CKPT_FREQ env var (any GPU, without recompile).
+            //   export LOGOS_CKPT_FREQ=5000   (H100)
+            //   export LOGOS_CKPT_FREQ=1000   (T4 — default)
+            int64_t ckpt_freq_default = is_h100 ? 5000LL : 1000LL;
+            int64_t ckpt_freq = (int64_t)logos_env_f("LOGOS_CKPT_FREQ", (float)ckpt_freq_default);
+            ckpt_freq = std::max(100LL, std::min(50000LL, ckpt_freq));  // clamp: [100, 50k]
+
+            if (step % ckpt_freq == 0 && step > 0) {
                 // ── [BUG-FIX] C_proxy GPUTensor scope ────────────────────────
                 // C_proxy is RAII (GPUTensor), so it frees itself at the end of
                 // this block. Previously the block was implicit; making it
                 // explicit ensures the VRAM is released before the checkpoint
-                // sync (which may need headroom on a 16 GB T4).
-                {
+                // sync (which may need headroom on a 16 GB T4).                {
                 GPUTensor C_proxy = gpu_alloc(gpu_model.last_hidden.rows,
                                               gpu_model.gpu_lm_head.cols);
                 cuda_vedic_gemm(gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy);
@@ -1496,7 +1567,8 @@ void train_gpu(const std::string& dataset_path) {
 
     training_done:  // [v18-RESUME] goto target from step cap check
     CUDA_CHECK(cudaDeviceSynchronize());
-    cudaFree(d_targets); cudaFree(d_loss_buf); cudaFree(d_grad_out);
+    // [v27-MEM1-FIX] d_targets/d_loss_buf/d_grad_out: CudaPtr RAII auto-freed here.
+    // Manual cudaFree() calls removed — destructors handle cleanup on all paths.
     for (auto* g : gpu_grads) delete g;
     gpu_model.sync_to_cpu(cpu_model);
     save_checkpoint(cpu_model,"logos_final",(int)step);
@@ -1520,7 +1592,7 @@ void train_gpu(const std::string& dataset_path) {
     }
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v24-H100-AMP)       ║\n");
+    printf("║  Training Complete! (v27-H100)           ║\n");
     printf("║  219M params | 8192 ctx | d=1024 L=16   ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Train_CE: %.4f | Val_CE: %.4f          ║\n", prev_train_ce, prev_val_ce);
@@ -1656,6 +1728,18 @@ void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
     HyperConfig hyper_cfg; hyper_cfg.enabled=true; hyper_cfg.curvature=1.0f;
     ModelGPU gpu_model(cfg,hyper_cfg);
     gpu_model.load_from_cpu(cpu_model);
+
+    // [v26-BUG10-FIX] Inference mode: phys.training explicitly false set karo.
+    // ModelGPU default: phys.training=false (GPUPhysicsConfig default in header).
+    // Lekin agar future code same gpu_model instance ko train_gpu ke baad reuse kare
+    // (jahan phys.training=true set hota hai), toh Feynman dropout + Reynolds EMA
+    // accidentally ON rahega — inference nondeterministic + slow ho jaata.
+    // Explicitly false: safe even if caller reuses the instance.
+    gpu_model.phys.training        = false;  // inference: no dropout, no EMA update
+    gpu_model.phys.feynman_dropout = false;  // belt + suspenders: kernel bhi skip karo
+    gpu_model.phys.reynolds        = false;  // running stats update skip (no data to track)
+    printf("  [v26] Inference mode: training=false (dropout OFF, Reynolds OFF)\n");
+
     auto prompt_ids=tok.encode(prompt_text,cfg.max_seq_len/2);
     auto beams=generate_feynman(gpu_model,prompt_ids,max_new,beam_width,hbar,top_k);
     for (int i=0;i<(int)beams.size();++i) {
@@ -1669,16 +1753,31 @@ void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
 // ============================================================
 int main(int argc, char* argv[]) {
     printf("╔══════════════════════════════════════════╗\n"
-           "║  LOGOS GPU v25-STABLE                    ║\n"
-           "║  BUG4: AMP double-scale FIXED            ║\n"
-           "║  BUG3: phys.training RAII FIXED          ║\n"
+           "║  LOGOS GPU v27-H100                      ║\n"
+           "║  MEM1: d_targets RAII FIXED              ║\n"
+           "║  MEM2: NikhilamTensor safe alloc FIXED   ║\n"
+           "║  H100: chunk/ckpt/prefetch optimized     ║\n"
            "╚══════════════════════════════════════════╝\n\n");
 
     std::string mode=(argc>1)?argv[1]:"--train";
+    // [v26-BUG11-FIX] Path sanitizer: .. aur absolute paths dono block karo.
+    // Pehle: sirf ".." check tha — "/etc/passwd" ya "/proc/self/mem" pass ho jaata.
+    // RunPod pe command line args trusted hain, lekin production deployment risk real hai.
+    // Fix: absolute paths (leading '/') bhi reject karo; fallback default return.
+    // Note: Windows paths (C:\...) RunPod Linux pe nahi aate — skip.
+    // Symbolic links: filesystem-level issue, userspace mein detect nahi ho sakta safely;
+    // RunPod pe /workspace/ ke bahar symlinks standard setup mein nahi hote.
     auto safe=[](const char* raw,const char* fb)->std::string{
         if (!raw) return fb;
         std::string s(raw);
-        if (s.find("..")!=std::string::npos||s.find('\0')!=std::string::npos) return fb;
+        // Block null bytes (embedded \0 se string truncation attack)
+        if (s.find('\0')!=std::string::npos) return fb;
+        // Block directory traversal (../ ya ..\)
+        if (s.find("..")!=std::string::npos) return fb;
+        // Block absolute paths (/etc/passwd, /proc/... etc.)
+        if (!s.empty() && s[0]=='/') return fb;
+        // Block empty paths
+        if (s.empty()) return fb;
         return s;
     };
 

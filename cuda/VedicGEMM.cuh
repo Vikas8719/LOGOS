@@ -5,6 +5,108 @@
 #include <cstdio>
 #include <cmath>
 
+// ============================================================
+//  CudaPtr<T> — RAII smart pointer for raw GPU memory
+//  Replaces bare cudaMalloc/cudaFree patterns that leak on exceptions.
+//
+//  Usage:
+//    CudaPtr<float>  d_buf(n);         // alloc n floats, zero-init
+//    CudaPtr<int8_t> d_i8(n, false);   // alloc without zeroing
+//    float* raw = d_buf.get();          // raw ptr for kernel calls
+//    T val = d_scalar.scalar();         // single value device->host
+//    // auto freed at scope exit — even on exception / early return
+//
+//  Rules:
+//    - Non-copyable (like unique_ptr)
+//    - Movable
+//    - .get() returns raw device ptr
+//    - Destructor calls cudaFree — never throws
+// ============================================================
+template<typename T>
+struct CudaPtr {
+    T*  ptr  = nullptr;
+    int size = 0;
+
+    CudaPtr() = default;
+
+    explicit CudaPtr(int n, bool zero = true) : size(n) {
+        if (n <= 0) { ptr = nullptr; return; }
+        cudaError_t e = cudaMalloc(&ptr, (size_t)n * sizeof(T));
+        if (e != cudaSuccess) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "CudaPtr cudaMalloc(%d x %zu B) failed: %s",
+                n, sizeof(T), cudaGetErrorString(e));
+            throw std::runtime_error(msg);
+        }
+        if (zero) {
+            e = cudaMemset(ptr, 0, (size_t)n * sizeof(T));
+            if (e != cudaSuccess) {
+                cudaFree(ptr); ptr = nullptr;
+                char msg2[256];
+                snprintf(msg2, sizeof(msg2),
+                    "CudaPtr cudaMemset failed: %s", cudaGetErrorString(e));
+                throw std::runtime_error(msg2);
+            }
+        }
+    }
+
+    CudaPtr(const CudaPtr&)            = delete;
+    CudaPtr& operator=(const CudaPtr&) = delete;
+
+    CudaPtr(CudaPtr&& o) noexcept : ptr(o.ptr), size(o.size)
+    { o.ptr = nullptr; o.size = 0; }
+
+    CudaPtr& operator=(CudaPtr&& o) noexcept {
+        if (this != &o) {
+            release_internal();
+            ptr = o.ptr; size = o.size;
+            o.ptr = nullptr; o.size = 0;
+        }
+        return *this;
+    }
+
+    ~CudaPtr() { release_internal(); }
+
+    void memset_zero() {
+        if (ptr && size > 0) cudaMemset(ptr, 0, (size_t)size * sizeof(T));
+    }
+
+    T*       get()       { return ptr; }
+    const T* get() const { return ptr; }
+
+    void from_host(const T* src, int n) {
+        cudaMemcpy(ptr, src, (size_t)n * sizeof(T), cudaMemcpyHostToDevice);
+    }
+    void to_host(T* dst, int n) const {
+        cudaMemcpy(dst, ptr, (size_t)n * sizeof(T), cudaMemcpyDeviceToHost);
+    }
+    // Single scalar device->host (for reduction outputs)
+    T scalar() const {
+        T val{};
+        cudaMemcpy(&val, ptr, sizeof(T), cudaMemcpyDeviceToHost);
+        return val;
+    }
+
+    bool empty() const { return ptr == nullptr || size == 0; }
+
+    // [v27-MEM2-FIX] release(): ownership transfer ke liye (unique_ptr::release() jaisa).
+    // Caller raw ptr ka ownership leta hai — CudaPtr nullptr ho jaata hai, destructor free nahi karega.
+    // Use case: CudaPtr<int8_t> mein alloc karo, quantize karo, phir NikhilamTensor ko do.
+    // Agar quantize fail ho to CudaPtr destructor cleanup karta hai; success pe caller owns it.
+    T* release() noexcept {
+        T* p = ptr;
+        ptr  = nullptr;
+        size = 0;
+        return p;
+    }
+
+private:
+    void release_internal() noexcept {
+        if (ptr) { cudaFree(ptr); ptr = nullptr; size = 0; }
+    }
+};
+
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t _e = (call); \

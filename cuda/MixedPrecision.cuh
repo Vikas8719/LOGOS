@@ -242,30 +242,25 @@ inline void scale_tensor(float* data, float scale, int n,
 
 // ── Host: check all grad tensors for inf/nan ─────────────────
 // Returns true if any gradient has inf or nan
-// [v25-BUG5-FIX] cudaDeviceSynchronize() sirf d_flag copy ke pehle karo (lazy sync).
-// Pehle: har step LOSS_SCALE_WINDOW check mein full GPU pipeline flush hota tha.
-// Ab: kernels async launch hote hain, sirf memory copy se pehle ek sync → ~0.5ms saved/step.
-// 100k steps × 0.5ms = 50 seconds less overhead on H100.
+// [v25-BUG5-FIX] cudaDeviceSynchronize() sirf copy ke pehle (lazy sync) → ~0.5ms/step saved.
+// [v26-LEAK-FIX] CudaPtr<int> use karo — d_flag kabhi leak nahi hoga exception par.
 inline bool grads_have_inf_nan(const std::vector<float*>& grad_ptrs,
                                 const std::vector<int>& sizes)
 {
-    int* d_flag;
-    CUDA_CHECK(cudaMalloc(&d_flag, sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_flag, 0, sizeof(int)));
+    // RAII: d_flag auto-freed on any exit path (normal, exception, early return)
+    CudaPtr<int> d_flag(1);  // 1 int, zero-initialised
 
     for (int i = 0; i < (int)grad_ptrs.size(); ++i) {
         int n = sizes[i];
         int blocks = (n + 255) / 256;
-        check_inf_nan_kernel<<<blocks, 256>>>(grad_ptrs[i], d_flag, n);
+        check_inf_nan_kernel<<<blocks, 256>>>(grad_ptrs[i], d_flag.get(), n);
         // No sync here — kernels queue asynchronously on default stream
     }
-    // Single sync point: wait for ALL check_inf_nan_kernel launches to complete
+    // Single sync: wait for ALL check_inf_nan_kernel launches to complete
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    int h_flag = 0;
-    CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
-    cudaFree(d_flag);
-    return h_flag != 0;
+    // scalar() does device->host copy of the single int flag
+    return d_flag.scalar() != 0;
 }
 
 // ============================================================
