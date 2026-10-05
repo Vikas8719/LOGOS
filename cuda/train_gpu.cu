@@ -856,7 +856,7 @@ void train_gpu(const std::string& dataset_path) {
     // T4 VRAM 16GB: weights(876MB) + optimizer(876MB) + KV cache(268MB) ≈ 2GB overhead
     // Remaining: ~13GB / 1.36GB per step ≈ 9 micro-batches max
     // grad_accum=8: effective batch = 8 × 8192 = 65,536 tokens/step (good for 219M)
-    int grad_accum = 8;  // [v22-SCALE] Fixed 8 (was dataset-size dependent 1/2/4)
+    int grad_accum = 4;  // [v22-SCALE] T4 OOM fix: 8→4 (seq=8192 pe activations zyada)
 
     // [v18] vocab_size debug: tok.vocab_size tokenizer ka actual size hai
     // decide_vocab_size() sirf target tha — actual size slightly different ho sakta hai
