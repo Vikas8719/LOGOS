@@ -851,12 +851,26 @@ void train_gpu(const std::string& dataset_path) {
         cfg.d_model,cfg.num_heads,cfg.num_layers,cfg.vocab_size,cfg.max_seq_len);
     if (!cfg_err.empty()) { fprintf(stderr,"❌ Config: %s\n",cfg_err.c_str()); return; }
 
-    // [v22-SCALE] grad_accum: 219M model + 8192 seq ke liye memory budget
-    // seq=8192 × d=1024 × 4B × activations ≈ 85MB/layer × 16 layers ≈ 1.36GB per micro-batch
-    // T4 VRAM 16GB: weights(876MB) + optimizer(876MB) + KV cache(268MB) ≈ 2GB overhead
-    // Remaining: ~13GB / 1.36GB per step ≈ 9 micro-batches max
-    // grad_accum=8: effective batch = 8 × 8192 = 65,536 tokens/step (good for 219M)
-    int grad_accum = 4;  // [v22-SCALE] T4 OOM fix: 8→4 (seq=8192 pe activations zyada)
+    // [v30-OOM-FIX] grad_accum: T4 (16GB) pe seq=8192 OOM hota tha.
+    // Memory breakdown per micro-batch forward:
+    //   activations: seq×D×L×~12 tensors = 8192×1024×16×12×4B ≈ 6.4 GB
+    //   weights(FP32): ~876 MB | FP16 shadow: ~418 MB | optimizer vel: ~876 MB
+    //   Total min: ~8.6 GB + runtime peaks → OOM on 16GB T4
+    //
+    // Fix strategy:
+    //   1. grad_accum=1: ek micro-batch at a time → gradient forward/backward peak kam
+    //   2. Env override: LOGOS_GRAD_ACCUM (default=1 for T4, set higher for A100/H100)
+    //   3. Effective batch size: 1 × 8192 = 8192 tokens/step (still valid for 219M)
+    //
+    // A100 (40GB): LOGOS_GRAD_ACCUM=4 → 4×8192=32768 tokens/step
+    // H100 (80GB): LOGOS_GRAD_ACCUM=8 → 8×8192=65536 tokens/step
+    int grad_accum_default = 1;  // T4 default: 1 (minimum memory)
+    if (is_a100) grad_accum_default = 4;
+    if (is_h100) grad_accum_default = 8;
+    int grad_accum = (int)logos_env_f("LOGOS_GRAD_ACCUM", (float)grad_accum_default);
+    grad_accum = std::max(1, std::min(32, grad_accum));  // clamp [1, 32]
+    printf("  [v30-OOM] grad_accum=%d (T4=1, A100=4, H100=8 | override: LOGOS_GRAD_ACCUM)\n",
+           grad_accum);
 
     // [v18] vocab_size debug: tok.vocab_size tokenizer ka actual size hai
     // decide_vocab_size() sirf target tha — actual size slightly different ho sakta hai
@@ -873,6 +887,32 @@ void train_gpu(const std::string& dataset_path) {
     // Actual values (LR/clip/T/steps/noise) optimizer banao ke baad print hote hain —
     // env override: LOGOS_LR, LOGOS_CLIP, LOGOS_T_START, LOGOS_STEPS, LOGOS_WARMUP, LOGOS_NOISE_GAIN
     printf("\n[v17 SHM Optimizer] hyper-parameters neeche [4/5] me print honge\n\n");
+
+    // [v30-OOM-FIX] Pre-flight VRAM check before allocating model.
+    // 219M model (d=1024, L=16, seq=8192) minimum VRAM requirements:
+    //   FP32 weights:   ~876 MB
+    //   FP16 shadow:    ~418 MB
+    //   Optimizer vel:  ~876 MB
+    //   Activations:    ~1500 MB (1 micro-batch, seq=8192, conservative)
+    //   Gradient bufs:  ~876 MB
+    //   Total estimate: ~4600 MB minimum
+    // T4 (16 GB): ok but tight. If free < 5GB → warn + suggest smaller config.
+    {
+        size_t free_before, total_before;
+        cudaMemGetInfo(&free_before, &total_before);
+        float free_gb  = (float)free_before  / (1024.f*1024.f*1024.f);
+        float total_gb = (float)total_before / (1024.f*1024.f*1024.f);
+        printf("  [v30] VRAM before model alloc: %.1f GB free / %.1f GB total\n",
+               free_gb, total_gb);
+        if (free_before < 5ULL*1024*1024*1024) {
+            printf("  ⚠️  [v30-OOM] VRAM tight (< 5 GB free)!\n");
+            printf("      219M (d=1024 L=16 seq=8192) needs ~5 GB minimum.\n");
+            printf("      To reduce memory set env vars:\n");
+            printf("        LOGOS_GRAD_ACCUM=1      (already default for T4)\n");
+            printf("      Or use a smaller model by editing decide_model_config().\n");
+            fflush(stdout);
+        }
+    }
 
     printf("[3/5] Init GPU model...\n"); fflush(stdout);
     LOGOSModel cpu_model(cfg);
@@ -1384,6 +1424,11 @@ void train_gpu(const std::string& dataset_path) {
                                  d_d_normed2,d_dX_ln,d_dX_attn_in,seq);
                     // [v14-WIRE] Reynolds running stats EMA update after each backward
                     gpu_model.update_norm_stats();
+                    // [v30-OOM-FIX] Free layer cache immediately after backward.
+                    // Activations (~6GB for seq=8192 L=16) are only needed during backward.
+                    // Freeing here before the next micro-batch reduces peak VRAM by ~6GB,
+                    // making T4 (16GB) viable for this 219M model configuration.
+                    gpu_model.free_layer_cache();
                     // [v25-BUG4-FIX] amp_scale_grads(loss_scaler.scale) REMOVED from here.
                     // Pehle: har micro-batch ke baad scale × grad_accum times apply hota tha,
                     // phir sirf 1× unscale → net (grad_accum)× over-scaled grads.
@@ -1565,6 +1610,11 @@ void train_gpu(const std::string& dataset_path) {
                         // Forward only — RAII guard ensures phys.training restored on any path
                         TrainingModeGuard _guard(gpu_model.phys);
                         GPUTensor vlogits = gpu_model.forward(vin);
+                        // [v30-OOM-FIX] Explicitly free layer cache after val forward.
+                        // forward() allocates ~6GB of activation tensors (seq=8192, L=16).
+                        // Without free: val loop holds 6GB × val_batches_to_eval in flight.
+                        // With free: only 1 batch active at a time → peak = 6GB not 180GB.
+                        gpu_model.free_layer_cache();
 
                         CUDA_CHECK(cudaMemcpy(d_vtgt, vtgt.data(),
                                    vseq*sizeof(int), cudaMemcpyHostToDevice));
