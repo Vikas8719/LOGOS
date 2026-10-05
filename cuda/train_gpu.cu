@@ -930,21 +930,11 @@ void train_gpu(const std::string& dataset_path) {
     // ── [v29-FULLRESUME] TrainingState load ──────────────────────────────
     // .trainstate file se: best_loss, prev_train_ce, prev_val_ce,
     // overfit_streak, amp_scale/window, loader byte position, gnorm EMA
+    // NOTE: start_step pehle compute hona chahiye — niche steps section se pehle load karo
+    // lekin actually use karo steps compute hone ke baad. Isliye ts_found flag store karo
+    // aur baad mein apply karo.
     TrainingState ts_loaded;
     bool ts_found = false;
-    if (resumed && start_step > 0) {
-        std::string ckpt_env_str2(std::getenv("LOGOS_CKPT") ? std::getenv("LOGOS_CKPT") : "");
-        // base_path already computed above in optstate block — reuse same logic
-        std::string base2 = ckpt_env_str2;
-        std::string sfx2 = "_step" + std::to_string((int)start_step) + ".bin";
-        if (base2.size() >= sfx2.size() &&
-            base2.substr(base2.size() - sfx2.size()) == sfx2)
-            base2 = base2.substr(0, base2.size() - sfx2.size());
-        else if (base2.size() > 4 && base2.substr(base2.size()-4) == ".bin")
-            base2 = base2.substr(0, base2.size()-4);
-
-        ts_found = ts_loaded.load(base2, (int)start_step);
-    }
 
     ModelGPU   gpu_model(cfg);
     gpu_model.load_from_cpu(cpu_model);
