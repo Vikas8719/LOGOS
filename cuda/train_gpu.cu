@@ -936,6 +936,33 @@ void train_gpu(const std::string& dataset_path) {
     TrainingState ts_loaded;
     bool ts_found = false;
 
+    // [v29-BUG-FIX] ts_loaded.load() ACTUALLY CALL KARO — pehle sirf declare tha,
+    // load() kabhi call hi nahi hoti thi → ts_found hamesha false → sab kuch reset.
+    // Resume pe LOGOS_CKPT set hai to same base path pe .trainstate dhundho.
+    if (resumed) {
+        const char* ckpt_env_ts = std::getenv("LOGOS_CKPT");
+        const int   step_n_ts   = (int)logos_env_f("LOGOS_START_STEP", 0.f);
+        if (ckpt_env_ts && *ckpt_env_ts && step_n_ts > 0) {
+            // Base path nikalo: "logos_gpu_ckpt_step61000.bin" → "logos_gpu_ckpt"
+            std::string base_ts(ckpt_env_ts);
+            std::string step_suf = "_step" + std::to_string(step_n_ts) + ".bin";
+            if (base_ts.size() >= step_suf.size() &&
+                base_ts.substr(base_ts.size() - step_suf.size()) == step_suf) {
+                base_ts = base_ts.substr(0, base_ts.size() - step_suf.size());
+            } else {
+                if (base_ts.size() > 4 &&
+                    base_ts.substr(base_ts.size() - 4) == ".bin")
+                    base_ts = base_ts.substr(0, base_ts.size() - 4);
+            }
+            ts_found = ts_loaded.load(base_ts, step_n_ts);
+            if (ts_found)
+                printf("  [v29] TrainingState loaded from: %s_step%d.trainstate\n",
+                       base_ts.c_str(), step_n_ts);
+            else
+                printf("  [v29] No .trainstate found — metrics will reset (weights OK)\n");
+        }
+    }
+
     ModelGPU   gpu_model(cfg);
     gpu_model.load_from_cpu(cpu_model);
 
@@ -1284,6 +1311,7 @@ void train_gpu(const std::string& dataset_path) {
 
     printf("\n[v29-FULLRESUME] resumed=%s | start_step=%lld | best_F=%.4f | target=%lld\n",
            resumed?"YES":"NO", (long long)start_step, best_loss, (long long)total_steps);
+    printf("  Config: d=%d L=%d H=%d seq=%d vocab=%d grad_accum=%d\n",
            cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size, grad_accum);
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
