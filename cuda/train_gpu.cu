@@ -1949,7 +1949,20 @@ int main(int argc, char* argv[]) {
 
     try {
         if (mode=="--train") {
-            std::string ds=(argc>2)?safe(argv[2],"dataset.txt"):"dataset.txt";
+            // [v30-KAGGLE-FIX] Dataset path resolution priority:
+            // 1. LOGOS_DATASET env var (absolute paths OK — set karo Kaggle cell mein)
+            // 2. Command line arg argv[2] — safe() se nahi guzarta (absolute paths chahiye)
+            // 3. Default "dataset.txt" (train_gpu ke andar auto-discover karega)
+            // safe() sirf --generate mode ke paths ke liye hai (checkpoint/model paths)
+            std::string ds = "dataset.txt";
+            const char* ds_env = std::getenv("LOGOS_DATASET");
+            if (ds_env && *ds_env) {
+                ds = std::string(ds_env);
+                printf("  [v30] Dataset from LOGOS_DATASET: %s\n", ds.c_str());
+            } else if (argc > 2) {
+                ds = std::string(argv[2]);  // argv[2] seedha use karo, safe() nahi
+                printf("  [v30] Dataset from argv: %s\n", ds.c_str());
+            }
             train_gpu(ds);
         } else if (mode=="--generate"||mode=="--generate-gpu") {
             std::string ckpt=(argc>2)?safe(argv[2],"none"):"none";
