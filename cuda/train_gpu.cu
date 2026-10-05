@@ -27,6 +27,7 @@
 #include "../include/StreamingDataLoader.hpp"
 #include "../include/Checkpoint.hpp"
 #include "../include/PhysicsOpt.hpp"    // [v14-WIRE] WeightPathIntegral GPU LR scaling
+#include "../include/TrainingState.hpp" // [v29-FULLRESUME] full training state save/load
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <iostream>
@@ -787,10 +788,36 @@ void train_gpu(const std::string& dataset_path) {
     fflush(stdout);
 
     printf("[1/5] Dataset scan...\n"); fflush(stdout);
-    int64_t actual_size=scan_dataset_size(dataset_path);
-    if (actual_size==0) {
-        fprintf(stderr,"❌ Dataset not found: %s\n",dataset_path.c_str()); return;
+
+    // [v28-DATASET-FIX] dataset_path ("dataset.txt") sirf CWD mein dhundhta tha.
+    // Kaggle pe download script data /kaggle/working/ mein likhta hai — build/ mein nahi.
+    // Auto-discover: pehle given path try karo, phir common Kaggle locations scan karo.
+    std::string resolved_dataset = dataset_path;
+    if (!std::ifstream(resolved_dataset).good()) {
+        const char* candidates[] = {
+            "/kaggle/working/dataset.txt",
+            "/kaggle/working/train.txt",
+            "/kaggle/working/logos_dataset.txt",
+            "/tmp/dataset.txt",
+            nullptr
+        };
+        for (int ci = 0; candidates[ci]; ++ci) {
+            if (std::ifstream(candidates[ci]).good()) {
+                resolved_dataset = candidates[ci];
+                printf("  [v28] dataset auto-resolved: %s\n", resolved_dataset.c_str());
+                break;
+            }
+        }
     }
+
+    int64_t actual_size=scan_dataset_size(resolved_dataset);
+    if (actual_size==0) {
+        fprintf(stderr,"❌ Dataset not found: %s\n", resolved_dataset.c_str());
+        fprintf(stderr,"   Kaggle notebook mein dataset path confirm karo:\n");
+        fprintf(stderr,"   /kaggle/working/ ke andar koi .txt file hai?\n");
+        return;
+    }
+    const std::string& dataset_path_resolved = resolved_dataset;
     printf("Dataset: %lld MB\n\n",(long long)actual_size/1024/1024);
 
     int vocab_target=decide_vocab_size(actual_size);
@@ -801,8 +828,8 @@ void train_gpu(const std::string& dataset_path) {
         // representative sample hai; 32MB par 8192-vocab BPE ghanton leta tha.
         static constexpr int64_t TOKENIZER_SAMPLE=8LL*1024*1024;
         int64_t sample_size=std::min(actual_size,TOKENIZER_SAMPLE);
-        std::ifstream f(dataset_path,std::ios::binary);
-        if (!f) { fprintf(stderr,"❌ Cannot open: %s\n",dataset_path.c_str()); return; }
+        std::ifstream f(dataset_path_resolved,std::ios::binary);
+        if (!f) { fprintf(stderr,"❌ Cannot open: %s\n",dataset_path_resolved.c_str()); return; }
         std::string sample; sample.resize((size_t)sample_size);
         f.read(sample.data(),sample_size);
         sample.resize((size_t)f.gcount());
@@ -900,6 +927,25 @@ void train_gpu(const std::string& dataset_path) {
     OptimizerState opt_state_loaded;
     bool opt_state_found = false;
 
+    // ── [v29-FULLRESUME] TrainingState load ──────────────────────────────
+    // .trainstate file se: best_loss, prev_train_ce, prev_val_ce,
+    // overfit_streak, amp_scale/window, loader byte position, gnorm EMA
+    TrainingState ts_loaded;
+    bool ts_found = false;
+    if (resumed && start_step > 0) {
+        std::string ckpt_env_str2(std::getenv("LOGOS_CKPT") ? std::getenv("LOGOS_CKPT") : "");
+        // base_path already computed above in optstate block — reuse same logic
+        std::string base2 = ckpt_env_str2;
+        std::string sfx2 = "_step" + std::to_string((int)start_step) + ".bin";
+        if (base2.size() >= sfx2.size() &&
+            base2.substr(base2.size() - sfx2.size()) == sfx2)
+            base2 = base2.substr(0, base2.size() - sfx2.size());
+        else if (base2.size() > 4 && base2.substr(base2.size()-4) == ".bin")
+            base2 = base2.substr(0, base2.size()-4);
+
+        ts_found = ts_loaded.load(base2, (int)start_step);
+    }
+
     ModelGPU   gpu_model(cfg);
     gpu_model.load_from_cpu(cpu_model);
 
@@ -964,14 +1010,14 @@ void train_gpu(const std::string& dataset_path) {
     printf("  Train: %.1f MB | Val: %.1f MB (5%% held out)\n",
            (float)val_start_byte/1024/1024, (float)val_bytes/1024/1024);
 
-    StreamingDataLoader loader(dataset_path, tok, SEQ, grad_accum, CHUNK_BYTES,
+    StreamingDataLoader loader(dataset_path_resolved, tok, SEQ, grad_accum, CHUNK_BYTES,
                                /*start_byte=*/0, /*end_byte=*/val_start_byte);
     // [v17] FIXED validation set: 32 windows pre-loaded into memory (every 16th batch).
     // val_loader is declared at function scope (not inside {} block) because
     // it is also used later in the training loop every 100 steps for on-the-fly
     // Val_CE evaluation (forward-only pass on ~10 batches).
     // BUG-FIX v17: pehle val_loader {} block ke andar tha → bahar 'undefined' compile error.
-    StreamingDataLoader val_loader(dataset_path, tok, SEQ, 1, 1LL*1024*1024,
+    StreamingDataLoader val_loader(dataset_path_resolved, tok, SEQ, 1, 1LL*1024*1024,
                                    /*start_byte=*/val_start_byte, /*end_byte=*/actual_size);
     std::vector<std::pair<std::vector<int>,std::vector<int>>> fixed_val;
     {
@@ -1203,9 +1249,51 @@ void train_gpu(const std::string& dataset_path) {
     float   best_loss = resumed
         ? logos_env_f("LOGOS_BEST_F", 999.f)
         : 999.f;
-    printf("\n[v22-SCALE] resumed=%s | start_step=%lld | best_F=%.4f | target=%lld\n",
+
+    // [v29-FULLRESUME] TrainingState se override karo agar mila
+    float gnorm_ema    = 0.f;
+    float train_ce_ema = 999.f;
+    float val_ce_ema   = 999.f;
+
+    if (ts_found) {
+        best_loss      = ts_loaded.best_loss;
+        prev_train_ce  = ts_loaded.prev_train_ce;
+        prev_val_ce    = ts_loaded.prev_val_ce;
+        overfit_streak = ts_loaded.overfit_streak;
+        gnorm_ema      = ts_loaded.gnorm_ema;
+        train_ce_ema   = ts_loaded.train_ce_ema;
+        val_ce_ema     = ts_loaded.val_ce_ema;
+        loss_scaler.scale                     = ts_loaded.amp_scale;
+        loss_scaler.steps_since_last_overflow = ts_loaded.amp_window;
+        loss_scaler.total_overflows           = ts_loaded.amp_overflows;
+        loss_scaler.total_scale_ups           = ts_loaded.amp_scale_ups;
+        loss_scaler.total_scale_downs         = ts_loaded.amp_scale_downs;
+        printf("  [v29] Metrics restored: best_F=%.4f train_CE=%.4f val_CE=%.4f\n",
+               best_loss, prev_train_ce, prev_val_ce);
+        printf("  [v29] AMP scale restored: %.0f (window=%d)\n",
+               loss_scaler.scale, loss_scaler.steps_since_last_overflow);
+    }
+
+    // [v29] Data loader ko saved byte position pe seek karo
+    if (ts_found && ts_loaded.loader_byte_pos > 0) {
+        StreamingDataLoader::LoaderState ls;
+        ls.current_shard      = ts_loaded.loader_shard;
+        ls.byte_pos           = ts_loaded.loader_byte_pos;
+        ls.total_tokens_seen  = ts_loaded.loader_tokens_seen;
+        ls.total_steps_done   = start_step;
+        ls.current_epoch      = ts_loaded.loader_epoch;
+        loader.restore_state(ls);
+        printf("  [v29] Data loader seeked to shard=%d byte=%lld epoch=%d\n",
+               ls.current_shard, (long long)ls.byte_pos, ls.current_epoch);
+    }
+    if (ts_found && ts_loaded.val_loader_byte_pos > 0) {
+        StreamingDataLoader::LoaderState vls{};
+        vls.byte_pos = ts_loaded.val_loader_byte_pos;
+        val_loader.restore_state(vls);
+    }
+
+    printf("\n[v29-FULLRESUME] resumed=%s | start_step=%lld | best_F=%.4f | target=%lld\n",
            resumed?"YES":"NO", (long long)start_step, best_loss, (long long)total_steps);
-    printf("[v22-SCALE] Model: d=%d L=%d H=%d seq=%d vocab=%d grad_accum=%d\n\n",
            cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size, grad_accum);
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
@@ -1545,6 +1633,42 @@ void train_gpu(const std::string& dataset_path) {
                     save_state.step_count    = static_cast<int64_t>(gpu_path_integral.step_count);
                     save_optimizer_state(save_state, "logos_gpu_ckpt", (int)step);
                 }
+                // [v29-FULLRESUME] TrainingState save — metrics + data position + AMP
+                {
+                    // [v29] gnorm EMA update
+                    constexpr float EMA_A = 0.05f;
+                    gnorm_ema    = (gnorm_ema    < 1.f) ? grad_norm
+                                 : (1.f-EMA_A)*gnorm_ema    + EMA_A*grad_norm;
+                    train_ce_ema = (train_ce_ema > 900.f) ? prev_train_ce
+                                 : (1.f-EMA_A)*train_ce_ema + EMA_A*prev_train_ce;
+                    val_ce_ema   = (val_ce_ema   > 900.f) ? prev_val_ce
+                                 : (1.f-EMA_A)*val_ce_ema   + EMA_A*prev_val_ce;
+
+                    TrainingState ts;
+                    ts.step              = step;
+                    ts.best_loss         = best_loss;
+                    ts.prev_train_ce     = prev_train_ce;
+                    ts.prev_val_ce       = prev_val_ce;
+                    ts.overfit_streak    = overfit_streak;
+                    ts.amp_scale         = loss_scaler.scale;
+                    ts.amp_window        = loss_scaler.steps_since_last_overflow;
+                    ts.amp_overflows     = loss_scaler.total_overflows;
+                    ts.amp_scale_ups     = loss_scaler.total_scale_ups;
+                    ts.amp_scale_downs   = loss_scaler.total_scale_downs;
+                    // Data loader position
+                    auto ls              = loader.get_state();
+                    ts.loader_shard      = ls.current_shard;
+                    ts.loader_byte_pos   = ls.byte_pos;
+                    ts.loader_tokens_seen= ls.total_tokens_seen;
+                    ts.loader_epoch      = ls.current_epoch;
+                    auto vls             = val_loader.get_state();
+                    ts.val_loader_byte_pos = vls.byte_pos;
+                    // Smooth metrics
+                    ts.gnorm_ema         = gnorm_ema;
+                    ts.train_ce_ema      = train_ce_ema;
+                    ts.val_ce_ema        = val_ce_ema;
+                    ts.save("logos_gpu_ckpt", (int)step);
+                }
                 // [v23-AMP] Loss scaler state print at checkpoint
                 loss_scaler.print_status(step);
                 // [v11-CLIP] Show cuBLAS context so Vedic PASS/FAIL is interpretable
@@ -1572,6 +1696,30 @@ void train_gpu(const std::string& dataset_path) {
     for (auto* g : gpu_grads) delete g;
     gpu_model.sync_to_cpu(cpu_model);
     save_checkpoint(cpu_model,"logos_final",(int)step);
+
+    // [v29-FULLRESUME] Final TrainingState save
+    {
+        TrainingState ts_final;
+        ts_final.step            = step;
+        ts_final.best_loss       = best_loss;
+        ts_final.prev_train_ce   = prev_train_ce;
+        ts_final.prev_val_ce     = prev_val_ce;
+        ts_final.overfit_streak  = overfit_streak;
+        ts_final.amp_scale       = loss_scaler.scale;
+        ts_final.amp_window      = loss_scaler.steps_since_last_overflow;
+        ts_final.amp_overflows   = loss_scaler.total_overflows;
+        ts_final.amp_scale_ups   = loss_scaler.total_scale_ups;
+        ts_final.amp_scale_downs = loss_scaler.total_scale_downs;
+        auto ls_f                = loader.get_state();
+        ts_final.loader_shard      = ls_f.current_shard;
+        ts_final.loader_byte_pos   = ls_f.byte_pos;
+        ts_final.loader_tokens_seen= ls_f.total_tokens_seen;
+        ts_final.loader_epoch      = ls_f.current_epoch;
+        ts_final.gnorm_ema         = gnorm_ema;
+        ts_final.train_ce_ema      = train_ce_ema;
+        ts_final.val_ce_ema        = val_ce_ema;
+        ts_final.save("logos_final", (int)step);
+    }
 
     // [v21-OPTSTATE] Final optimizer state save
     {
