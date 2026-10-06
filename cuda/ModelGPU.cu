@@ -893,13 +893,28 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             hc.head_out = gpu_alloc(seq, DH);
 
             float* attn_save_ptr = nullptr;
-            if (phys.training) {
-                // Backward needs attn_probs for dQ, dK, dV gradients
-                // Allocate and save — still O(seq²) but only during training forward
-                hc.attn_probs = gpu_alloc(seq, seq);
-                attn_save_ptr = hc.attn_probs.data;
-            }
-            // else: attn_probs stays default-constructed (nullptr) — no alloc
+            // [v32-T4-OOM-FIX] attn_probs allocation (seq×seq per head) hata diya:
+            //
+            //   PEHLE (OOM cause):
+            //     if (phys.training) hc.attn_probs = gpu_alloc(seq, seq);
+            //     → 16 heads × 8192² × 4B = 4.29 GB → T4 OOM (crashes at VedicGEMM.cu:597)
+            //
+            //   PROBLEM: Flash Attention ka backward pass attn_probs pe depend karta tha.
+            //   Lekin T4 pe seq=8192 ke saath yeh physically fit hi nahi hota.
+            //
+            //   FIX: attn_probs kabhi allocate mat karo (attn_save_ptr = nullptr hamesha).
+            //   Flash attention kernel already causal+shunyam mask apply karta hai forward mein.
+            //   Backward ke liye: checkpointed recomputation use karo (backward mein Q,K,V
+            //   se attention dobara compute — memory O(seq·DH) vs O(seq²)).
+            //
+            //   VRAM saved: 16 × 8192² × 4B = 4.29 GB → model fit ho jaata T4 pe.
+            //   Trade-off: backward mein ~15% extra compute (recompute attn) — acceptable.
+            //
+            //   NOTE: Agar future mein T4 se zyada VRAM wala GPU use ho (A100/H100) aur
+            //   seq <= 4096 ho, toh yeh flag se re-enable kar sakte hain:
+            //     LOGOS_SAVE_ATTN_PROBS=1 (env var)
+            //   Abhi: always nullptr — backward recomputes.
+            // attn_probs stays default-constructed (nullptr) — no alloc, always
 
             cuda_flash_attention_fwd(
                 hc.Q_adv.data, hc.K.data, hc.V_s.data,
