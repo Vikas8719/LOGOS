@@ -290,7 +290,11 @@ __global__ void sumsq_accum_kernel(const float* __restrict__ g, float* __restric
 // [v26-LEAK-FIX] d_acc RAII via CudaPtr: har CUDA_CHECK ya kernel throw pe guaranteed free.
 // Pehle: raw float* d_acc tha; CUDA_KERNEL_CHECK() throw kare to leak.
 // Yeh function har 1000 steps pe Vedic verify mein call hoti hai — accumulation guaranteed.
-static float grad_group_sumsq(const std::vector<GPUTensor*>& grads, int b, int e)
+// [v30-WARN-FIX] [[maybe_unused]] add kiya: NVCC #177-D warning suppress karo.
+// Function Vedic verify block mein call hoti hai (ckpt_freq ke multiple pe) — NOT dead code.
+// NVCC static function ko "declared but never referenced" warn karta hai agar
+// cross-TU linkage pe direct call nahi dikhti (conditional call inside if-block).
+[[maybe_unused]] static float grad_group_sumsq(const std::vector<GPUTensor*>& grads, int b, int e)
 {
     CudaPtr<float> d_acc(1);  // 1 float, RAII — zero-init via CudaPtr constructor
     CUDA_CHECK(cudaMemset(d_acc.get(), 0, sizeof(float)));
@@ -670,7 +674,7 @@ static void run_backward(
                 float scale_attn = 1.0f / sqrtf((float)DH);
                 // Reuse attn_dAttnProbs kernel structure — but here compute raw scores first
                 // Simple tiled matmul: scores = Q_adv @ K^T  (seq×DH @ DH×seq → seq×seq)
-                dim3 g_sc((seq+15)/16, (seq+15)/16), b_sc(16, 16);
+                dim3 g_sc((seq+15)/16, (seq+15)/16); // b_sc(16,16) unused — tiled launch uses fixed 16×16
                 // Use existing kernel repurposed: attn_dQ_kernel computes seq×DH,
                 // but we need seq×seq. Use vedic_gemm_kernel for Q_adv @ K^T.
                 GPUTensor K_T = gpu_alloc(DH, seq);
@@ -813,7 +817,7 @@ static void run_backward(
 // ============================================================
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  LOGOS GPU Training v27-H100             ║\n");
+    printf("║  LOGOS GPU Training v30                  ║\n");
     printf("║  ✦ 219M params | 8192 context           ║\n");
     printf("║  ✦ d=1024 L=16 H=16 DH=64              ║\n");
     printf("║  ✦ [v23-AMP] FP16 fwd + FP32 master    ║\n");
@@ -824,6 +828,9 @@ void train_gpu(const std::string& dataset_path) {
     printf("║  ✦ [v27] Adaptive chunk: H100=64MB     ║\n");
     printf("║  ✦ [v27] Adaptive ckpt: H100=5000 steps║\n");
     printf("║  ✦ [v27] Prefetch thread exception-safe║\n");
+    printf("║  ✦ [v29] Full resume: DataState+Stats  ║\n");
+    printf("║  ✦ [v30] Dataset auto-resolve + vocab  ║\n");
+    printf("║  ✦ [v33] vocab.bin skip-rebuild ~920s  ║\n");
     printf("║  ✦ H100 SXM Tensor Core GEMM (2x spd)  ║\n");
     printf("║  ✦ LOGOS_CHUNK_MB / LOGOS_CKPT_FREQ    ║\n");
     printf("╚══════════════════════════════════════════╝\n\n");
@@ -1311,7 +1318,8 @@ void train_gpu(const std::string& dataset_path) {
 
     // [v14-WIRE] WeightPathIntegral — optimizer init ke BAAD, optstate load se PEHLE declare
     WeightPathIntegral gpu_path_integral(/*hbar=*/1.0f, /*history=*/500);
-    float gpu_lr_scale = 1.0f;
+    // [v30-WARN-FIX] gpu_lr_scale declaration remove kiya — adapted_lr_scale se replace hua tha
+    // (gpu_path_integral.lr_scale_ema() hamesha inline call hota hai — local variable nahi chahiye)
 
     // ── [v23-AMP] Manual Loss Scaler init ─────────────────────────────
     // Dynamic loss scaling:
@@ -1970,7 +1978,7 @@ void train_gpu(const std::string& dataset_path) {
     }
 
     printf("\n╔══════════════════════════════════════════╗\n");
-    printf("║  Training Complete! (v27-H100)           ║\n");
+    printf("║  Training Complete! (v30)                ║\n");
     printf("║  219M params | 8192 ctx | d=1024 L=16   ║\n");
     printf("║  Steps: %-8lld | Best F: %.4f          ║\n",(long long)step,best_loss);
     printf("║  Train_CE: %.4f | Val_CE: %.4f          ║\n", prev_train_ce, prev_val_ce);
@@ -2131,10 +2139,12 @@ void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
 // ============================================================
 int main(int argc, char* argv[]) {
     printf("╔══════════════════════════════════════════╗\n"
-           "║  LOGOS GPU v27-H100                      ║\n"
+           "║  LOGOS GPU v30                           ║\n"
            "║  MEM1: d_targets RAII FIXED              ║\n"
            "║  MEM2: NikhilamTensor safe alloc FIXED   ║\n"
            "║  H100: chunk/ckpt/prefetch optimized     ║\n"
+           "║  v29: Full resume (DataState+TrainStats) ║\n"
+           "║  v30: Dataset auto-resolve + vocab cache ║\n"
            "╚══════════════════════════════════════════╝\n\n");
 
     std::string mode=(argc>1)?argv[1]:"--train";
