@@ -384,43 +384,17 @@ jobs:
           clang++ --version | head -1
 
     
-      - name: Install MULL (Latest GitHub Release)
-        id: mull_install
+      - name: Install MULL via apt (mull-17)
         run: |
-          echo "Fetching latest Mull release assets via Python..."
-          
-          # Python स्क्रिप्ट बिना किसी शेल सिंटैक्स एरर के सटीक URL निकाल लेगी
-          DEB_URL=$(python3 -c '
-          import urllib.request, json
-          try:
-              req = urllib.request.Request("https://github.com", headers={"User-Agent": "Mozilla/5.0"})
-              with urllib.request.urlopen(req) as response:
-                  data = json.loads(response.read().decode())
-                  urls = [asset["browser_download_url"] for asset in data["assets"] if "ubuntu-amd64-22.04.deb" in asset["name"] and "LLVM-17" in asset["name"]]
-                  print(urls[0] if urls else "")
-          except Exception as e:
-              print("")
-          ')
+          # clang-17 repo pehle se add hai (upar wale step mein), usi se mull-17 aata hai
+          sudo apt-get install -y --no-install-recommends mull-17
 
-          # अगर डायनामिक URL किसी वजह से खाली मिले, तो वेरिफाइड फॉलबैक URL
-          if [ -z "$DEB_URL" ]; then
-            echo "⚠️ Dynamic URL look up failed, using verified fallback URL"
-            DEB_URL="https://github.com"
+          # mull-runner-17 → mull-runner symlink banao taaki CMake find_program kaam kare
+          if ! command -v mull-runner &>/dev/null; then
+            sudo ln -sf /usr/bin/mull-runner-17 /usr/local/bin/mull-runner
           fi
-          
-          echo "Downloading from: $DEB_URL"
-          wget -q "$DEB_URL" -O /tmp/mull.deb
-          
-          echo "Installing package..."
-          sudo dpkg -i /tmp/mull.deb || sudo apt-get install -f -y
 
-          if command -v mull-runner &>/dev/null; then
-            echo "installed=true" >> $GITHUB_OUTPUT
-            echo "✅ mull-runner: $(mull-runner --version 2>&1 | head -1)"
-          else
-            echo "installed=false" >> $GITHUB_OUTPUT
-            echo "❌ mull-runner installation failed!"
-          fi
+          echo "✅ mull-runner: $(mull-runner --version 2>&1 | head -1)"
 
 
       - name: Configure (MULL + Debug + clang++)
@@ -441,11 +415,6 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/math
-          if [ "${{ steps.mull_install.outputs.installed }}" != "true" ]; then
-            echo "score=SKIPPED" >> $GITHUB_OUTPUT
-            echo "⚠️  mull-runner not installed — skipping"
-            exit 0
-          fi
           mull-runner \
             --config build/mull.yml \
             --report-dir build/mull-report/math \
@@ -461,11 +430,6 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/checkpoint
-          if [ "${{ steps.mull_install.outputs.installed }}" != "true" ]; then
-            echo "score=SKIPPED" >> $GITHUB_OUTPUT
-            echo "⚠️  mull-runner not installed — skipping"
-            exit 0
-          fi
           mull-runner \
             --config build/mull.yml \
             --report-dir build/mull-report/checkpoint \
