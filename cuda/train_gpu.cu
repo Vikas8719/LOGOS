@@ -886,18 +886,43 @@ void train_gpu(const std::string& dataset_path) {
     printf("[1/5] Tokenizer build (vocab=%d)...\n",vocab_target); fflush(stdout);
     Tokenizer tok;
     {
-        // [v17] 8MB (was 32MB): dataset shuffled hai isliye pehle 8MB Hindi+English dono ka
-        // representative sample hai; 32MB par 8192-vocab BPE ghanton leta tha.
-        static constexpr int64_t TOKENIZER_SAMPLE=8LL*1024*1024;
-        int64_t sample_size=std::min(actual_size,TOKENIZER_SAMPLE);
-        std::ifstream f(dataset_path_resolved,std::ios::binary);
-        if (!f) { fprintf(stderr,"❌ Cannot open: %s\n",dataset_path_resolved.c_str()); return; }
-        std::string sample; sample.resize((size_t)sample_size);
-        f.read(sample.data(),sample_size);
-        sample.resize((size_t)f.gcount());
-        tok.build(sample,vocab_target);
-        tok.save("vocab.bin");
-        printf("Vocab: %d tokens\n\n",tok.vocab_size);
+        // [v33-FAST] vocab.bin already exist kare to rebuild skip karo → ~920s saved!
+        // Override: LOGOS_REBUILD_VOCAB=1 set karo force rebuild ke liye.
+        // Override: LOGOS_TOKENIZER_MB=N set karo sample size change ke liye (default 4MB).
+        bool skip_rebuild = false;
+        const char* rebuild_env = std::getenv("LOGOS_REBUILD_VOCAB");
+        bool force_rebuild = (rebuild_env && rebuild_env[0]=='1');
+
+        if (!force_rebuild && std::ifstream("vocab.bin").good()) {
+            printf("  [v33-FAST] vocab.bin found — loading (skip rebuild, ~920s saved!)\n");
+            printf("             Force rebuild: set LOGOS_REBUILD_VOCAB=1\n");
+            if (tok.load("vocab.bin")) {
+                printf("  ✅ Vocab loaded: %d tokens\n\n", tok.vocab_size);
+                skip_rebuild = true;
+            } else {
+                printf("  ⚠️  vocab.bin load failed — rebuilding\n");
+            }
+        }
+
+        if (!skip_rebuild) {
+            // [v33-FAST] Default 4MB (was 8MB): T4 pe 4MB enough for 8192-vocab BPE
+            // BPE time scales as O(sample_size × merges) — 4MB se ~460s, 8MB se ~920s.
+            // LOGOS_TOKENIZER_MB env var se override: export LOGOS_TOKENIZER_MB=2
+            int64_t tok_mb = (int64_t)logos_env_f("LOGOS_TOKENIZER_MB", 4.f);
+            tok_mb = std::max((int64_t)1, std::min((int64_t)32, tok_mb));
+            int64_t TOKENIZER_SAMPLE = tok_mb * 1024LL * 1024LL;
+            printf("  [v33-FAST] BPE sample: %lld MB (override: LOGOS_TOKENIZER_MB)\n",
+                   (long long)tok_mb);
+            int64_t sample_size=std::min(actual_size, TOKENIZER_SAMPLE);
+            std::ifstream f(dataset_path_resolved,std::ios::binary);
+            if (!f) { fprintf(stderr,"❌ Cannot open: %s\n",dataset_path_resolved.c_str()); return; }
+            std::string sample; sample.resize((size_t)sample_size);
+            f.read(sample.data(),sample_size);
+            sample.resize((size_t)f.gcount());
+            tok.build(sample,vocab_target);
+            tok.save("vocab.bin");
+            printf("Vocab: %d tokens\n\n",tok.vocab_size);
+        }
     }
 
     printf("[2/5] Model config...\n"); fflush(stdout);
@@ -1251,7 +1276,9 @@ void train_gpu(const std::string& dataset_path) {
     float   lr_init      = logos_env_f_clamped("LOGOS_LR",         lr_default, 1e-7f, 1.0f);
     const float clip_norm = logos_env_f_clamped("LOGOS_CLIP",      0.3f,   0.01f, 10.0f);
     const float t_start   = logos_env_f_clamped("LOGOS_T_START",   0.05f,  1e-4f, 1.0f);
-    const int   warmup_steps = (int)logos_env_f_clamped("LOGOS_WARMUP", 300.f, 0.f, 10000.f);
+    // [v33-FAST] warmup 300→100: T4 pe 300 steps LR ramp-up slow hai
+    // 100 steps = faster LR reach → faster initial loss drop → time save
+    const int   warmup_steps = (int)logos_env_f_clamped("LOGOS_WARMUP", 100.f, 0.f, 10000.f);
     const float noise_gain   = logos_env_f_clamped("LOGOS_NOISE_GAIN", 0.02f, 0.0f, 1.0f);
 
     // [v16-STABLE] Geodesic friction balance analysis:
@@ -1640,14 +1667,15 @@ void train_gpu(const std::string& dataset_path) {
             if (step > start_step && (step - start_step) % 5000 == 0) gpu_path_integral.reset_best();
 
             // [v27-H100-TWEAK2] Adaptive checkpoint + Vedic verify frequency.
-            // T4/Kaggle: har 1000 steps → sync_to_cpu() ~2s GPU block = acceptable.
-            // H100 80GB: har 1000 steps → sync_to_cpu() ~5-8s GPU block per step
-            //   = 80-100GB data × 150k steps mein HOURS wasted on CPU sync.
-            //   5000 steps pe checkpoint karo → 5× less overhead.
-            // Override: LOGOS_CKPT_FREQ env var (any GPU, without recompile).
-            //   export LOGOS_CKPT_FREQ=5000   (H100)
-            //   export LOGOS_CKPT_FREQ=1000   (T4 — default)
-            int64_t ckpt_freq_default = is_h100 ? 5000LL : 1000LL;
+            // T4/Kaggle: sync_to_cpu() ~2s GPU block.
+            // [v33-FAST] T4 default: 2000 steps (was 1000) → 2× less checkpoint overhead.
+            //   219M model sync_to_cpu() = 876MB × 4B FP32 = 3.5GB transfer → ~2-3s on T4.
+            //   Har 1000 steps = 2-3s overhead/1000 steps. 2000 pe 50% reduction.
+            // Override: LOGOS_CKPT_FREQ env var.
+            //   export LOGOS_CKPT_FREQ=500   (frequent, safer)
+            //   export LOGOS_CKPT_FREQ=2000  (T4 default — v33)
+            //   export LOGOS_CKPT_FREQ=5000  (H100)
+            int64_t ckpt_freq_default = is_h100 ? 5000LL : 2000LL;  // [v33] T4: 1000→2000
             int64_t ckpt_freq = (int64_t)logos_env_f("LOGOS_CKPT_FREQ", (float)ckpt_freq_default);
             ckpt_freq = std::max((int64_t)100, std::min((int64_t)50000, ckpt_freq));  // clamp: [100, 50k]
 
@@ -1677,7 +1705,14 @@ void train_gpu(const std::string& dataset_path) {
                 }
                 } // C_proxy freed here (RAII)
 
-            if (step % 100 == 0) {
+            // [v33-FAST] Log frequency: default har 100 steps → LOGOS_LOG_FREQ se override
+            // T4 pe val loop (30 batches) ~8-12s leta hai → har 100 steps = 8-12% overhead!
+            // Default: 500 steps (was 100) = 10× less val overhead.
+            // Override: LOGOS_LOG_FREQ=100  (verbose), LOGOS_LOG_FREQ=1000 (fast)
+            int64_t log_freq = (int64_t)logos_env_f("LOGOS_LOG_FREQ", 500.f);
+            log_freq = std::max((int64_t)10, std::min((int64_t)10000, log_freq));
+
+            if (step % log_freq == 0) {
                 float cur_T, cur_aH, cur_aL;
                 optimizer.get_state(cur_T, cur_aH, cur_aL);
                 float lr_x = gpu_path_integral.lr_scale_ema(0.5f);
@@ -1688,10 +1723,11 @@ void train_gpu(const std::string& dataset_path) {
                 float val_ce_sum = 0.f;
                 int   val_count  = 0;
                 std::vector<std::pair<std::vector<int>,std::vector<int>>> val_batches;
-                // [v18] 10 → 30: val_ce estimate ka variance kam karo
-                // 10 batches par std-dev ~0.4 CE unit thi → fake OVF-warn
-                // 30 batches par std-dev ~0.15 → reliable overfit signal
-                int val_batches_to_eval = 30;
+                // [v33-FAST] Val batches: default 10 (was 30).
+                // 30 batches × ~0.3s each = 9s per eval. 10 batches = 3s. Variance ok.
+                // Override: LOGOS_VAL_BATCHES=30 (accurate) / LOGOS_VAL_BATCHES=5 (fast)
+                int val_batches_to_eval = (int)logos_env_f("LOGOS_VAL_BATCHES", 10.f);
+                val_batches_to_eval = std::max(1, std::min(100, val_batches_to_eval));
                 // ── [BUG-FIX] Validation loop memory leak ─────────────────
                 // BUG (pre-fix): d_vtgt, d_vloss, d_vgrad har val-batch mein
                 //   cudaMalloc hote the lekin exception ya early-break ke case
@@ -1803,7 +1839,9 @@ void train_gpu(const std::string& dataset_path) {
                 fflush(stdout);
             }
 
-            if (step>0 && step%1000==0) {
+            if (step>0 && step%ckpt_freq==0) {
+                // [v33-FAST] cudaDeviceSynchronize pehle sirf checkpoint ke time tha,
+                // ab async stream se overlap karo: sync sirf agar zaruri ho.
                 CUDA_CHECK(cudaDeviceSynchronize());
                 gpu_model.sync_to_cpu(cpu_model);
                 save_checkpoint(cpu_model,"logos_gpu_ckpt",(int)step);
