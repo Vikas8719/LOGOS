@@ -383,29 +383,37 @@ jobs:
           sudo ln -sf /usr/bin/clang++-17 /usr/local/bin/clang++
           clang++ --version | head -1
 
-      # ─── GitHub Release से Mull का लेटेस्ट वर्जन ऑटो-डाउनलोड करने का फुलप्रूफ तरीका ───
+    
       - name: Install MULL (Latest GitHub Release)
         id: mull_install
         run: |
-          echo "Fetching latest Mull release assets..."
-          # GitHub API से Ubuntu 22.04 amd64 के लिए सटीक .deb पैकेज का URL निकाल रहे हैं
-          DEB_URL=$(curl -s https://github.com \
-            | grep -oP '"browser_download_url": "\K[^"]+' \
+          echo "Fetching latest Mull release assets via Python..."
+          
+          # Python स्क्रिप्ट बिना किसी शेल सिंटैक्स एरर के सटीक URL निकाल लेगी
+          DEB_URL=$(python3 -c '
+          import urllib.request, json
+          try:
+              req = urllib.request.Request("https://github.com", headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req) as response:
+                  data = json.loads(response.read().decode())
+                  urls = [asset["browser_download_url"] for asset in data["assets"] if "ubuntu-amd64-22.04.deb" in asset["name"] and "LLVM-17" in asset["name"]]
+                  print(urls[0] if urls else "")
+          except Exception as e:
+              print("")
+          ')
 
-            | grep 'ubuntu-amd64-22.04.deb' | head -n 1)
-
+          # अगर डायनामिक URL किसी वजह से खाली मिले, तो वेरिफाइड फॉलबैक URL
           if [ -z "$DEB_URL" ]; then
-            echo "⚠️ Could not find dynamic URL, falling back to verified v0.34.1"
+            echo "⚠️ Dynamic URL look up failed, using verified fallback URL"
             DEB_URL="https://github.com"
           fi
-
+          
           echo "Downloading from: $DEB_URL"
           wget -q "$DEB_URL" -O /tmp/mull.deb
-
+          
           echo "Installing package..."
           sudo dpkg -i /tmp/mull.deb || sudo apt-get install -f -y
 
-          # Mull 0.30+ में बाइनरी नाम सीधे mull-runner इंस्टॉल होता है
           if command -v mull-runner &>/dev/null; then
             echo "installed=true" >> $GITHUB_OUTPUT
             echo "✅ mull-runner: $(mull-runner --version 2>&1 | head -1)"
@@ -413,6 +421,7 @@ jobs:
             echo "installed=false" >> $GITHUB_OUTPUT
             echo "❌ mull-runner installation failed!"
           fi
+
 
       - name: Configure (MULL + Debug + clang++)
         run: |
