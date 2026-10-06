@@ -42,6 +42,42 @@
 #include <cstdlib>
 
 // [v32-T4-OOM-FIX] Forward declarations for kernels used in backward recompute
+// NOTE: gpu_transpose_kernel ModelGPU.cu mein define hai (logos_core STATIC library)
+// CUDA device kernels extern declare nahi karte — sirf host wrappers ya inline headers se call hote hain
+// Solution: transpose inline implement karo ya wrappers use karo
+// vedic_gemm_kernel aur boltzmann_softmax_kernel VedicGEMM.cu mein hain — logos_core se linked ✅
+// causal_mask_kernel ModelGPU.cu mein hai — logos_core se linked ✅
+// Lekin __global__ kernels cross-TU launch sirf CUDA separable compilation ke saath kaam karta hai
+// Safer approach: har kernel ke liye device-side wrapper use karo jo logos_core expose karta hai
+// YA: transpose ko train_gpu.cu mein hi define karo (ek simple kernel, duplication acceptable)
+
+// [v32] Cross-TU kernel launch fix:
+// gpu_transpose_kernel aur grad_scale_kernel ModelGPU.cu mein define hain,
+// lekin __global__ kernels cross-TU launch nahi ho sakte bina CUDA separable compilation ke.
+// Solution: yahan inline define karo (simple kernels, duplication acceptable).
+
+// Transpose kernel: A[rows×cols] → B[cols×rows]
+__global__ void gpu_transpose_kernel(const float* __restrict__ A, float* __restrict__ B,
+                                     int rows, int cols) {
+    __shared__ float tile[16][17]; // +1 to avoid bank conflicts
+    int x = blockIdx.x * 16 + threadIdx.x;
+    int y = blockIdx.y * 16 + threadIdx.y;
+    if (x < cols && y < rows)
+        tile[threadIdx.y][threadIdx.x] = A[y * cols + x];
+    __syncthreads();
+    int tx = blockIdx.y * 16 + threadIdx.x;
+    int ty = blockIdx.x * 16 + threadIdx.y;
+    if (tx < rows && ty < cols)
+        B[ty * rows + tx] = tile[threadIdx.x][threadIdx.y];
+}
+
+// Scale kernel: out[i] *= scale  (in-place)
+__global__ void grad_scale_kernel(float* __restrict__ data, float scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] *= scale;
+}
+
+// External kernels from VedicGEMM.cu + ModelGPU.cu (host-callable wrappers exist in logos_core)
 extern __global__ void vedic_gemm_kernel(const float*, const float*, float*, int, int, int);
 extern __global__ void boltzmann_softmax_kernel(const float*, float*, int, int, float);
 extern __global__ void causal_mask_kernel(float*, int);
