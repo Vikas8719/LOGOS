@@ -370,24 +370,59 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang + MULL
+      - name: Install clang-17
         run: |
-          # LLVM 17 apt repo add karo
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
             sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] \
             http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
-          # clang-17 + mull-17 install karo
           sudo apt-get install -y --no-install-recommends \
-            clang-17 mull-17 cmake ninja-build
-          # Symlinks banao taaki cmake clang++ dhundh sake
+            clang-17 llvm-17 cmake ninja-build
           sudo ln -sf /usr/bin/clang-17   /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-17 /usr/local/bin/clang++
-          sudo ln -sf /usr/bin/mull-runner-17 /usr/local/bin/mull-runner
-          echo "✅ clang: $(clang++ --version | head -1)"
-          echo "✅ mull:  $(mull-runner --version 2>&1 | head -1)"
+          clang++ --version | head -1
+
+      - name: Install MULL (GitHub release)
+        id: mull_install
+        run: |
+          # mull-project GitHub releases se verified binary download karo
+          # Releases page: https://github.com/mull-project/mull/releases
+          # Ubuntu 22.04 ke liye Debian package available hai
+          MULL_VER="0.23.0"
+          DEB_NAME="mull_${MULL_VER}_x86_64_ubuntu_22.04.deb"
+          DEB_URL="https://github.com/mull-project/mull/releases/download/${MULL_VER}/${DEB_NAME}"
+
+          echo "Downloading mull ${MULL_VER}..."
+          wget -q "${DEB_URL}" -O /tmp/mull.deb 2>&1 || true
+
+          if [ -f /tmp/mull.deb ] && [ -s /tmp/mull.deb ]; then
+            sudo dpkg -i /tmp/mull.deb 2>&1 || true
+            sudo apt-get install -f -y 2>&1 || true
+          fi
+
+          # Agar deb fail → older version try karo
+          if ! command -v mull-runner &>/dev/null; then
+            MULL_VER="0.22.0"
+            DEB_NAME="mull_${MULL_VER}_x86_64_ubuntu_22.04.deb"
+            DEB_URL="https://github.com/mull-project/mull/releases/download/${MULL_VER}/${DEB_NAME}"
+            echo "Trying mull ${MULL_VER}..."
+            wget -q "${DEB_URL}" -O /tmp/mull.deb 2>&1 || true
+            if [ -f /tmp/mull.deb ] && [ -s /tmp/mull.deb ]; then
+              sudo dpkg -i /tmp/mull.deb 2>&1 || true
+              sudo apt-get install -f -y 2>&1 || true
+            fi
+          fi
+
+          if command -v mull-runner &>/dev/null; then
+            echo "installed=true" >> $GITHUB_OUTPUT
+            echo "✅ mull-runner: $(mull-runner --version 2>&1 | head -1)"
+          else
+            echo "installed=false" >> $GITHUB_OUTPUT
+            echo "⚠️  mull-runner install failed — mutation tests will be skipped"
+            echo "    Manual install: https://github.com/mull-project/mull/releases"
+          fi
 
       - name: Configure (MULL + Debug + clang++)
         run: |
@@ -407,13 +442,17 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/math
+          if [ "${{ steps.mull_install.outputs.installed }}" != "true" ]; then
+            echo "score=SKIPPED" >> $GITHUB_OUTPUT
+            echo "⚠️  mull-runner not installed — skipping (see Install MULL step)"
+            exit 0
+          fi
           mull-runner \
             --config build/mull.yml \
             --report-dir build/mull-report/math \
             --test-program build/mull_math_unit \
             --ld-search-path build \
             2>&1 | tee build/mull-report/math/runner.log
-          # Score extract karo
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' build/mull-report/math/runner.log || echo "N/A")
           echo "score=${SCORE}" >> $GITHUB_OUTPUT
           echo "Math mutation score: ${SCORE}%"
@@ -423,6 +462,11 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/checkpoint
+          if [ "${{ steps.mull_install.outputs.installed }}" != "true" ]; then
+            echo "score=SKIPPED" >> $GITHUB_OUTPUT
+            echo "⚠️  mull-runner not installed — skipping (see Install MULL step)"
+            exit 0
+          fi
           mull-runner \
             --config build/mull.yml \
             --report-dir build/mull-report/checkpoint \
