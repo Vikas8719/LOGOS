@@ -36,7 +36,6 @@ concurrency:
 # ─────────────────────────────────────────────────────────────────
 
 jobs:
-
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — Linux
   #  T2_Math_Unit + T2b_Checkpoint + T4_Large_Data_Scale
@@ -353,7 +352,7 @@ jobs:
             build/test_math_unit
           retention-days: 7
 
-  # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
   #  MULL MUTATION TESTING
   #  Test suite ki weakness dhundta hai:
   #    - src/VedicGEMM.cpp, src/Checkpoint.cpp
@@ -366,11 +365,11 @@ jobs:
     name: "MULL Mutation Tests (T6)"
     runs-on: ubuntu-22.04
     needs: [cpu-tests-linux]
-    continue-on-error: true   # mutation score gap se CI block nahi hoga
+    continue-on-error: true # mutation score gap se CI block nahi hoga
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang-17
+      - name: Install clang-17 and LLVM
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
             sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
@@ -384,35 +383,16 @@ jobs:
           sudo ln -sf /usr/bin/clang++-17 /usr/local/bin/clang++
           clang++ --version | head -1
 
-      - name: Install MULL (GitHub release)
+      # ─── पुराना wget लॉजिक हटाकर रिपॉजिटरी से सीधा इंस्टॉलेशन ───
+      - name: Install MULL (Via APT Repository)
         id: mull_install
         run: |
-          # mull-project GitHub releases se verified binary download karo
-          # Releases page: https://github.com/mull-project/mull/releases
-          # Ubuntu 22.04 ke liye Debian package available hai
-          MULL_VER="0.23.0"
-          DEB_NAME="mull_${MULL_VER}_x86_64_ubuntu_22.04.deb"
-          DEB_URL="https://github.com/mull-project/mull/releases/download/${MULL_VER}/${DEB_NAME}"
+          echo "Installing mull-17 via APT..."
+          sudo apt-get install -y mull-17
 
-          echo "Downloading mull ${MULL_VER}..."
-          wget -q "${DEB_URL}" -O /tmp/mull.deb 2>&1 || true
-
-          if [ -f /tmp/mull.deb ] && [ -s /tmp/mull.deb ]; then
-            sudo dpkg -i /tmp/mull.deb 2>&1 || true
-            sudo apt-get install -f -y 2>&1 || true
-          fi
-
-          # Agar deb fail → older version try karo
-          if ! command -v mull-runner &>/dev/null; then
-            MULL_VER="0.22.0"
-            DEB_NAME="mull_${MULL_VER}_x86_64_ubuntu_22.04.deb"
-            DEB_URL="https://github.com/mull-project/mull/releases/download/${MULL_VER}/${DEB_NAME}"
-            echo "Trying mull ${MULL_VER}..."
-            wget -q "${DEB_URL}" -O /tmp/mull.deb 2>&1 || true
-            if [ -f /tmp/mull.deb ] && [ -s /tmp/mull.deb ]; then
-              sudo dpkg -i /tmp/mull.deb 2>&1 || true
-              sudo apt-get install -f -y 2>&1 || true
-            fi
+          if command -v mull-runner-17 &>/dev/null; then
+            # APT से इंस्टॉल करने पर बाइनरी नाम mull-runner-17 हो सकता है, उसके लिए सिम्लिंक बना रहे हैं
+            sudo ln -sf /usr/bin/mull-runner-17 /usr/local/bin/mull-runner
           fi
 
           if command -v mull-runner &>/dev/null; then
@@ -421,7 +401,6 @@ jobs:
           else
             echo "installed=false" >> $GITHUB_OUTPUT
             echo "⚠️  mull-runner install failed — mutation tests will be skipped"
-            echo "    Manual install: https://github.com/mull-project/mull/releases"
           fi
 
       - name: Configure (MULL + Debug + clang++)
@@ -527,66 +506,6 @@ jobs:
           retention-days: 14
 
   # ═══════════════════════════════════════════════════════════════
-  #  KAGGLE GPU TRIGGER (async, main only)
-  # ═══════════════════════════════════════════════════════════════
-  kaggle-gpu-trigger:
-    name: "Kaggle GPU Trigger"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    continue-on-error: true
-    env:
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Kaggle CLI
-        run: pip install kaggle --quiet
-
-      - name: Setup + Auth + Push + Poll
-        run: |
-          set -e
-
-          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
-            echo "::error::KAGGLE secrets missing"
-            exit 1
-          fi
-
-          U_LOWER=$(echo "$KAGGLE_USERNAME" | tr '[:upper:]' '[:lower:]')
-          KERNEL_ID="${U_LOWER}/logos-gpu-training-v3"
-
-          mkdir -p ~/.kaggle
-          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" \
-            > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
-          HTTP=$(curl -s -o /tmp/kag.json -w "%{http_code}" \
-            -H "Authorization: Basic $(printf '%s:%s' "$KAGGLE_USERNAME" "$KAGGLE_KEY" | base64 -w0)" \
-            "https://www.kaggle.com/api/v1/kernels/list?page=1&pageSize=1")
-          [ "$HTTP" != "200" ] && { echo "::error::Kaggle auth failed (HTTP $HTTP)"; exit 1; }
-          echo "Auth OK"
-
-          printf '{\n  "id": "%s",\n  "title": "LOGOS GPU Training v3",\n  "code_file": "kaggle_gpu_train.ipynb",\n  "language": "python",\n  "kernel_type": "notebook",\n  "is_private": true,\n  "enable_gpu": true,\n  "enable_internet": true,\n  "dataset_sources": [],\n  "competition_sources": [],\n  "kernel_sources": []\n}\n' \
-            "$KERNEL_ID" > kernel-metadata.json
-
-          set +e
-          OUT=$(kaggle kernels push -p . 2>&1); CODE=$?
-          set -e
-          echo "$OUT"
-          [ $CODE -ne 0 ] && { echo "::error::Push failed: $OUT"; exit 1; }
-
-          echo "Polling (20×60s)..."
-          for i in $(seq 1 20); do
-            sleep 60
-            STATUS=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null || echo "poll-error")
-            echo "[$i/20] $STATUS"
-            echo "$STATUS" | grep -qiE "running|complete|error|cancel" && break
-          done
-          echo "Final: $STATUS"
-          echo "Link: https://www.kaggle.com/code/${U_LOWER}/logos-gpu-training-v3"
-
-  # ═══════════════════════════════════════════════════════════════
   #  SUMMARY GATE
   # ═══════════════════════════════════════════════════════════════
   summary:
@@ -605,14 +524,14 @@ jobs:
     steps:
       - name: Print results + gate
         env:
-          R_CPU_LX:  ${{ needs.cpu-tests-linux.result }}
+          R_CPU_LX: ${{ needs.cpu-tests-linux.result }}
           R_CPU_WIN: ${{ needs.cpu-tests-windows.result }}
           R_CPU_MAC: ${{ needs.cpu-tests-macos.result }}
-          R_GPU:     ${{ needs.gpu-tests.result }}
-          R_LX_BLD:  ${{ needs.linux-build.result }}
+          R_GPU: ${{ needs.gpu-tests.result }}
+          R_LX_BLD: ${{ needs.linux-build.result }}
           R_WIN_BLD: ${{ needs.windows-build.result }}
           R_MAC_BLD: ${{ needs.macos-build.result }}
-          R_MULL:    ${{ needs.mutation-tests.result }}
+          R_MULL: ${{ needs.mutation-tests.result }}
         run: |
           echo "════════════════════════════════════════════════════"
           echo "  LOGOS CI Summary — v25-MULL"
