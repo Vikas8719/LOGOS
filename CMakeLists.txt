@@ -498,7 +498,7 @@ if(LOGOS_MUTATION_TEST)
     endif()
 
     find_program(MULL_RUNNER_EXE
-        NAMES mull-runner mull-runner-14 mull-runner-15 mull-runner-16 mull-runner-17
+        NAMES mull-runner mull-runner-15 mull-runner-14 mull-runner-16 mull-runner-17
         PATHS
             /usr/bin
             /usr/local/bin

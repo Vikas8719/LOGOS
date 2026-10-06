@@ -369,32 +369,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang-17 and LLVM
+      - name: Install clang-15, LLVM-15, and MULL-15
         run: |
+          # ── clang-15 + llvm-15 (LLVM apt repo se) ──────────────
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
             sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] \
-            http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" | \
+            http://apt.llvm.org/jammy/ llvm-toolchain-jammy-15 main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list
+
+          # ── MULL Cloudsmith repo ─────────────────────────────────
+          # mull-17 sirf Ubuntu 24.04 Noble pe hai
+          # Ubuntu 22.04 Jammy pe mull-15 latest stable hai (Cloudsmith se)
+          curl -1sLf \
+            'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' \
+            | sudo -E distro=ubuntu codename=jammy bash
+
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            clang-17 llvm-17 cmake ninja-build
-          sudo ln -sf /usr/bin/clang-17   /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-17 /usr/local/bin/clang++
+            clang-15 llvm-15 mull-15 cmake ninja-build
+
+          # symlinks — CMake find_program aur clang++ ko path milega
+          sudo ln -sf /usr/bin/clang-15    /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-15  /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/mull-runner-15 /usr/local/bin/mull-runner
+
           clang++ --version | head -1
-
-    
-      - name: Install MULL via apt (mull-17)
-        run: |
-          # clang-17 repo pehle se add hai (upar wale step mein), usi se mull-17 aata hai
-          sudo apt-get install -y --no-install-recommends mull-17
-
-          # mull-runner-17 → mull-runner symlink banao taaki CMake find_program kaam kare
-          if ! command -v mull-runner &>/dev/null; then
-            sudo ln -sf /usr/bin/mull-runner-17 /usr/local/bin/mull-runner
-          fi
-
-          echo "✅ mull-runner: $(mull-runner --version 2>&1 | head -1)"
+          mull-runner --version 2>&1 | head -1
 
 
       - name: Configure (MULL + Debug + clang++)
