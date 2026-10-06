@@ -215,6 +215,33 @@ __global__ void shm_hybrid_kernel(
 
 std::string validate_model_config(int d_model, int num_heads, int num_layers, int vocab_size, int max_seq_len);
 
+// ============================================================
+//  [v31-FLASH] Flash Attention — O(seq) memory, no seq×seq tensor
+//  Tiled SRAM computation: Q,K,V tiles → output directly
+//  Eliminates: scores[seq×seq] = 256MB per head for seq=8192
+//
+//  Parameters:
+//    Q, K, V  : raw device ptrs [seq × DH] float32
+//    out      : raw device ptr  [seq × DH] float32 (pre-allocated)
+//    attn_ptr : if non-null, saved attn_probs for backward [seq × seq]
+//               (set to nullptr to skip — pure inference / no backward needed)
+//    seq      : sequence length
+//    DH       : head dimension
+//    scale    : 1/sqrt(DH)
+//    causal   : true = causal mask (training), false = full attn (inference)
+//    shunyam  : true = sparse window attention mask
+//    window   : shunyam window size
+//    stride   : shunyam stride
+// ============================================================
+void cuda_flash_attention_fwd(
+    const float* Q, const float* K, const float* V,
+    float* out,
+    float* attn_ptr,    // nullable — if non-null: save attn probs for backward
+    int seq, int DH,
+    float scale,
+    bool causal,
+    bool shunyam, int window, int stride);
+
 // FP16/FP32 conversion and mixed precision GEMM (H100 Tensor Core)
 // [BUG4-FIX] cuda_cast_fp32_to_fp16 / cuda_cast_fp16_to_fp32 declarations REMOVED —
 // MixedPrecision.cuh mein inline definitions hain (cuda_ prefix wrappers).

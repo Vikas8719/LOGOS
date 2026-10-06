@@ -865,6 +865,245 @@ void cuda_free_energy_loss(
 }
 
 // ============================================================
+//  [v31-FLASH] FLASH ATTENTION FORWARD
+//  Algorithm: Dao et al. 2022 — tiled SRAM, online softmax
+//
+//  KEY INSIGHT: seq×seq scores tensor (256MB/head for seq=8192) is NEVER
+//  materialized in global memory. Instead:
+//    - Process Q in tiles of FA_TILE rows
+//    - For each Q tile, scan all K,V tiles with online softmax
+//    - Accumulate output O directly in registers/shared memory
+//    - Write only final output [seq×DH] — O(seq·DH) not O(seq²)
+//
+//  Memory saved per head: seq² × 4B = 8192² × 4B = 256 MB
+//  Total saved: 16 heads × 256 MB = 4 GB per forward pass ← THIS fixes T4 OOM
+//
+//  Block config: gridDim.x = ceil(seq/FA_TILE)
+//                blockDim.x = FA_TILE threads
+//  Each block handles FA_TILE query rows, scans all KV tiles.
+//
+//  Shared memory per block:
+//    Q_tile: FA_TILE × FA_DH_MAX × 4B = 32×128×4 = 16 KB
+//    K_tile: same = 16 KB
+//    V_tile: same = 16 KB
+//    O_tile: same = 16 KB
+//    m,l:    FA_TILE × 4B × 2 = 256 B
+//    Total:  ~64 KB — fits in T4 shared mem (48KB/SM)
+//    → Use FA_TILE=32, FA_DH_MAX=128: 4×32×128×4 = 65536B = 64KB
+//    T4 has 64KB configurable shared mem (carveout = 50% L1 + 50% shared)
+//    Actual limit with cudaFuncSetAttribute = 48KB → reduce to FA_TILE=16
+//    FA_TILE=16: 4×16×128×4 = 32KB + 2×16×4 = 32 KB + 128B < 48KB ✓
+// ============================================================
+
+#define FA_TILE     16     // query tile rows per block (fits 48KB T4 SRAM)
+#define FA_DH_MAX  128     // max head dim (d=1024,H=16→DH=64 ✓; H=8→DH=128 ✓)
+
+__global__ void flash_attention_kernel(
+    const float* __restrict__ Q,     // [seq × DH]
+    const float* __restrict__ K,     // [seq × DH]
+    const float* __restrict__ V,     // [seq × DH]
+    float*       __restrict__ Out,   // [seq × DH] output
+    float*       __restrict__ Aptr,  // [seq × seq] nullable — save attn for bwd
+    int seq, int DH,
+    float scale,
+    bool causal,
+    bool shunyam, int window, int stride)
+{
+    // Each block handles FA_TILE consecutive query rows
+    int q_start = blockIdx.x * FA_TILE;
+    int tid      = threadIdx.x;   // 0 .. FA_TILE-1 (one thread per query row)
+
+    // ── Shared memory layout ─────────────────────────────────
+    // sQ[FA_TILE × FA_DH_MAX] | sK[FA_TILE × FA_DH_MAX]
+    // sV[FA_TILE × FA_DH_MAX] | sO[FA_TILE × FA_DH_MAX]
+    // sm[FA_TILE] | sl[FA_TILE]
+    extern __shared__ float smem[];
+    float* sQ = smem;
+    float* sK = sQ + FA_TILE * FA_DH_MAX;
+    float* sV = sK + FA_TILE * FA_DH_MAX;
+    float* sO = sV + FA_TILE * FA_DH_MAX;
+    float* sm = sO + FA_TILE * FA_DH_MAX;  // running max  [FA_TILE]
+    float* sl = sm + FA_TILE;              // running sum  [FA_TILE]
+
+    int q_row   = q_start + tid;
+    bool q_valid = (q_row < seq);
+
+    // ── Load Q tile (each thread loads one row) ──────────────
+    if (q_valid) {
+        const float* qptr = Q + q_row * DH;
+        for (int d = 0; d < DH; ++d)
+            sQ[tid * FA_DH_MAX + d] = qptr[d];
+    } else {
+        for (int d = 0; d < DH; ++d)
+            sQ[tid * FA_DH_MAX + d] = 0.0f;
+    }
+
+    // ── Init running softmax state ───────────────────────────
+    sm[tid] = -1e30f;
+    sl[tid] = 0.0f;
+    for (int d = 0; d < DH; ++d)
+        sO[tid * FA_DH_MAX + d] = 0.0f;
+
+    __syncthreads();
+
+    // ── Outer loop: scan KV tiles ────────────────────────────
+    int kv_tiles = (seq + FA_TILE - 1) / FA_TILE;
+
+    for (int kv_t = 0; kv_t < kv_tiles; ++kv_t) {
+        int kv_start = kv_t * FA_TILE;
+
+        // Load K tile
+        int kv_row = kv_start + tid;
+        if (kv_row < seq) {
+            const float* kptr = K + kv_row * DH;
+            for (int d = 0; d < DH; ++d)
+                sK[tid * FA_DH_MAX + d] = kptr[d];
+        } else {
+            for (int d = 0; d < DH; ++d)
+                sK[tid * FA_DH_MAX + d] = 0.0f;
+        }
+
+        // Load V tile
+        if (kv_row < seq) {
+            const float* vptr = V + kv_row * DH;
+            for (int d = 0; d < DH; ++d)
+                sV[tid * FA_DH_MAX + d] = vptr[d];
+        } else {
+            for (int d = 0; d < DH; ++d)
+                sV[tid * FA_DH_MAX + d] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // ── Inner loop: compute scores + online softmax ──────
+        if (q_valid) {
+            // Compute FA_TILE scores in registers
+            float scores_local[FA_TILE];
+            float tile_max = -1e30f;
+
+            for (int kj = 0; kj < FA_TILE; ++kj) {
+                int k_abs = kv_start + kj;
+                if (k_abs >= seq) { scores_local[kj] = -1e30f; continue; }
+
+                // Causal mask
+                if (causal && k_abs > q_row) { scores_local[kj] = -1e30f; continue; }
+
+                // Shunyam sparse window mask
+                if (shunyam && seq > window) {
+                    bool in_window  = (k_abs >= q_row - window) && (k_abs <= q_row);
+                    bool is_global  = (k_abs % stride == 0);
+                    if (!in_window && !is_global) { scores_local[kj] = -1e30f; continue; }
+                }
+
+                // Q·K^T dot product (raw ptrs from shared mem)
+                float dot = 0.0f;
+                const float* qi = sQ + tid * FA_DH_MAX;
+                const float* ki = sK + kj  * FA_DH_MAX;
+                #pragma unroll 8
+                for (int d = 0; d < DH; ++d) dot += qi[d] * ki[d];
+                scores_local[kj] = dot * scale;
+                tile_max = fmaxf(tile_max, scores_local[kj]);
+            }
+
+            // Online softmax update (numerically stable)
+            float m_new     = fmaxf(sm[tid], tile_max);
+            float exp_shift = expf(sm[tid] - m_new);  // rescale old O and l
+
+            // Rescale accumulated output for new max
+            for (int d = 0; d < DH; ++d)
+                sO[tid * FA_DH_MAX + d] *= exp_shift;
+            float l_new = sl[tid] * exp_shift;
+
+            // Accumulate new scores into O
+            for (int kj = 0; kj < FA_TILE; ++kj) {
+                float s = scores_local[kj];
+                if (s <= -1e29f) continue;  // masked out
+
+                float e = expf(s - m_new);
+                l_new += e;
+
+                // O[q_row] += e * V[kj]
+                const float* vi = sV + kj * FA_DH_MAX;
+                float*       oi = sO + tid * FA_DH_MAX;
+                #pragma unroll 8
+                for (int d = 0; d < DH; ++d)
+                    oi[d] += e * vi[d];
+
+                // Optionally save unnormalized attn for backward
+                if (Aptr != nullptr) {
+                    int k_abs = kv_start + kj;
+                    if (k_abs < seq)
+                        Aptr[q_row * seq + k_abs] = e;  // will normalize below
+                }
+            }
+
+            sm[tid] = m_new;
+            sl[tid] = l_new;
+        }
+
+        __syncthreads();
+    }  // end KV tile loop
+
+    // ── Final: normalize output by sum, write to global mem ──
+    if (q_valid) {
+        float inv_l = (sl[tid] > 1e-9f) ? (1.0f / sl[tid]) : 0.0f;
+        float*       out_row = Out + q_row * DH;
+        const float* oi      = sO  + tid * FA_DH_MAX;
+        for (int d = 0; d < DH; ++d)
+            out_row[d] = oi[d] * inv_l;
+
+        // Normalize saved attn probs
+        if (Aptr != nullptr) {
+            float* arow = Aptr + q_row * seq;
+            for (int k_abs = 0; k_abs < seq; ++k_abs)
+                arow[k_abs] *= inv_l;
+        }
+    }
+}
+
+// ── Host wrapper ─────────────────────────────────────────────
+void cuda_flash_attention_fwd(
+    const float* Q, const float* K, const float* V,
+    float* out,
+    float* attn_ptr,      // nullable
+    int seq, int DH,
+    float scale,
+    bool causal,
+    bool shunyam, int window, int stride)
+{
+    if (DH > FA_DH_MAX) {
+        throw std::runtime_error(
+            "[v31-FLASH] DH=" + std::to_string(DH) +
+            " exceeds FA_DH_MAX=" + std::to_string(FA_DH_MAX) +
+            ". Increase FA_DH_MAX or reduce num_heads.");
+    }
+
+    // smem: Q+K+V+O tiles + m+l arrays
+    size_t smem_bytes = sizeof(float) * (4 * FA_TILE * FA_DH_MAX + 2 * FA_TILE);
+
+    // Request max shared memory for this kernel
+    cudaFuncSetAttribute(flash_attention_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_bytes);
+
+    int q_tiles = (seq + FA_TILE - 1) / FA_TILE;
+    flash_attention_kernel<<<q_tiles, FA_TILE, smem_bytes>>>(
+        Q, K, V, out, attn_ptr,
+        seq, DH, scale, causal,
+        shunyam, window, stride);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "CUDA Error at %s:%d — %s", __FILE__, __LINE__,
+            cudaGetErrorString(err));
+        fprintf(stderr, "%s\n", msg);
+        throw std::runtime_error(msg);
+    }
+}
+
+// ============================================================
 //  CONFIG VALIDATION (v4, unchanged)
 // ============================================================
 std::string validate_model_config(int d_model, int num_heads, int num_layers,

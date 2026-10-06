@@ -755,6 +755,19 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
     if (seq<=0||seq>cfg.max_seq_len)
         throw std::invalid_argument("Invalid seq: "+std::to_string(seq));
 
+    // [v31-FLASH] Flash Attention active — no seq×seq tensor allocated
+    // VRAM for attention: 16 heads × seq×DH×4B × 3(Q,K,V,out) ≈ 192MB vs old 8.2GB
+    static bool flash_logged = false;
+    if (!flash_logged) {
+        long long old_attn_mb = (long long)seq * seq * 4 * 2 * cfg.num_heads / 1024 / 1024;
+        long long new_attn_mb = (long long)seq * (D/cfg.num_heads) * 4 * cfg.num_heads / 1024 / 1024;
+        printf("  [v31-FLASH] Flash Attention ON | seq=%d H=%d DH=%d\n", seq, cfg.num_heads, D/cfg.num_heads);
+        printf("  [v31-FLASH] Attn mem: OLD=%lld MB (seq²) → NEW=%lld MB (seq·DH) | saved=%lld MB\n",
+               old_attn_mb, new_attn_mb, old_attn_mb - new_attn_mb);
+        fflush(stdout);
+        flash_logged = true;
+    }
+
     std::vector<int> safe=token_ids;
     for (int& t:safe) if(t<0||t>=V) t=0;
     CUDA_CHECK(cudaMemcpy(d_token_ids,safe.data(),seq*sizeof(int),cudaMemcpyHostToDevice));
@@ -865,30 +878,58 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
                 CUDA_CHECK(cudaMemcpy(hc.V_s.data,  hc.V.data,seq*DH*sizeof(float),cudaMemcpyDeviceToDevice));
             }
 
-            GPUTensor K_T=gpu_alloc(DH,seq);
-            { dim3 tg((seq+15)/16,(DH+15)/16); dim3 tb(16,16);
-              gpu_transpose_kernel<<<tg,tb>>>(hc.K.data,K_T.data,seq,DH); CUDA_KERNEL_CHECK(); }
-            GPUTensor scores=gpu_alloc(seq,seq);
-            cuda_vedic_gemm(hc.Q_adv,K_T,scores);
+            // [v31-FLASH] Flash Attention — replaces scores[seq×seq] + softmax + gemm
+            // OLD (OOM cause): K_T[DH×seq] + scores[seq×seq] + attn_probs[seq×seq]
+            //   = DH×seq×4B + 2×seq²×4B per head
+            //   = 64×8192×4 + 2×8192²×4 = 2MB + 512MB = 514 MB per head
+            //   × 16 heads = 8.2 GB just for attention intermediates → T4 OOM
+            //
+            // NEW (Flash): only out[seq×DH] allocated = 8192×64×4 = 2MB per head
+            //   × 16 heads = 32MB total — 256× reduction ✓
+            //
+            // attn_probs saved only if phys.training (needed for backward dQ,dK,dV)
+            // If not training (inference/val): attn_ptr=nullptr → saves 512MB/head more
 
-            { dim3 g(seq,(seq+31)/32); dim3 b(32);
-              if (phys.shunyam&&seq>phys.window)
-                  shunyam_mask_kernel<<<g,b>>>(scores.data,seq,phys.window,phys.stride);
-              else
-                  causal_mask_kernel<<<g,b>>>(scores.data,seq);
-              CUDA_KERNEL_CHECK(); }
+            hc.head_out = gpu_alloc(seq, DH);
 
-            hc.attn_probs=gpu_alloc(seq,seq);
-            cuda_boltzmann_softmax(scores,hc.attn_probs,seq,seq,sqrtf((float)DH));
+            float* attn_save_ptr = nullptr;
+            if (phys.training) {
+                // Backward needs attn_probs for dQ, dK, dV gradients
+                // Allocate and save — still O(seq²) but only during training forward
+                hc.attn_probs = gpu_alloc(seq, seq);
+                attn_save_ptr = hc.attn_probs.data;
+            }
+            // else: attn_probs stays default-constructed (nullptr) — no alloc
 
-            hc.head_out=gpu_alloc(seq,DH);
-            cuda_vedic_gemm(hc.attn_probs,hc.V_s,hc.head_out);
+            cuda_flash_attention_fwd(
+                hc.Q_adv.data, hc.K.data, hc.V_s.data,
+                hc.head_out.data,
+                attn_save_ptr,          // null = skip attn save (val/inference)
+                seq, DH,
+                1.0f / sqrtf((float)DH),
+                true,                   // causal = always true (autoregressive)
+                phys.shunyam && seq > phys.window,
+                phys.window, phys.stride
+            );
+            CUDA_KERNEL_CHECK();
 
-            GPUTensor head_proj=gpu_alloc(seq,D);
-            amp_gemm(hc.head_out, blk.W_O[h], pWO, head_proj);
+            // [v31-RAWPTR] head_proj: temporary, freed immediately after residual add
+            // Use CudaPtr (raw pointer) instead of GPUTensor to avoid RAII overhead
+            // and make the short lifetime explicit. Freed at end of this scope.
+            {
+                CudaPtr<float> head_proj_raw(seq * D);
+                GPUTensor head_proj_view;
+                head_proj_view.data = head_proj_raw.get();
+                head_proj_view.rows = seq; head_proj_view.cols = D; head_proj_view.size = seq * D;
 
-            int sz=seq*D,th=256;
-            residual_add_kernel<<<(sz+th-1)/th,th>>>(concat.data,head_proj.data,sz); CUDA_KERNEL_CHECK();
+                amp_gemm(hc.head_out, blk.W_O[h], pWO, head_proj_view);
+
+                int sz=seq*D, th=256;
+                residual_add_kernel<<<(sz+th-1)/th,th>>>(concat.data, head_proj_view.data, sz);
+                CUDA_KERNEL_CHECK();
+
+                head_proj_view.data = nullptr; // prevent double-free (CudaPtr owns memory)
+            } // head_proj_raw freed here — saves seq×D×4B = 8192×1024×4 = 32MB per head
         }
 
         int pWproj = layer_base_pi + H*4 + 0;
@@ -897,12 +938,26 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
 
         cache.concat=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.concat.data,concat.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
-        GPUTensor mha_out=gpu_alloc(seq,D);
-        amp_gemm(concat, blk.W_proj, pWproj, mha_out);
 
+        // [v31-RAWPTR] mha_out: temp projection, freed after cache save + residual
         cache.attn_out=gpu_alloc(seq,D);
-        CUDA_CHECK(cudaMemcpy(cache.attn_out.data,mha_out.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
-        { int sz=seq*D,th=256; residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,mha_out.data,sz); CUDA_KERNEL_CHECK(); }
+        {
+            CudaPtr<float> mha_raw(seq * D);
+            GPUTensor mha_view;
+            mha_view.data = mha_raw.get();
+            mha_view.rows = seq; mha_view.cols = D; mha_view.size = seq * D;
+
+            amp_gemm(concat, blk.W_proj, pWproj, mha_view);
+
+            // Save for backward (cache.attn_out = W_proj output before residual)
+            CUDA_CHECK(cudaMemcpy(cache.attn_out.data, mha_view.data,
+                                  seq*D*sizeof(float), cudaMemcpyDeviceToDevice));
+            int sz=seq*D, th=256;
+            residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data, mha_view.data, sz);
+            CUDA_KERNEL_CHECK();
+
+            mha_view.data = nullptr; // prevent double-free
+        } // mha_raw freed here
 
         cache.post_attn=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.post_attn.data,X.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
@@ -926,10 +981,21 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             dropout_seed=dropout_seed*1664525u+1013904223u+(unsigned)l;
         }
 
-        GPUTensor ffn_out=gpu_alloc(seq,D);
-        amp_gemm_bias(cache.ffn_A, blk.W2, pW2, blk.b2, ffn_out);
+        // [v31-RAWPTR] ffn_out: temporary, used only for residual add
+        {
+            CudaPtr<float> ffn_out_raw(seq * D);
+            GPUTensor ffn_out_view;
+            ffn_out_view.data = ffn_out_raw.get();
+            ffn_out_view.rows = seq; ffn_out_view.cols = D; ffn_out_view.size = seq * D;
 
-        { int sz=seq*D,th=256; residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data,ffn_out.data,sz); CUDA_KERNEL_CHECK(); }
+            amp_gemm_bias(cache.ffn_A, blk.W2, pW2, blk.b2, ffn_out_view);
+
+            int sz=seq*D, th=256;
+            residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data, ffn_out_view.data, sz);
+            CUDA_KERNEL_CHECK();
+
+            ffn_out_view.data = nullptr; // prevent double-free
+        } // ffn_out_raw freed here — saves 32MB per layer × 16 layers = 512MB
     }
 
     last_hidden=std::move(X);
