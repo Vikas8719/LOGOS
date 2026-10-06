@@ -383,24 +383,35 @@ jobs:
           sudo ln -sf /usr/bin/clang++-17 /usr/local/bin/clang++
           clang++ --version | head -1
 
-      # ─── पुराना wget लॉजिक हटाकर रिपॉजिटरी से सीधा इंस्टॉलेशन ───
-      - name: Install MULL (Via APT Repository)
+      # ─── GitHub Release से Mull का लेटेस्ट वर्जन ऑटो-डाउनलोड करने का फुलप्रूफ तरीका ───
+      - name: Install MULL (Latest GitHub Release)
         id: mull_install
         run: |
-          echo "Installing mull-17 via APT..."
-          sudo apt-get install -y mull-17
+          echo "Fetching latest Mull release assets..."
+          # GitHub API से Ubuntu 22.04 amd64 के लिए सटीक .deb पैकेज का URL निकाल रहे हैं
+          DEB_URL=$(curl -s https://github.com \
+            | grep -oP '"browser_download_url": "\K[^"]+' \
 
-          if command -v mull-runner-17 &>/dev/null; then
-            # APT से इंस्टॉल करने पर बाइनरी नाम mull-runner-17 हो सकता है, उसके लिए सिम्लिंक बना रहे हैं
-            sudo ln -sf /usr/bin/mull-runner-17 /usr/local/bin/mull-runner
+            | grep 'ubuntu-amd64-22.04.deb' | head -n 1)
+
+          if [ -z "$DEB_URL" ]; then
+            echo "⚠️ Could not find dynamic URL, falling back to verified v0.34.1"
+            DEB_URL="https://github.com"
           fi
 
+          echo "Downloading from: $DEB_URL"
+          wget -q "$DEB_URL" -O /tmp/mull.deb
+
+          echo "Installing package..."
+          sudo dpkg -i /tmp/mull.deb || sudo apt-get install -f -y
+
+          # Mull 0.30+ में बाइनरी नाम सीधे mull-runner इंस्टॉल होता है
           if command -v mull-runner &>/dev/null; then
             echo "installed=true" >> $GITHUB_OUTPUT
             echo "✅ mull-runner: $(mull-runner --version 2>&1 | head -1)"
           else
             echo "installed=false" >> $GITHUB_OUTPUT
-            echo "⚠️  mull-runner install failed — mutation tests will be skipped"
+            echo "❌ mull-runner installation failed!"
           fi
 
       - name: Configure (MULL + Debug + clang++)
@@ -423,7 +434,7 @@ jobs:
           mkdir -p build/mull-report/math
           if [ "${{ steps.mull_install.outputs.installed }}" != "true" ]; then
             echo "score=SKIPPED" >> $GITHUB_OUTPUT
-            echo "⚠️  mull-runner not installed — skipping (see Install MULL step)"
+            echo "⚠️  mull-runner not installed — skipping"
             exit 0
           fi
           mull-runner \
@@ -443,7 +454,7 @@ jobs:
           mkdir -p build/mull-report/checkpoint
           if [ "${{ steps.mull_install.outputs.installed }}" != "true" ]; then
             echo "score=SKIPPED" >> $GITHUB_OUTPUT
-            echo "⚠️  mull-runner not installed — skipping (see Install MULL step)"
+            echo "⚠️  mull-runner not installed — skipping"
             exit 0
           fi
           mull-runner \
@@ -472,11 +483,7 @@ jobs:
           echo "    60-79% = ⚠️  OK   — some gaps"
           echo "    80-89% = ✅ Good"
           echo "    90%+   = 🏆 Excellent"
-          echo ""
-          echo "  Survived mutants = test suite mein gap"
-          echo "  Reports: see artifacts (mull-reports)"
           echo "════════════════════════════════════════════════════"
-          # Warn agar score < 80
           python3 - <<'PYEOF'
           import sys
           scores = []
