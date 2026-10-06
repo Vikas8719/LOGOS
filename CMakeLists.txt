@@ -1,12 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
-project(LOGOS VERSION 0.12.0 LANGUAGES CXX)
-# v0.12.0 — Sanitizers wired
+project(LOGOS VERSION 0.13.0 LANGUAGES CXX)
+# v0.13.0 — MULL Mutation Testing wired
+#
 #   ASan+UBSan: CPU tests (T2_Math_Unit, T2b_Checkpoint) mein ON
 #     cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug ..
 #     ctest -LE GPU   ← CPU tests run honge sanitizers ke saath
+#
 #   CUDA GPU tests: compute-sanitizer via CTest environment
 #     LOGOS_USE_COMPUTE_SANITIZER=ON set karo
 #     ctest -L GPU   ← compute-sanitizer --tool memcheck se wrap hoga
+#
+#   MULL Mutation Testing: test suite ki weakness dhundta hai
+#     cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_BUILD_TYPE=Debug ..
+#     cmake --build build --target mull-run
+#     ← Automatically mutants banata hai + test_math_unit + test_checkpoint chalata hai
+#     ← Report: build/mull-report/index.html
+#
 #   --use_fast_math sirf production (logos_gpu) mein hai
 #   test targets mein --use_fast_math NAHI — warna sanitizer results galat aate hain
 
@@ -417,6 +426,312 @@ install(TARGETS logos DESTINATION bin)
 if(CMAKE_CUDA_COMPILER)
     install(TARGETS logos_gpu DESTINATION bin)
 endif()
+
+# ═══════════════════════════════════════════════════════════════
+# MULL — Mutation Testing
+# ═══════════════════════════════════════════════════════════════
+#
+# Kya karta hai:
+#   test_math_unit.cpp aur test_checkpoint.cpp pe MULL mutations chalata hai.
+#   Target source files jo mutate hote hain:
+#     src/VedicGEMM.cpp      ← Vedic GEMM formulas (M1, M2, M9)
+#     src/Checkpoint.cpp     ← checkpoint save/load roundtrip (T2b)
+#     include/VedicGEMM.hpp  ← tiling logic
+#     include/Tensor.hpp     ← tensor ops (free energy, softmax)
+#     include/PhysicsOpt.hpp ← optimizer physics (M11, M14, M15, M16)
+#     include/LayerNorm.hpp  ← LayerNorm stats (M8, M13)
+#     include/Attention.hpp  ← NS attention (M12)
+#
+# Kaise use karein:
+#   # Step 1: MULL install karo (Linux/macOS)
+#   #   Ubuntu:  sudo apt-get install mull  (LLVM apt repo se)
+#   #   macOS:   brew install mull
+#   #   Manual:  https://github.com/mull-project/mull/releases
+#   #
+#   # Step 2: Build karo
+#   cmake -B build -DLOGOS_MUTATION_TEST=ON -DCMAKE_BUILD_TYPE=Debug \
+#         -DCMAKE_CXX_COMPILER=clang++ ..
+#   cmake --build build --target mull-run
+#   #
+#   # Step 3: Report dekho
+#   open build/mull-report/index.html   (macOS)
+#   xdg-open build/mull-report/index.html  (Linux)
+#   #
+#   # Expected output:
+#   #   Mutation score: XX%  (target: > 80%)
+#   #   Killed:   N   ← good (tests ne pakad liya)
+#   #   Survived: M   ← bad  (test gap hai)
+#   #   Timeout:  K
+#   #
+#   # NOTE: MULL ko clang++ chahiye (GCC se kaam nahi karta)
+#   #       Debug build zaruri hai (Release mein LLVM IR alag hota hai)
+#
+# Mutation operators (MULL default set):
+#   cxx_add_to_sub     : a + b  → a - b  (e.g., CE + T*S badal CE - T*S)
+#   cxx_mul_to_div     : a * b  → a / b  (e.g., T*S → T/S)
+#   cxx_sub_to_add     : a - b  → a + b
+#   cxx_gt_to_ge       : >  → >=         (loop boundary off-by-one)
+#   cxx_lt_to_le       : <  → <=         (tiling loop ka edge case)
+#   cxx_logical_and_to_or: &&  → ||      (condition flip)
+#   cxx_remove_void_call : function call hata deta hai
+#   cxx_negate_mutator : !cond → cond    (condition negate)
+#
+# ── MULL option ─────────────────────────────────────────────────
+option(LOGOS_MUTATION_TEST "Enable MULL mutation testing (requires clang++ + mull-runner)" OFF)
+
+if(LOGOS_MUTATION_TEST)
+    # ── Requirement checks ──────────────────────────────────────
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "[MULL] clang++ chahiye, ${CMAKE_CXX_COMPILER_ID} nahi.\n"
+            "       Dobara configure karo:\n"
+            "       cmake -DLOGOS_MUTATION_TEST=ON "
+            "-DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug ..")
+    endif()
+
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(WARNING
+            "[MULL] Debug build recommended (current: ${CMAKE_BUILD_TYPE}).\n"
+            "       Release mein LLVM IR optimized hota hai aur mutations miss ho sakte hain.\n"
+            "       Sahi command:\n"
+            "       cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_BUILD_TYPE=Debug ..")
+    endif()
+
+    find_program(MULL_RUNNER_EXE
+        NAMES mull-runner mull-runner-14 mull-runner-15 mull-runner-16 mull-runner-17
+        PATHS
+            /usr/bin
+            /usr/local/bin
+            /opt/homebrew/bin
+            /usr/lib/mull
+            $ENV{MULL_PATH}
+    )
+
+    if(NOT MULL_RUNNER_EXE)
+        message(FATAL_ERROR
+            "[MULL] mull-runner nahi mila.\n"
+            "       Install karo:\n"
+            "         Ubuntu 22.04:\n"
+            "           wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -\n"
+            "           sudo add-apt-repository 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main'\n"
+            "           sudo apt-get update && sudo apt-get install mull-17\n"
+            "         macOS:\n"
+            "           brew install mull\n"
+            "         Manual:\n"
+            "           https://github.com/mull-project/mull/releases\n"
+            "       Ya MULL_PATH env var set karo.")
+    endif()
+
+    message(STATUS "✅ MULL found: ${MULL_RUNNER_EXE}")
+
+    # ── Mutation target: test_math_unit (M1-M16 sab) ───────────
+    # -femit-all-decls    : dead code eliminate na ho (mutations miss ho sakte hain)
+    # -fprofile-instr-generate: LLVM instrumentation for mull
+    # -fcoverage-mapping  : line coverage data
+    # -g -O0              : debug symbols, no optimization (mutations readable hote hain)
+    add_executable(mull_math_unit
+        tests/test_math_unit.cpp
+        src/VedicGEMM.cpp
+        src/Checkpoint.cpp
+    )
+    target_include_directories(mull_math_unit PRIVATE include tests)
+    target_compile_options(mull_math_unit PRIVATE
+        -O0
+        -g
+        -grecord-gcc-switches
+        -fprofile-instr-generate
+        -fcoverage-mapping
+        -femit-all-decls
+        -fno-omit-frame-pointer
+        -std=c++20
+        -fexperimental-new-pass-manager   # LLVM new pass manager (mull needs this)
+    )
+    target_link_options(mull_math_unit PRIVATE
+        -fprofile-instr-generate
+    )
+
+    # ── Mutation target: test_checkpoint (T2b roundtrip) ────────
+    add_executable(mull_checkpoint
+        tests/test_checkpoint.cpp
+        src/Checkpoint.cpp
+    )
+    target_include_directories(mull_checkpoint PRIVATE include)
+    target_compile_options(mull_checkpoint PRIVATE
+        -O0
+        -g
+        -grecord-gcc-switches
+        -fprofile-instr-generate
+        -fcoverage-mapping
+        -femit-all-decls
+        -fno-omit-frame-pointer
+        -std=c++20
+        -fexperimental-new-pass-manager
+    )
+    target_link_options(mull_checkpoint PRIVATE
+        -fprofile-instr-generate
+    )
+
+    # ── MULL config file ────────────────────────────────────────
+    # mull.yml: kaunse operators chalein, kaunsi files mutate hon,
+    #           timeout, parallel workers, report format
+    set(MULL_CONFIG_PATH "${CMAKE_BINARY_DIR}/mull.yml")
+    set(MULL_REPORT_DIR  "${CMAKE_BINARY_DIR}/mull-report")
+
+    # Source files jo MULL mutate karega (sirf yeh files, test files nahi)
+    # Relative to project source dir
+    set(MULL_INCLUDE_SOURCES
+        "${CMAKE_SOURCE_DIR}/src/VedicGEMM.cpp"
+        "${CMAKE_SOURCE_DIR}/src/Checkpoint.cpp"
+        "${CMAKE_SOURCE_DIR}/include/VedicGEMM.hpp"
+        "${CMAKE_SOURCE_DIR}/include/Tensor.hpp"
+        "${CMAKE_SOURCE_DIR}/include/PhysicsOpt.hpp"
+        "${CMAKE_SOURCE_DIR}/include/LayerNorm.hpp"
+        "${CMAKE_SOURCE_DIR}/include/Attention.hpp"
+    )
+
+    # mull.yml banao (configure_file se — build time pe generate hota hai)
+    # Yeh file mull-runner ko batata hai:
+    #   - kaunse mutation operators use karo
+    #   - kaunsi source files mutate karo
+    #   - timeout per mutant
+    #   - output format
+    file(WRITE "${MULL_CONFIG_PATH}" "# LOGOS MULL Mutation Testing Config
+# Auto-generated by CMakeLists.txt (LOGOS_MUTATION_TEST=ON)
+# Manually edit karne ki zarurat nahi — cmake se regenerate hota hai
+
+mutators:
+  # Arithmetic mutations (Free Energy, GEMM formulas)
+  - cxx_add_to_sub          # a+b → a-b  : CE+T*S catch karega M3
+  - cxx_sub_to_add          # a-b → a+b  : F=CE-T*S catch karega M3/M10
+  - cxx_mul_to_div          # a*b → a/b  : scaling mutations
+  - cxx_div_to_mul          # a/b → a*b  : inverse scaling
+  # Relational mutations (loop boundaries, tiling)
+  - cxx_gt_to_ge            # >  → >=    : off-by-one in GEMM loops
+  - cxx_lt_to_le            # <  → <=    : tiling edge case M9
+  - cxx_ge_to_gt            # >= → >
+  - cxx_le_to_lt            # <= → <
+  - cxx_eq_to_ne            # == → !=
+  - cxx_ne_to_eq            # != → ==
+  # Logical mutations (conditions)
+  - cxx_logical_and_to_or   # && → ||    : guard condition flip
+  - cxx_logical_or_to_and   # || → &&
+  - cxx_negate_mutator      # !x → x     : negation removal
+  # Call removal (void functions)
+  - cxx_remove_void_call    # function() hata deta hai
+
+timeout_per_test_ms: 10000    # 10s per mutant per test (M16 ke liye kaafi)
+jobs: 4                        # parallel mutant runners
+include_paths:
+  # Sirf in files ke mutations chalenge (test files exclude hain)
+  - \"${CMAKE_SOURCE_DIR}/src/VedicGEMM.cpp\"
+  - \"${CMAKE_SOURCE_DIR}/src/Checkpoint.cpp\"
+  - \"${CMAKE_SOURCE_DIR}/include/VedicGEMM.hpp\"
+  - \"${CMAKE_SOURCE_DIR}/include/Tensor.hpp\"
+  - \"${CMAKE_SOURCE_DIR}/include/PhysicsOpt.hpp\"
+  - \"${CMAKE_SOURCE_DIR}/include/LayerNorm.hpp\"
+  - \"${CMAKE_SOURCE_DIR}/include/Attention.hpp\"
+exclude_paths:
+  # Test files mutate mat karo (mutation mein test code change hone se wrong results)
+  - \"${CMAKE_SOURCE_DIR}/tests/\"
+  - \"${CMAKE_SOURCE_DIR}/cuda/\"
+reporters:
+  - IDE          # stdout: mutant location + result (killed/survived)
+  - HTML         # build/mull-report/index.html (browser mein dekho)
+report_dir: \"${MULL_REPORT_DIR}\"
+")
+
+    # ── mull-run custom target ──────────────────────────────────
+    # cmake --build build --target mull-run
+    # Do steps:
+    #   1. mull_math_unit + mull_checkpoint build karo
+    #   2. mull-runner dono binaries pe chalao
+    #   3. HTML report generate karo
+
+    add_custom_target(mull-run
+        # Step 1: report dir banao
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${MULL_REPORT_DIR}"
+
+        # Step 2: mull_math_unit pe mull-runner chalao (M1-M16 tests)
+        COMMAND ${MULL_RUNNER_EXE}
+            --config "${MULL_CONFIG_PATH}"
+            --report-dir "${MULL_REPORT_DIR}/math"
+            --test-program "$<TARGET_FILE:mull_math_unit>"
+            --ld-search-path "${CMAKE_BINARY_DIR}"
+        COMMENT "[MULL 1/2] Mutation testing: test_math_unit (M1-M16)"
+
+        # Step 3: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
+        COMMAND ${MULL_RUNNER_EXE}
+            --config "${MULL_CONFIG_PATH}"
+            --report-dir "${MULL_REPORT_DIR}/checkpoint"
+            --test-program "$<TARGET_FILE:mull_checkpoint>"
+            --ld-search-path "${CMAKE_BINARY_DIR}"
+        COMMENT "[MULL 2/2] Mutation testing: test_checkpoint (T2b)"
+
+        # Step 4: summary print karo
+        COMMAND ${CMAKE_COMMAND} -E echo ""
+        COMMAND ${CMAKE_COMMAND} -E echo "══════════════════════════════════════════"
+        COMMAND ${CMAKE_COMMAND} -E echo "  MULL Mutation Testing Complete"
+        COMMAND ${CMAKE_COMMAND} -E echo "  Reports:"
+        COMMAND ${CMAKE_COMMAND} -E echo "    Math:       ${MULL_REPORT_DIR}/math/index.html"
+        COMMAND ${CMAKE_COMMAND} -E echo "    Checkpoint: ${MULL_REPORT_DIR}/checkpoint/index.html"
+        COMMAND ${CMAKE_COMMAND} -E echo "══════════════════════════════════════════"
+
+        DEPENDS mull_math_unit mull_checkpoint
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        VERBATIM
+    )
+
+    # ── CTest integration: mull-run ko CTest mein bhi add karo ─
+    # ctest -L MUTATION se chalega
+    # Note: mull lamba chalta hai (sabhi mutants × tests) → timeout 1800s
+    enable_testing()
+    add_test(NAME "T6_Mutation_Math"
+        COMMAND ${MULL_RUNNER_EXE}
+            --config "${MULL_CONFIG_PATH}"
+            --report-dir "${MULL_REPORT_DIR}/math"
+            --test-program "$<TARGET_FILE:mull_math_unit>"
+            --ld-search-path "${CMAKE_BINARY_DIR}"
+    )
+    add_test(NAME "T6_Mutation_Checkpoint"
+        COMMAND ${MULL_RUNNER_EXE}
+            --config "${MULL_CONFIG_PATH}"
+            --report-dir "${MULL_REPORT_DIR}/checkpoint"
+            --test-program "$<TARGET_FILE:mull_checkpoint>"
+            --ld-search-path "${CMAKE_BINARY_DIR}"
+    )
+    set_tests_properties("T6_Mutation_Math"
+        PROPERTIES
+            TIMEOUT 1800
+            LABELS "MUTATION"
+            PASS_REGULAR_EXPRESSION "Mutation score: [89][0-9]\\.[0-9]+%|Mutation score: 100"
+    )
+    set_tests_properties("T6_Mutation_Checkpoint"
+        PROPERTIES
+            TIMEOUT 600
+            LABELS "MUTATION"
+            PASS_REGULAR_EXPRESSION "Mutation score: [89][0-9]\\.[0-9]+%|Mutation score: 100"
+    )
+
+    message(STATUS "")
+    message(STATUS "✅ MULL Mutation Testing ENABLED")
+    message(STATUS "   Runner  : ${MULL_RUNNER_EXE}")
+    message(STATUS "   Targets : mull_math_unit, mull_checkpoint")
+    message(STATUS "   Config  : ${MULL_CONFIG_PATH}")
+    message(STATUS "   Report  : ${MULL_REPORT_DIR}/*/index.html")
+    message(STATUS "")
+    message(STATUS "   Run:    cmake --build build --target mull-run")
+    message(STATUS "   CTest:  ctest -L MUTATION --output-on-failure")
+    message(STATUS "   Goal:   Mutation score > 80% (90%+ excellent)")
+    message(STATUS "")
+    message(STATUS "   Operators (${CMAKE_SOURCE_DIR}/src + include):")
+    message(STATUS "     cxx_add_to_sub / cxx_sub_to_add  ← Free Energy formula")
+    message(STATUS "     cxx_mul_to_div / cxx_div_to_mul  ← GEMM scaling")
+    message(STATUS "     cxx_gt_to_ge / cxx_lt_to_le      ← loop boundary")
+    message(STATUS "     cxx_logical_and_to_or             ← guard conditions")
+    message(STATUS "     cxx_remove_void_call              ← checkpoint write skip")
+    message(STATUS "")
+
+endif() # LOGOS_MUTATION_TEST
 
 message(STATUS "")
 message(STATUS "Build targets:")

@@ -1,4 +1,4 @@
-name: LOGOS CI v24-CTEST
+name: LOGOS CI v25-MULL
 
 permissions:
   contents: read
@@ -14,18 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 # ─────────────────────────────────────────────────────────────────
-#  JOB OVERVIEW  (v24 — unified structure, Linux visible in UI)
+#  JOB OVERVIEW  (v25 — MULL mutation testing added)
 #  ┌──────────────────────────────────────────────────────────────┐
 #  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-windows → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  gpu-tests         → T1+T3+T4+T5 via ctest -L GPU           │
+#  │  mutation-tests    → T6 MULL (clang++, non-blocking)        │
 #  │  linux-build       → full Linux build + E2E smoke            │
 #  │  windows-build     → full Windows build smoke                │
 #  │  macos-build       → full macOS build smoke                  │
 #  │  kaggle-gpu-trigger→ async Kaggle GPU notebook push          │
 #  │  summary           → final CI gate                           │
 #  └──────────────────────────────────────────────────────────────┘
+#
+#  Sanitizer layers:
+#    ASan+UBSan  : cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
+#    compute-san : cmake -DLOGOS_USE_COMPUTE_SANITIZER=ON
+#    MULL        : cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_CXX_COMPILER=clang++
+#                  cmake --build build --target mull-run
 # ─────────────────────────────────────────────────────────────────
 
 jobs:
@@ -347,6 +354,135 @@ jobs:
           retention-days: 7
 
   # ═══════════════════════════════════════════════════════════════
+  #  MULL MUTATION TESTING
+  #  Test suite ki weakness dhundta hai:
+  #    - src/VedicGEMM.cpp, src/Checkpoint.cpp
+  #    - include/Tensor.hpp, PhysicsOpt.hpp, LayerNorm.hpp, Attention.hpp
+  #  Target: Mutation score > 80% (90%+ excellent)
+  #  Runtime: ~10-20 min (sabhi mutants × dono test binaries)
+  #  Non-blocking: continue-on-error: true (CI block nahi karta)
+  # ═══════════════════════════════════════════════════════════════
+  mutation-tests:
+    name: "MULL Mutation Tests (T6)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    continue-on-error: true   # mutation score gap se CI block nahi hoga
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang + MULL
+        run: |
+          # LLVM 17 apt repo add karo
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+            sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] \
+            http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          # clang-17 + mull-17 install karo
+          sudo apt-get install -y --no-install-recommends \
+            clang-17 mull-17 cmake ninja-build
+          # Symlinks banao taaki cmake clang++ dhundh sake
+          sudo ln -sf /usr/bin/clang-17   /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-17 /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/mull-runner-17 /usr/local/bin/mull-runner
+          echo "✅ clang: $(clang++ --version | head -1)"
+          echo "✅ mull:  $(mull-runner --version 2>&1 | head -1)"
+
+      - name: Configure (MULL + Debug + clang++)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DLOGOS_MUTATION_TEST=ON
+
+      - name: Build mutation targets
+        run: |
+          cmake --build build \
+            --target mull_math_unit mull_checkpoint \
+            --parallel $(nproc)
+
+      - name: Run MULL — test_math_unit (M1-M16)
+        id: mull_math
+        continue-on-error: true
+        run: |
+          mkdir -p build/mull-report/math
+          mull-runner \
+            --config build/mull.yml \
+            --report-dir build/mull-report/math \
+            --test-program build/mull_math_unit \
+            --ld-search-path build \
+            2>&1 | tee build/mull-report/math/runner.log
+          # Score extract karo
+          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' build/mull-report/math/runner.log || echo "N/A")
+          echo "score=${SCORE}" >> $GITHUB_OUTPUT
+          echo "Math mutation score: ${SCORE}%"
+
+      - name: Run MULL — test_checkpoint (T2b)
+        id: mull_ckpt
+        continue-on-error: true
+        run: |
+          mkdir -p build/mull-report/checkpoint
+          mull-runner \
+            --config build/mull.yml \
+            --report-dir build/mull-report/checkpoint \
+            --test-program build/mull_checkpoint \
+            --ld-search-path build \
+            2>&1 | tee build/mull-report/checkpoint/runner.log
+          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' build/mull-report/checkpoint/runner.log || echo "N/A")
+          echo "score=${SCORE}" >> $GITHUB_OUTPUT
+          echo "Checkpoint mutation score: ${SCORE}%"
+
+      - name: Mutation Score Summary
+        run: |
+          MATH_SCORE="${{ steps.mull_math.outputs.score }}"
+          CKPT_SCORE="${{ steps.mull_ckpt.outputs.score }}"
+          echo "════════════════════════════════════════════════════"
+          echo "  LOGOS MULL Mutation Testing Results"
+          echo "════════════════════════════════════════════════════"
+          echo ""
+          echo "  test_math_unit   (M1-M16) : ${MATH_SCORE}%"
+          echo "  test_checkpoint  (T2b)    : ${CKPT_SCORE}%"
+          echo ""
+          echo "  Grading:"
+          echo "    < 60% = ❌ Poor  — major test gaps"
+          echo "    60-79% = ⚠️  OK   — some gaps"
+          echo "    80-89% = ✅ Good"
+          echo "    90%+   = 🏆 Excellent"
+          echo ""
+          echo "  Survived mutants = test suite mein gap"
+          echo "  Reports: see artifacts (mull-reports)"
+          echo "════════════════════════════════════════════════════"
+          # Warn agar score < 80
+          python3 - <<'PYEOF'
+          import sys
+          scores = []
+          for s in ["${MATH_SCORE}", "${CKPT_SCORE}"]:
+              try: scores.append(float(s))
+              except: pass
+          if scores:
+              avg = sum(scores)/len(scores)
+              if avg < 60:
+                  print(f"❌ POOR mutation score ({avg:.1f}%) — test suite mein major gaps hain")
+                  sys.exit(1)
+              elif avg < 80:
+                  print(f"⚠️  OK mutation score ({avg:.1f}%) — kuch gaps hain, improve karo")
+              else:
+                  print(f"✅ Good mutation score ({avg:.1f}%)")
+          else:
+              print("⚠️  Score parse nahi ho saka — runner output dekho")
+          PYEOF
+
+      - name: Upload MULL reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mull-reports
+          path: build/mull-report/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ═══════════════════════════════════════════════════════════════
   #  KAGGLE GPU TRIGGER (async, main only)
   # ═══════════════════════════════════════════════════════════════
   kaggle-gpu-trigger:
@@ -420,6 +556,7 @@ jobs:
       - linux-build
       - windows-build
       - macos-build
+      - mutation-tests
     if: always()
     steps:
       - name: Print results + gate
@@ -431,9 +568,10 @@ jobs:
           R_LX_BLD:  ${{ needs.linux-build.result }}
           R_WIN_BLD: ${{ needs.windows-build.result }}
           R_MAC_BLD: ${{ needs.macos-build.result }}
+          R_MULL:    ${{ needs.mutation-tests.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v24-CTEST"
+          echo "  LOGOS CI Summary — v25-MULL"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -443,6 +581,7 @@ jobs:
           echo "  Linux Build + E2E:    $R_LX_BLD"
           echo "  Windows Build:        $R_WIN_BLD"
           echo "  macOS Build:          $R_MAC_BLD"
+          echo "  MULL Mutation Tests:  $R_MULL (non-blocking)"
           echo "  Kaggle GPU Trigger:   async (non-blocking)"
           echo ""
           echo "  CTest coverage:"
@@ -452,21 +591,29 @@ jobs:
           echo "    T1  Syntax Build  (GPU)"
           echo "    T3  Memory Stress (GPU)"
           echo "    T5  CUDA Kernels  (GPU)"
+          echo "    T6  MULL Mutation (Linux, non-blocking)"
+          echo ""
+          echo "  Sanitizer layers:"
+          echo "    ASan+UBSan  → CPU test bugs (LOGOS_SANITIZE=ON)"
+          echo "    compute-san → GPU memory errors (LOGOS_USE_COMPUTE_SANITIZER=ON)"
+          echo "    MULL        → Test suite weakness (LOGOS_MUTATION_TEST=ON)"
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
+          echo "  Changes in v25 (MULL):"
+          echo "    ✅ CMakeLists.txt: LOGOS_MUTATION_TEST=ON option added"
+          echo "    ✅ mull.yml auto-generated in build dir (14 operators)"
+          echo "    ✅ mull_math_unit target: test_math_unit M1-M16 mutations"
+          echo "    ✅ mull_checkpoint target: T2b checkpoint roundtrip mutations"
+          echo "    ✅ mull-run custom target: cmake --build --target mull-run"
+          echo "    ✅ CI job: mutation-tests (continue-on-error: true)"
+          echo "    ✅ Artifacts: mull-reports (HTML + log, 14 day retention)"
+          echo "    ✅ Score gate: < 60% = warning, < 80% = improvement needed"
+          echo ""
           echo "  Changes in v24:"
           echo "    ✅ UI FIX: training-pipeline renamed → linux-build"
-          echo "       (now visible alongside Windows Build + macOS Build in CI)"
-          echo "    ✅ UNIFIED: All 3 CPU test jobs now run T4 with timeout=600s"
-          echo "       (Linux was 120s in CTest step → T4 could silently time out)"
-          echo "    ✅ CLEANUP: Removed redundant T4 shell step from Linux job"
-          echo "       (CTest already runs T4; duplicate bash step had a logic bug)"
-          echo "    ✅ CLEANUP: gpu-tests CPU-fallback CTest timeout set to 600s"
-          echo ""
-          echo "  Changes in v23:"
-          echo "    ✅ BUG FIX: Windows /tmp/ path → tmp_file() cross-platform"
-          echo "    ✅ BUG FIX: save_checkpoint return value checked in LDS8+LDS11"
+          echo "    ✅ UNIFIED: All 3 CPU test jobs T4 timeout=600s"
+          echo "    ✅ CLEANUP: Redundant T4 shell step removed from Linux job"
           echo ""
           echo "════════════════════════════════════════════════════"
 
@@ -478,6 +625,9 @@ jobs:
 
           if [ "$R_GPU" = "failure" ]; then
             echo "⚠️  GPU tests failed (non-blocking if no CUDA runner)"
+          fi
+          if [ "$R_MULL" = "failure" ]; then
+            echo "⚠️  MULL mutation tests failed (non-blocking — check mull-reports artifact)"
           fi
 
           if [ "$FAIL" = "true" ]; then
