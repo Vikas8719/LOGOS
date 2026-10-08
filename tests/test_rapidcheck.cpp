@@ -373,7 +373,12 @@ static void rc7_checkpoint_size_formula() {
         int vocab_size  = *rc::gen::inRange(2, 513);
         int d_model_div = *rc::gen::inRange(1, 9);   // d_model = d_model_div * 4
         int d_model     = d_model_div * 4;            // must be multiple of 4 (for heads)
-        int num_heads   = *rc::gen::element(std::vector<int>{1, 2, 4});
+        // rc::gen::element({1,2,4}) — picks one value from initializer list
+        // rc::gen::elementOf(vec) — alternative for named vector
+        // Safest: use inRange index to pick from array
+        const int heads_arr[] = {1, 2, 4};
+        int heads_idx = *rc::gen::inRange(0, 3);
+        int num_heads = heads_arr[heads_idx];
         int num_layers  = *rc::gen::inRange(1, 5);
         int max_seq_len = *rc::gen::inRange(2, 65);
 
