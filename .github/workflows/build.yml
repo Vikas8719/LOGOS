@@ -1,4 +1,4 @@
-name: LOGOS CI v26-RapidCheck
+name: LOGOS CI v27-PhysicsMull
 
 permissions:
   contents: read
@@ -539,6 +539,13 @@ jobs:
             --target mull_math_unit mull_checkpoint \
             --parallel $(nproc)
 
+      - name: Check mull-runner version + output format
+        run: |
+          echo "=== mull-runner version ==="
+          mull-runner --version 2>&1 || mull-runner -version 2>&1 || true
+          echo "=== mull-runner help (first 20 lines) ==="
+          mull-runner --help 2>&1 | head -20 || true
+
       - name: Run MULL — test_math_unit (M1-M16)
         id: mull_math
         continue-on-error: true
@@ -550,9 +557,34 @@ jobs:
             --test-program build/mull_math_unit \
             --ld-search-path build \
             2>&1 | tee build/mull-report/math/runner.log
-          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' build/mull-report/math/runner.log || echo "N/A")
-          echo "score=${SCORE}" >> $GITHUB_OUTPUT
-          echo "Math mutation score: ${SCORE}%"
+
+          # mull-runner version によって output format alag hota hai:
+          # mull-15 format: "Mutation score: 85.71%"  OR
+          #                 "Killed: 12/14 (85%)"     OR
+          #                 summary table at end
+          # Parse multiple patterns:
+          LOG=build/mull-report/math/runner.log
+          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | head -1)
+          if [ -z "$SCORE" ]; then
+            # Try "Killed: N out of N" format → compute percentage
+            KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | head -1)
+            TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | head -1)
+            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+              SCORE=$(python3 -c "print(f'{100*$KILLED/$TOTAL:.1f}')")
+            fi
+          fi
+          if [ -z "$SCORE" ]; then
+            # Try "N/N" format in summary table
+            KILLED=$(grep -oP '\|\s*\K\d+(?=\s*\|\s*\d+\s*\|)' "$LOG" 2>/dev/null | head -1)
+            TOTAL=$(grep -oP '\|\s*\d+\s*\|\s*\K\d+(?=\s*\|)' "$LOG" 2>/dev/null | head -1)
+            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+              SCORE=$(python3 -c "print(f'{100*$KILLED/$TOTAL:.1f}')")
+            fi
+          fi
+          echo "score=${SCORE:-N/A}" >> $GITHUB_OUTPUT
+          echo "Math mutation score: ${SCORE:-N/A}%"
+          echo "--- Last 30 lines of mull runner output ---"
+          tail -30 "$LOG"
 
       - name: Run MULL — test_checkpoint (T2b)
         id: mull_ckpt
@@ -565,9 +597,20 @@ jobs:
             --test-program build/mull_checkpoint \
             --ld-search-path build \
             2>&1 | tee build/mull-report/checkpoint/runner.log
-          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' build/mull-report/checkpoint/runner.log || echo "N/A")
-          echo "score=${SCORE}" >> $GITHUB_OUTPUT
-          echo "Checkpoint mutation score: ${SCORE}%"
+
+          LOG=build/mull-report/checkpoint/runner.log
+          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | head -1)
+          if [ -z "$SCORE" ]; then
+            KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | head -1)
+            TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | head -1)
+            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+              SCORE=$(python3 -c "print(f'{100*$KILLED/$TOTAL:.1f}')")
+            fi
+          fi
+          echo "score=${SCORE:-N/A}" >> $GITHUB_OUTPUT
+          echo "Checkpoint mutation score: ${SCORE:-N/A}%"
+          echo "--- Last 30 lines of mull runner output ---"
+          tail -30 "$LOG"
 
       - name: Mutation Score Summary
         run: |
