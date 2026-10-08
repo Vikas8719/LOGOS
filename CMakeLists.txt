@@ -647,7 +647,9 @@ if(LOGOS_MUTATION_TEST)
         -femit-all-decls
         -fno-omit-frame-pointer
         -std=c++20
-        -fexperimental-new-pass-manager   # LLVM new pass manager (mull needs this)
+        # NOTE: -fexperimental-new-pass-manager clang-15 mein DEPRECATED hai
+        # Hatane se LLVM new pass manager automatically enable hota hai (clang-15 default)
+        # Yahi MULL ko mutation metadata embed karne deta hai
         ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
     )
     target_link_options(mull_math_unit PRIVATE
@@ -691,7 +693,7 @@ if(LOGOS_MUTATION_TEST)
         -femit-all-decls
         -fno-omit-frame-pointer
         -std=c++20
-        -fexperimental-new-pass-manager
+        # NOTE: -fexperimental-new-pass-manager clang-15 mein DEPRECATED hai — hata diya
         ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
     )
     target_link_options(mull_checkpoint PRIVATE

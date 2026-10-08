@@ -572,12 +572,9 @@ jobs:
         run: |
           mkdir -p build/mull-report/math
 
-          # mull-runner 0.34.1 syntax (confirmed from --help):
-          #   mull-runner [OPTIONS] <EXECUTABLE> [RUNNER_ARGS]
-          # Config file se options load hoti hain (--config flag)
-          # Report dir bhi config se aata hai ya default
           echo "--- Running mull-runner on mull_math_unit ---"
           mull-runner \
+            --config build/mull.yml \
             --workers 2 \
             --timeout 30000 \
             --report-dir build/mull-report/math \
@@ -593,7 +590,16 @@ jobs:
           # Format 1: "Mutation score: 85.71%"
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
 
-          # Format 2: "Killed: 12 out of 14"
+          # Format 2: "infinitely high" = 0 mutants found = binary compile flags galat the
+          if [ -z "$SCORE" ]; then
+            if grep -q "infinitely high" "$LOG" 2>/dev/null; then
+              echo "❌ No mutants found — binary mein MULL instrumentation nahi hai"
+              echo "   Check: -fexperimental-new-pass-manager removed? clang-15 use ho raha hai?"
+              SCORE="0_NO_MUTANTS"
+            fi
+          fi
+
+          # Format 3: "Killed: 12 out of 14"
           if [ -z "$SCORE" ]; then
             KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
@@ -602,8 +608,8 @@ jobs:
             fi
           fi
 
-          # Format 3: "Killed mutants: 12 / 14"
-          if [ -z "$SCORE" ]; then
+          # Format 4: "Killed mutants: 12 / 14"
+          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
             KILLED=$(grep -oP '[Kk]illed mutants?:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             TOTAL=$(grep -oP '[Kk]illed mutants?:\s*\d+\s*/\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
@@ -611,8 +617,8 @@ jobs:
             fi
           fi
 
-          # Format 4: koi bhi percentage "NN.NN%" ya "NN%"
-          if [ -z "$SCORE" ]; then
+          # Format 5: any percentage in log
+          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
             SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
           fi
 
@@ -627,6 +633,7 @@ jobs:
 
           echo "--- Running mull-runner on mull_checkpoint ---"
           mull-runner \
+            --config build/mull.yml \
             --workers 2 \
             --timeout 30000 \
             --report-dir build/mull-report/checkpoint \
@@ -641,13 +648,18 @@ jobs:
 
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
           if [ -z "$SCORE" ]; then
+            if grep -q "infinitely high" "$LOG" 2>/dev/null; then
+              SCORE="0_NO_MUTANTS"
+            fi
+          fi
+          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
             KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
               SCORE=$(python3 -c "print(f'{100*int(\"$KILLED\")/int(\"$TOTAL\"):.1f}')")
             fi
           fi
-          if [ -z "$SCORE" ]; then
+          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
             SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
           fi
 
