@@ -529,6 +529,29 @@ if(LOGOS_MUTATION_TEST)
     # -fprofile-instr-generate: LLVM instrumentation for mull
     # -fcoverage-mapping  : line coverage data
     # -g -O0              : debug symbols, no optimization (mutations readable hote hain)
+    # ── GCC-12 toolchain path detect karo (clang ABI fix ke liye) ──
+    # Problem: ubuntu-22.04 pe clang-15 default GCC-14 ka libstdc++ use karta hai.
+    # GCC-14 mein std::__shared_ptr<_Dir>::operator bool() inline ho gaya —
+    # yeh symbol .so mein nahi hota, isliye undefined reference linker error aata hai.
+    # Fix: clang ko explicitly GCC-12 ka sysroot/toolchain use karwao.
+    # --gcc-toolchain=<path>: clang GCC-12 ke headers + libstdc++ dhundta hai.
+    find_program(GCC12_EXE NAMES g++-12 PATHS /usr/bin)
+    if(GCC12_EXE)
+        execute_process(
+            COMMAND ${GCC12_EXE} -print-file-name=libstdc++.a
+            OUTPUT_VARIABLE _GCC12_LIBPATH OUTPUT_STRIP_TRAILING_WHITESPACE)
+        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_LIBPATH}" DIRECTORY)
+        # toolchain root = lib dir se 3 levels upar (lib/gcc/x86_64-linux-gnu/12 → /)
+        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_TOOLCHAIN}" DIRECTORY)
+        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_TOOLCHAIN}" DIRECTORY)
+        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_TOOLCHAIN}" DIRECTORY)
+        message(STATUS "[MULL] GCC-12 toolchain: ${_GCC12_TOOLCHAIN}")
+        set(MULL_GCC_TOOLCHAIN_FLAG "--gcc-toolchain=${_GCC12_TOOLCHAIN}")
+    else()
+        message(STATUS "[MULL] g++-12 nahi mila — system default GCC use hoga")
+        set(MULL_GCC_TOOLCHAIN_FLAG "")
+    endif()
+
     add_executable(mull_math_unit
         tests/test_math_unit.cpp
         src/VedicGEMM.cpp
@@ -545,12 +568,12 @@ if(LOGOS_MUTATION_TEST)
         -fno-omit-frame-pointer
         -std=c++20
         -fexperimental-new-pass-manager   # LLVM new pass manager (mull needs this)
+        ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
     )
     target_link_options(mull_math_unit PRIVATE
         -fprofile-instr-generate
-        # clang + GCC libstdc++ ABI mismatch fix (same as mull_checkpoint):
-        # --no-as-needed ensures libstdc++fs + libstdc++ fully linked.
         -Wl,--no-as-needed
+        ${MULL_GCC_TOOLCHAIN_FLAG}        # link time bhi GCC-12 toolchain
     )
     # stdc++fs pehle, phir stdc++ (dependency order correct rakhna zaroori hai)
     target_link_libraries(mull_math_unit PRIVATE stdc++fs stdc++)
@@ -571,18 +594,17 @@ if(LOGOS_MUTATION_TEST)
         -fno-omit-frame-pointer
         -std=c++20
         -fexperimental-new-pass-manager
+        ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
     )
     target_link_options(mull_checkpoint PRIVATE
         -fprofile-instr-generate
-        # clang + GCC libstdc++ ABI mismatch fix:
-        # directory_iterator::operator== aur recursive_directory_iterator::operator==
-        # ke liye std::__shared_ptr<_Dir>::operator bool() GCC libstdc++ se chahiye.
-        # --no-as-needed: linker silently skip na kare even if direct call na ho.
+        # clang-15 + GCC-14 ABI mismatch fix:
+        # std::__shared_ptr<_Dir>::operator bool() GCC-14 mein inline ho gaya.
+        # GCC-12 toolchain force karo taaki yeh symbol available ho.
         -Wl,--no-as-needed
+        ${MULL_GCC_TOOLCHAIN_FLAG}        # link time bhi GCC-12 toolchain
     )
-    # clang + GCC libstdc++ mix pe std::filesystem explicitly link karna padta hai.
-    # Ordering matters: stdc++fs pehle (filesystem), phir stdc++ (base runtime).
-    # -Wl,--no-as-needed upar set hai taaki both libraries fully pulled in hon.
+    # stdc++fs pehle (filesystem), phir stdc++ (base runtime) — order matters.
     target_link_libraries(mull_checkpoint PRIVATE stdc++fs stdc++)
 
     # ── MULL config file ────────────────────────────────────────
