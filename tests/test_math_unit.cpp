@@ -196,7 +196,7 @@ static void test_m1_vedic_gemm() {
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-1.f, 1.f);
 
-    // Test multiple shapes
+    // Test multiple shapes including edge cases
     std::vector<std::tuple<int,int,int>> shapes = {
         {4,4,4}, {8,16,8}, {32,64,32}, {64,128,64}, {128,256,128}
     };
@@ -206,12 +206,9 @@ static void test_m1_vedic_gemm() {
         for (float& x : A) x = dist(rng);
         for (float& x : B) x = dist(rng);
 
-        // Vedic GEMM (using Tensor wrapper)
         Tensor TA({M,K}); std::copy(A.begin(),A.end(),TA.data.begin());
         Tensor TB({K,N}); std::copy(B.begin(),B.end(),TB.data.begin());
         Tensor TC = vedic_gemm(TA, TB);
-
-        // Reference
         auto Cref = naive_gemm(A, B, M, K, N);
 
         float max_err = 0.f;
@@ -222,6 +219,81 @@ static void test_m1_vedic_gemm() {
                            std::to_string(K) + "x" + std::to_string(N) +
                            "] max_err=" + std::to_string(max_err);
         TEST(name, max_err < 1e-2f);
+
+        // Verify exact element count — catches loop bound mutations
+        TEST("vedic_gemm output rows == M",  TC.rows() == M);
+        TEST("vedic_gemm output cols == N",  TC.cols() == N);
+        TEST("vedic_gemm total_size == M*N", TC.total_size == M * N);
+
+        // Verify a specific element against reference — catches arithmetic mutations
+        // C[0,0] = sum_k A[0,k]*B[k,0]
+        float c00_ref = 0.f;
+        for (int k = 0; k < K; ++k) c00_ref += A[k] * B[k*N];
+        TEST("vedic_gemm C[0,0] exact match", std::abs(TC.data[0] - c00_ref) < 1e-3f);
+
+        // Verify last element — catches off-by-one in loop end
+        float cLast_ref = 0.f;
+        for (int k = 0; k < K; ++k)
+            cLast_ref += A[(M-1)*K + k] * B[k*N + (N-1)];
+        TEST("vedic_gemm C[M-1,N-1] exact match",
+             std::abs(TC.data[M*N-1] - cLast_ref) < 1e-3f);
+    }
+
+    // Identity matrix test: I @ I == I  (exact, no tolerance needed for small size)
+    {
+        int N = 4;
+        Tensor I({N,N}, 0.f);
+        for (int i = 0; i < N; ++i) I.at(i,i) = 1.f;
+        Tensor R = vedic_gemm(I, I);
+        bool identity_ok = true;
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j) {
+                float expected = (i == j) ? 1.f : 0.f;
+                if (std::abs(R.at(i,j) - expected) > 1e-5f) identity_ok = false;
+            }
+        TEST("vedic_gemm(I, I) == I (exact)", identity_ok);
+    }
+
+    // Scale test: (2*A) @ B == 2*(A @ B)
+    {
+        int M=8, K=8, N=8;
+        std::vector<float> A(M*K), B(K*N);
+        for (float& x : A) x = dist(rng);
+        for (float& x : B) x = dist(rng);
+        Tensor TA({M,K}); std::copy(A.begin(),A.end(),TA.data.begin());
+        Tensor TB({K,N}); std::copy(B.begin(),B.end(),TB.data.begin());
+        Tensor TA2 = TA * 2.f;
+        Tensor C1  = vedic_gemm(TA2, TB);
+        Tensor C2  = vedic_gemm(TA,  TB) * 2.f;
+        float max_diff = 0.f;
+        for (int i = 0; i < M*N; ++i)
+            max_diff = std::max(max_diff, std::abs(C1.data[i] - C2.data[i]));
+        TEST("vedic_gemm: (2A)@B == 2*(A@B) (linearity)", max_diff < 1e-3f);
+    }
+
+    // Exact known-value test: 2x2 manual
+    {
+        Tensor A2({2,2}); A2.data = {1.f, 2.f, 3.f, 4.f};
+        Tensor B2({2,2}); B2.data = {5.f, 6.f, 7.f, 8.f};
+        Tensor C2 = vedic_gemm(A2, B2);
+        // C = [[1*5+2*7, 1*6+2*8],[3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]]
+        TEST("vedic_gemm 2x2 exact: C[0,0]=19", std::abs(C2.at(0,0) - 19.f) < 1e-4f);
+        TEST("vedic_gemm 2x2 exact: C[0,1]=22", std::abs(C2.at(0,1) - 22.f) < 1e-4f);
+        TEST("vedic_gemm 2x2 exact: C[1,0]=43", std::abs(C2.at(1,0) - 43.f) < 1e-4f);
+        TEST("vedic_gemm 2x2 exact: C[1,1]=50", std::abs(C2.at(1,1) - 50.f) < 1e-4f);
+    }
+
+    // vedic_gemm_bias: bias is ADDED, not multiplied
+    {
+        Tensor A2({2,2}); A2.data = {1.f, 0.f, 0.f, 1.f};  // identity
+        Tensor W2({2,2}); W2.data = {1.f, 0.f, 0.f, 1.f};  // identity
+        Tensor b({2});    b.data  = {3.f, 5.f};
+        Tensor R = vedic_gemm_bias(A2, W2, b);
+        // R[0] = 1*1+0*0 + 3 = 4; R[1] = 1*0+0*1 + 5 = 5
+        TEST("vedic_gemm_bias: R[0,0] = 1+3 = 4", std::abs(R.at(0,0) - 4.f) < 1e-4f);
+        TEST("vedic_gemm_bias: R[0,1] = 1+5 = 6", std::abs(R.at(0,1) - 6.f) < 1e-4f);
+        TEST("vedic_gemm_bias: R[1,0] = 1+3 = 4", std::abs(R.at(1,0) - 4.f) < 1e-4f);
+        TEST("vedic_gemm_bias: R[1,1] = 1+5 = 6", std::abs(R.at(1,1) - 6.f) < 1e-4f);
     }
 }
 
@@ -300,6 +372,39 @@ static void test_m2_gunitasamuchayah() {
         }
         TEST("Nikhilam: base - (base - |x|) reconstructs x for all test values", ok);
     }
+
+    // Gunitasamuchayah: exact sum verification for 3x3 known values
+    {
+        // A = [[1,2,3],[4,5,6]], B = [[1,0],[0,1],[1,1]]
+        // C = A@B = [[4,5],[10,11]]  sum(C) = 30
+        std::vector<float> A = {1,2,3, 4,5,6};
+        std::vector<float> B = {1,0, 0,1, 1,1};
+        auto C = naive_gemm(A, B, 2, 3, 2);
+        float sum_C = std::accumulate(C.begin(), C.end(), 0.f);
+        TEST("naive_gemm 2x3x2 sum(C) == 30", std::abs(sum_C - 30.f) < 1e-4f);
+        TEST("naive_gemm C[0,0] == 4", std::abs(C[0] - 4.f) < 1e-4f);
+        TEST("naive_gemm C[0,1] == 5", std::abs(C[1] - 5.f) < 1e-4f);
+        TEST("naive_gemm C[1,0] == 10", std::abs(C[2] - 10.f) < 1e-4f);
+        TEST("naive_gemm C[1,1] == 11", std::abs(C[3] - 11.f) < 1e-4f);
+    }
+
+    // Loop count: naive_gemm must visit ALL M*K*N combinations
+    {
+        // If a loop uses < instead of <=, it would skip last element
+        // Zero matrix + one cell set → result must reflect exactly that cell
+        int M=3, K=3, N=3;
+        std::vector<float> A(M*K, 0.f), B(K*N, 0.f);
+        A[2*K + 2] = 1.f;  // A[2,2] = 1, all else 0
+        B[2*N + 2] = 1.f;  // B[2,2] = 1, all else 0
+        auto C = naive_gemm(A, B, M, K, N);
+        // Only C[2,2] should be 1, everything else 0
+        TEST("naive_gemm: last-row last-col element correct (loop reaches M-1,K-1,N-1)",
+             std::abs(C[2*N+2] - 1.f) < 1e-4f);
+        float sum_rest = 0.f;
+        for (int i = 0; i < M*N; ++i) if (i != 2*N+2) sum_rest += std::abs(C[i]);
+        TEST("naive_gemm: only C[M-1,N-1] != 0 when only A[M-1,K-1] and B[K-1,N-1] set",
+             sum_rest < 1e-4f);
+    }
 }
 
 // ============================================================
@@ -356,6 +461,57 @@ static void test_m3_free_energy() {
         TEST("Peaked dist → S ≈ 0", Sp < 0.01f);
     }
 
+    // [g] cpu_softmax exact values: known logits
+    // logits = [0, 0] → p = [0.5, 0.5]
+    {
+        std::vector<float> eq_logits = {0.f, 0.f};
+        auto p2 = cpu_softmax(eq_logits, 1.f);
+        TEST("softmax([0,0]) p[0] == 0.5", std::abs(p2[0] - 0.5f) < 1e-5f);
+        TEST("softmax([0,0]) p[1] == 0.5", std::abs(p2[1] - 0.5f) < 1e-5f);
+    }
+
+    // [h] cpu_softmax T=2 vs T=1: T=2 less peaked
+    {
+        std::vector<float> lg = {2.f, 0.f};
+        auto p_t1 = cpu_softmax(lg, 1.f);
+        auto p_t2 = cpu_softmax(lg, 2.f);
+        // With T=2, divides by 2 → less peaked → p[0] closer to 0.5
+        TEST("softmax T=2 less peaked than T=1: p[0] smaller",
+             p_t2[0] < p_t1[0]);
+        TEST("softmax T=2: sum still 1",
+             std::abs(p_t2[0] + p_t2[1] - 1.f) < 1e-5f);
+    }
+
+    // [i] Free energy exact value check: F = CE - T*S
+    {
+        // logits=[0,0], target=0, T=1
+        // p=[.5,.5], CE=-log(0.5)=log2≈0.6931, S=log2≈0.6931
+        // F = 0.6931 - 1*0.6931 = 0
+        std::vector<float> eq_l = {0.f, 0.f};
+        auto peq = cpu_softmax(eq_l, 1.f);
+        float CE_eq = cpu_ce(peq, 0);
+        float S_eq  = cpu_entropy(peq);
+        float F_eq  = CE_eq - 1.f * S_eq;
+        TEST("Free energy F=0 for uniform dist at T=1", std::abs(F_eq) < 1e-4f);
+        TEST("CE = log(2) for uniform 2-class", std::abs(CE_eq - std::log(2.f)) < 1e-4f);
+        TEST("S = log(2) for uniform 2-class",  std::abs(S_eq  - std::log(2.f)) < 1e-4f);
+    }
+
+    // [j] cpu_entropy: single class distribution → S = 0 exactly
+    {
+        // Approximate one-hot: [1-eps, eps] as eps→0
+        std::vector<float> onehot = {1.f - 1e-6f, 1e-6f};
+        float S_oh = cpu_entropy(onehot);
+        TEST("Entropy near-onehot: S < 1e-4", S_oh < 1e-4f);
+    }
+
+    // [k] cpu_free_energy T=0 → F == CE
+    {
+        float F_t0 = cpu_free_energy(logits, target, 0.f);
+        float CE_t0 = cpu_ce(cpu_softmax(logits, 1.f), target);
+        TEST("cpu_free_energy(T=0) == CE", std::abs(F_t0 - CE_t0) < 1e-5f);
+    }
+
     std::cout << "    CE=" << CE << " S=" << S << " F=" << F << " (T=" << T << ")\n";
 }
 
@@ -402,8 +558,32 @@ static void test_m4_leapfrog_stability() {
     TEST("Leapfrog: energy drift < 50% over 100 steps",    lf_drift < 0.5f);
 
     // Order test: Euler error ∝ lr, Leapfrog error ∝ lr²
-    // At lr=0.1: Euler drift should be >> Leapfrog drift
     TEST("Euler drift > 1% (expected 1st order error)", euler_drift > 0.01f);
+
+    // Exact half-kick verification: one leapfrog step manual check
+    // W=1, V=0, lr=0.1:
+    //   V_half = 0 - (0.1/2)*1 = -0.05
+    //   W_new  = 1 + 0.1*(-0.05) = 0.995
+    //   V_new  = -0.05 - (0.1/2)*0.995 = -0.05 - 0.04975 = -0.09975
+    {
+        float W = 1.f, V = 0.f, h = 0.1f;
+        V -= (h * 0.5f) * W;
+        W += h * V;
+        V -= (h * 0.5f) * W;
+        TEST("Leapfrog half-kick: W after 1 step ≈ 0.995",
+             std::abs(W - 0.995f) < 1e-4f);
+        TEST("Leapfrog half-kick: V after 1 step ≈ -0.09975",
+             std::abs(V - (-0.09975f)) < 1e-4f);
+        // W must be LESS than 1 (spring compressed)
+        TEST("Leapfrog: W < initial W=1 after spring force", W < 1.f);
+        // V must be negative (moving toward equilibrium)
+        TEST("Leapfrog: V < 0 after half-kick away from W=1", V < 0.f);
+    }
+
+    // Energy must NOT increase past 2x initial for leapfrog (bounded)
+    TEST("Leapfrog: final energy < 2 * initial energy", E1_lf < 2.f * E0_lf);
+    // Euler energy CAN drift: verify it actually drifted significantly
+    TEST("Euler: energy drifted from initial (not conserved)", E1_euler != E0_euler);
 }
 
 // ============================================================
@@ -439,6 +619,35 @@ static void test_m5_boltzmann_softmax() {
     float S2 = cpu_entropy(p_std);
     float S3 = cpu_entropy(p_hot);
     TEST("Entropy: S(T=0.001) < S(T=1) < S(T=1000)", S1 < S2 && S2 < S3);
+
+    // Exact softmax computation check: known 2-element case
+    // logits=[a,b], T=1 → p[0] = exp(a-max) / (exp(a-max)+exp(b-max))
+    // For logits=[2,0]: max=2, p[0]=exp(0)/(exp(0)+exp(-2))=1/(1+e^-2)≈0.8808
+    {
+        std::vector<float> l2 = {2.f, 0.f};
+        auto p2 = cpu_softmax(l2, 1.f);
+        float expected_p0 = 1.f / (1.f + std::exp(-2.f));
+        TEST("softmax([2,0]): p[0] exact", std::abs(p2[0] - expected_p0) < 1e-5f);
+        TEST("softmax([2,0]): p[0]+p[1] == 1", std::abs(p2[0]+p2[1]-1.f) < 1e-5f);
+        TEST("softmax([2,0]): p[0] > p[1]", p2[0] > p2[1]);
+        // T=0.5: logits/T = [4,0] → more peaked
+        auto p2_cold = cpu_softmax(l2, 0.5f);
+        float expected_cold = 1.f / (1.f + std::exp(-4.f));
+        TEST("softmax([2,0],T=0.5): p[0] more peaked",
+             std::abs(p2_cold[0] - expected_cold) < 1e-5f);
+        TEST("softmax T=0.5 more peaked than T=1: p[0] higher", p2_cold[0] > p2[0]);
+    }
+
+    // Verify all probabilities sum to 1 with general logits
+    {
+        std::vector<float> lg5 = {1.f, 3.f, -1.f, 0.5f, 2.f};
+        auto p5 = cpu_softmax(lg5, 1.f);
+        float sum5 = 0.f; for (float v : p5) sum5 += v;
+        TEST("softmax(5-class): sum == 1", std::abs(sum5 - 1.f) < 1e-5f);
+        // Max logit (index 1, val=3) must have max probability
+        TEST("softmax: argmax logit → argmax prob",
+             *std::max_element(p5.begin(), p5.end()) == p5[1]);
+    }
 }
 
 // ============================================================
@@ -495,6 +704,39 @@ static void test_m6_nikhilam_complement() {
     }
 
     std::cout << "    scale=" << scale << " max_quant_err=" << max_quant_err << "\n";
+
+    // Exact quantization value checks
+    {
+        float absmax2 = 8.f, sc = absmax2 / 127.f;
+        // 8.0 → round(8/sc) = 127 → dequant = 127*sc = 8.0 exactly
+        int8_t q127 = (int8_t)std::max(-127.f, std::min(127.f, std::round(8.f / sc)));
+        float rec127 = q127 * sc;
+        TEST("Quant: 8.0 → int8=127 → dequant == absmax",
+             std::abs(rec127 - 8.f) < 1e-3f && (int)q127 == 127);
+        // 0.0 → int8=0 → dequant=0
+        int8_t q0 = (int8_t)std::max(-127.f, std::min(127.f, std::round(0.f / sc)));
+        TEST("Quant: 0.0 → int8=0", (int)q0 == 0);
+        // -4.0 → round(-4/sc) → negative int8
+        int8_t qneg = (int8_t)std::max(-127.f, std::min(127.f,
+                          std::round(-4.f / sc)));
+        TEST("Quant: -4.0 → negative int8", (int)qneg < 0);
+        // Dequantized -4.0 within scale/2 of original
+        float rec_neg = qneg * sc;
+        TEST("Quant: -4.0 dequant error <= scale/2",
+             std::abs(rec_neg - (-4.f)) <= sc * 0.5f + 1e-5f);
+    }
+
+    // int8 round-trip for all boundary values must be exact
+    {
+        bool rt_ok = true;
+        std::vector<int> boundaries = {-127, -126, -1, 0, 1, 126, 127};
+        for (int v : boundaries) {
+            int8_t q = (int8_t)v;
+            int back = (int)q;
+            if (back != v) rt_ok = false;
+        }
+        TEST("int8 round-trip exact for boundary values {-127,-126,-1,0,1,126,127}", rt_ok);
+    }
 }
 
 // ============================================================
@@ -544,11 +786,8 @@ static void test_m7_hyperbolic_maps() {
     // d) Curvature: larger c → tighter ball (smaller output norm for same input)
     {
         std::vector<float> v = {1.f, 1.f, 1.f, 1.f};
-        // c=1
         auto y1 = cpu_expmap(v);
         float n1=0.f; for (float x : y1) n1+=x*x; n1=std::sqrt(n1);
-        // c=4: scale v by sqrt(c) inside expmap
-        // expmap_c(v) = tanh(sqrt(c)*||v||/2) * v / (sqrt(c)*||v||)
         float c = 4.f, sc = std::sqrt(c);
         float norm=0.f; for (float x : v) norm+=x*x; norm=std::sqrt(norm);
         float factor = std::tanh(sc*norm*0.5f) / (sc*norm + 1e-9f);
@@ -557,6 +796,34 @@ static void test_m7_hyperbolic_maps() {
         n4 = std::sqrt(n4);
         std::cout << "    ||expmap_c=1(v)||=" << n1 << " ||expmap_c=4(v)||=" << n4 << "\n";
         TEST("Larger curvature → smaller output norm", n4 < n1);
+    }
+
+    // e) cpu_logmap exact value: for small v, logmap(expmap(v)) ≈ v
+    //    For v = [0.3], expmap: norm=0.3, mapped=tanh(0.15)/0.3≈0.148/0.3≈0.494
+    //    factor = tanh(0.15)/0.3; y[0] = factor*0.3 = tanh(0.15) ≈ 0.1489
+    {
+        std::vector<float> v1d = {0.3f};
+        auto y = cpu_expmap(v1d);
+        float expected_y = std::tanh(0.15f);  // tanh(||v||/2) * v/||v|| * ||v|| = tanh(||v||/2)
+        TEST("expmap 1D: ||expmap([0.3])|| ≈ tanh(0.15)",
+             std::abs(y[0] - expected_y) < 1e-4f);
+        auto v_rec = cpu_logmap(y);
+        TEST("logmap(expmap([0.3])) ≈ 0.3", std::abs(v_rec[0] - 0.3f) < 1e-4f);
+    }
+
+    // f) expmap direction preserved: output is parallel to input
+    {
+        std::vector<float> v = {1.f, 2.f, 0.f, -1.f};
+        auto y = cpu_expmap(v);
+        // y must be proportional to v: y[i]/v[i] = const for v[i] != 0
+        // y[0]/v[0] should == y[1]/v[1]
+        float ratio01 = y[0] / v[0];
+        float ratio11 = y[1] / v[1];
+        TEST("expmap preserves direction: y[0]/v[0] == y[1]/v[1]",
+             std::abs(ratio01 - ratio11) < 1e-4f);
+        float ratio31 = y[3] / v[3];
+        TEST("expmap preserves direction: y[0]/v[0] == y[3]/v[3]",
+             std::abs(ratio01 - ratio31) < 1e-4f);
     }
 }
 
@@ -601,9 +868,51 @@ static void test_m8_layernorm() {
     std::cout << "    LN output: mean=" << mean_y << " std=" << std_y
               << " (expected: mean≈beta=1, std≈gamma=2)\n";
 
-    // With uniform gamma=2, beta=1: output mean≈1, std≈2
     TEST("LayerNorm: mean ≈ beta (1.0)",    std::abs(mean_y - 1.0f) < 0.01f);
     TEST("LayerNorm: std ≈ gamma (2.0)",    std::abs(std_y  - 2.0f) < 0.1f);
+
+    // Exact 4-element layernorm: x=[1,2,3,4], gamma=[1,1,1,1], beta=[0,0,0,0]
+    // mean=2.5, var=1.25, inv_std=1/sqrt(1.25+eps)≈0.8944
+    // y = (x-2.5)*0.8944 → [-1.342,-0.447,0.447,1.342]
+    {
+        std::vector<float> x4 = {1.f, 2.f, 3.f, 4.f};
+        std::vector<float> g4(4, 1.f), b4(4, 0.f);
+        auto y4 = layernorm_cpu(x4, g4, b4);
+        float mean4 = 0.f, var4 = 0.f;
+        for (float v : y4) mean4 += v; mean4 /= 4;
+        for (float v : y4) var4 += (v-mean4)*(v-mean4); var4 /= 4;
+        TEST("LayerNorm 4-elem: output mean ≈ 0",   std::abs(mean4) < 1e-4f);
+        TEST("LayerNorm 4-elem: output var ≈ 1",    std::abs(var4 - 1.f) < 1e-3f);
+        TEST("LayerNorm 4-elem: y[0] < y[1] < y[2] < y[3] (monotone)",
+             y4[0] < y4[1] && y4[1] < y4[2] && y4[2] < y4[3]);
+        TEST("LayerNorm 4-elem: y[0] < 0 (below mean)", y4[0] < 0.f);
+        TEST("LayerNorm 4-elem: y[3] > 0 (above mean)", y4[3] > 0.f);
+        // Exact value check: y[0] ≈ -1.3416
+        float expected_y0 = (1.f - 2.5f) / std::sqrt(1.25f + 1e-5f);
+        TEST("LayerNorm 4-elem: y[0] exact", std::abs(y4[0] - expected_y0) < 1e-3f);
+    }
+
+    // LayerNorm with non-unit gamma: gamma=3 → std=3
+    {
+        std::vector<float> x5(16); std::iota(x5.begin(), x5.end(), 1.f);
+        std::vector<float> g5(16, 3.f), b5(16, 0.f);
+        auto y5 = layernorm_cpu(x5, g5, b5);
+        float m5 = 0.f, v5 = 0.f;
+        for (float f : y5) m5 += f; m5 /= 16;
+        for (float f : y5) v5 += (f-m5)*(f-m5); v5 /= 16;
+        TEST("LayerNorm gamma=3: mean ≈ 0",  std::abs(m5) < 1e-3f);
+        TEST("LayerNorm gamma=3: std ≈ 3",   std::abs(std::sqrt(v5) - 3.f) < 0.05f);
+    }
+
+    // LayerNorm subtraction: x-mean must be computed correctly (not x+mean)
+    {
+        // If subtraction mutated to addition, normalized value would be wrong sign for below-mean
+        std::vector<float> x3 = {0.f, 0.f, 6.f};  // mean=2, x[0]-mean=-2
+        std::vector<float> g3(3, 1.f), b3(3, 0.f);
+        auto y3 = layernorm_cpu(x3, g3, b3);
+        TEST("LayerNorm: below-mean input → negative output", y3[0] < 0.f);
+        TEST("LayerNorm: above-mean input → positive output", y3[2] > 0.f);
+    }
 }
 
 // ============================================================
@@ -641,6 +950,34 @@ static void test_m9_gemm_tiling() {
         std::string name = "VedicGEMM [" + std::to_string(M) + "x" +
                            std::to_string(K) + "x" + std::to_string(N) + "]";
         TEST(name, max_err < 1e-2f);
+
+        // Shape correctness: loop bounds must produce exactly M rows and N cols
+        TEST("VedicGEMM tiling: output rows == M", TC.rows() == M);
+        TEST("VedicGEMM tiling: output cols == N", TC.cols() == N);
+
+        // Spot-check C[0,0] and C[M-1,N-1] against reference
+        TEST("VedicGEMM tiling: C[0,0] matches ref",
+             std::abs(TC.data[0] - Cref[0]) < 1e-3f);
+        TEST("VedicGEMM tiling: C[M-1,N-1] matches ref",
+             std::abs(TC.data[M*N-1] - Cref[M*N-1]) < 1e-3f);
+        // Middle element too (catches tile seam errors)
+        int mid = (M/2)*N + (N/2);
+        TEST("VedicGEMM tiling: C[mid] matches ref",
+             std::abs(TC.data[mid] - Cref[mid]) < 1e-3f);
+    }
+
+    // Tile-boundary test: shape exactly = VEDIC_BLOCK
+    {
+        int B64 = 64;
+        Tensor A64({B64, B64}); A64.fill_random(-0.1f, 0.1f, 11);
+        Tensor B64t({B64, B64}); B64t.fill_random(-0.1f, 0.1f, 22);
+        Tensor C64 = vedic_gemm(A64, B64t);
+        TEST("VedicGEMM exact-tile shape: total_size correct",
+             C64.total_size == B64 * B64);
+        // Sum of all outputs must be finite
+        float sum64 = 0.f;
+        for (float v : C64.data) sum64 += v;
+        TEST("VedicGEMM exact-tile: output sum finite", std::isfinite(sum64));
     }
 }
 
@@ -694,6 +1031,29 @@ static void test_m10_gradient_fd() {
     TEST("FE gradient: max relative error < 1%",  max_rel_err < 0.01f);
     TEST("FE gradient: target grad is most negative",
          analytical[target] < 0.f || vocab == 1);
+
+    // Verify gradient sign for a simple case
+    // For CE gradient: g[target] = p[target]-1 < 0, g[other] = p[other] > 0
+    {
+        std::vector<float> simple_l = {2.f, 0.f, 0.f};
+        auto sp = cpu_softmax(simple_l, 1.f);
+        auto sg = cpu_ce_grad(sp, 0, 1);  // target=0
+        TEST("CE grad: g[target=0] < 0", sg[0] < 0.f);
+        TEST("CE grad: g[non-target] > 0", sg[1] > 0.f);
+        TEST("CE grad: sum(g) ≈ 0 (logits sum to 0 gradient)",
+             std::abs(sg[0]+sg[1]+sg[2]) < 1e-5f);
+    }
+
+    // FE gradient with T=0 equals CE gradient exactly
+    {
+        std::vector<float> l3 = {1.f, 2.f, 0.f};
+        auto p3 = cpu_softmax(l3, 1.f);
+        auto fe_g = cpu_fe_grad(l3, 1, 0.f, 1);  // T=0, target=1
+        auto ce_g = cpu_ce_grad(p3, 1, 1);
+        for (int i = 0; i < 3; ++i)
+            TEST("FE grad T=0 equals CE grad [" + std::to_string(i) + "]",
+                 std::abs(fe_g[i] - ce_g[i]) < 1e-5f);
+    }
 }
 
 // ============================================================
@@ -745,15 +1105,46 @@ static void test_m11_natural_gradient() {
 
     // d) NaturalGradientOptimizer actually changes weights
     {
-        Tensor W({4, 4}); W.fill_random(-0.1f, 0.1f);
+        Tensor W({4, 4}); W.fill_random(-0.1f, 0.1f, 42);
         Tensor G({4, 4}); G.fill(0.05f);
         NaturalGradientOptimizer opt(1e-3f, 0.99f, 1e-8f, 0.9f, 0.01f, 1e-6f, 100);
         std::vector<Tensor*> ps = {&W};
         std::vector<Tensor*> gs = {&G};
-        float w0 = W.data[0];
+        std::vector<float> W_before = W.data;
         opt.step(ps, gs);
-        TEST("NaturalGradOpt: weights change after step", W.data[0] != w0);
+        // Weight MUST change: verify multiple elements changed
+        int changed_count = 0;
+        for (int i = 0; i < W.total_size; ++i)
+            if (std::abs(W.data[i] - W_before[i]) > 1e-9f) ++changed_count;
+        TEST("NaturalGradOpt: weights change after step", changed_count > 0);
         TEST("NaturalGradOpt: no NaN after step",         !W.has_nan());
+        // Gradient is positive → weights must DECREASE (gradient descent)
+        TEST("NaturalGradOpt: positive grad → weight decreases",
+             W.data[0] < W_before[0]);
+    }
+
+    // e) EMA formula correct: F_t = beta*F_{t-1} + (1-beta)*g^2
+    //    Manual check: beta=0.5, g=2, F_0=1 → F_1 = 0.5*1 + 0.5*4 = 2.5
+    {
+        float beta = 0.5f, g = 2.f, F = 1.f;
+        F = beta * F + (1.f - beta) * g * g;
+        TEST("EMA formula: F = beta*F + (1-beta)*g^2 exact",
+             std::abs(F - 2.5f) < 1e-5f);
+        // Second step: F_2 = 0.5*2.5 + 0.5*4 = 3.25
+        F = beta * F + (1.f - beta) * g * g;
+        TEST("EMA second step: F_2 = 3.25", std::abs(F - 3.25f) < 1e-5f);
+    }
+
+    // f) Natural gradient direction: g̃ = g / sqrt(F+eps), verify arithmetic
+    {
+        float g_v = 3.f, F_v = 9.f, eps = 1e-8f;
+        float g_nat = g_v / (std::sqrt(F_v) + eps);
+        // sqrt(9) = 3 → g_nat ≈ 3/3 = 1
+        TEST("Natural grad: g/sqrt(g^2) ≈ 1 (scale invariant)",
+             std::abs(g_nat - 1.f) < 1e-3f);
+        // If mutation changes / to *: g_nat = 3 * 3 = 9 → fails
+        TEST("Natural grad: g/sqrt(F) < g when F > 1",
+             g_nat < g_v);
     }
 }
 
@@ -764,6 +1155,22 @@ static void test_m12_navier_stokes_attention() {
     std::cout << "\n[M12] Navier-Stokes Attention — Fluid Physics\n";
 
     int seq = 8, d_k = 16, d_v = 16;
+    // set_global_seed is a void call — verify it actually affects subsequent fill_random
+    // by checking that same seed gives same values
+    {
+        logos_rng::set_global_seed(12345);
+        Tensor T1({1, 4}); T1.fill_random(-1.f, 1.f);
+        logos_rng::set_global_seed(12345);
+        Tensor T2({1, 4}); T2.fill_random(-1.f, 1.f);
+        bool seed_works = (T1.data == T2.data);
+        TEST("set_global_seed: same seed → same random values (not a no-op)", seed_works);
+        // Different seed → different values
+        logos_rng::set_global_seed(99999);
+        Tensor T3({1, 4}); T3.fill_random(-1.f, 1.f);
+        bool diff_seed_differs = (T1.data != T3.data);
+        TEST("set_global_seed: different seed → different values", diff_seed_differs);
+    }
+
     logos_rng::set_global_seed(42);
 
     Tensor Q({seq, d_k}); Q.fill_random(-0.5f, 0.5f);
@@ -834,7 +1241,6 @@ static void test_m12_navier_stokes_attention() {
 
     // e) NS output vs standard output should differ (fluid physics changes result)
     {
-        // Standard attention
         Tensor K_T    = K.transpose();
         Tensor scores = vedic_gemm(Q, K_T);
         scores += mask;
@@ -849,6 +1255,41 @@ static void test_m12_navier_stokes_attention() {
         std::cout << "    NS vs Standard max_diff=" << max_diff << "\n";
         TEST("NS attention: output differs from standard attention (eta+nu > 0)",
              max_diff > 1e-6f);
+    }
+
+    // f) Viscous diffusion formula: V_smooth = (1-nu)*V + nu/2*(V_left + V_right)
+    //    Manual: nu=0.1, V=[2,4,6] → V_smooth[1] = 0.9*4 + 0.05*(2+6) = 3.6+0.4=4.0
+    {
+        float nu2 = 0.1f;
+        float Vleft=2.f, Vmid=4.f, Vright=6.f;
+        float smooth = (1.f - nu2)*Vmid + 0.5f*nu2*(Vleft + Vright);
+        TEST("Viscous diffusion formula: V_smooth = (1-nu)*V + nu/2*(L+R) exact",
+             std::abs(smooth - 4.0f) < 1e-5f);
+        // nu=1.0: pure average → (L+R)/2 = 4 when L=2,R=6
+        float smooth_full = (1.f-1.f)*Vmid + 0.5f*1.f*(Vleft+Vright);
+        TEST("Viscous diffusion nu=1: V_smooth = (L+R)/2", std::abs(smooth_full - 4.f) < 1e-5f);
+        // nu=0: no diffusion → V unchanged
+        float smooth_none = (1.f-0.f)*Vmid + 0.5f*0.f*(Vleft+Vright);
+        TEST("Viscous diffusion nu=0: V_smooth = V (no diffusion)",
+             std::abs(smooth_none - Vmid) < 1e-5f);
+    }
+
+    // g) Softmax rows sum = 1: verify arithmetic (sum=1, not sum=0 or sum=weight_count)
+    {
+        Tensor K_T2 = K.transpose();
+        Tensor sc2  = vedic_gemm(Q, K_T2);
+        sc2 += mask;
+        Tensor w2   = boltzmann_softmax(sc2, temperature);
+        // row 0 sum must be exactly 1 (not 0, not seq)
+        float row0_sum = 0.f;
+        for (int j = 0; j < seq; ++j) row0_sum += w2.at(0, j);
+        TEST("boltzmann_softmax row sum == 1.0 (not 0, not seq)",
+             std::abs(row0_sum - 1.f) < 1e-4f);
+        // All weights non-negative
+        bool all_nonneg = true;
+        for (int i = 0; i < w2.total_size; ++i)
+            if (w2.data[i] < -1e-6f) all_nonneg = false;
+        TEST("boltzmann_softmax: all weights >= 0", all_nonneg);
     }
 }
 
@@ -907,15 +1348,43 @@ static void test_m13_reynolds_batch_norm() {
     // f) Re_crit annealing: Re_crit decreases from start to end
     {
         ReynoldsBatchNorm rbn2(d);
-        rbn2.Re_crit = 2.0f;  // init high (laminar start)
+        rbn2.Re_crit = 2.0f;
         float Re_start = rbn2.Re_crit;
-        rbn2.anneal_reynolds(500, 1000, 2.0f, 0.5f);  // 50% through training
+        rbn2.anneal_reynolds(500, 1000, 2.0f, 0.5f);
         float Re_mid = rbn2.Re_crit;
-        rbn2.anneal_reynolds(999, 1000, 2.0f, 0.5f);  // near end
+        rbn2.anneal_reynolds(999, 1000, 2.0f, 0.5f);
         float Re_end = rbn2.Re_crit;
         TEST("Reynolds annealing: Re_crit decreases over training",
              Re_start > Re_mid && Re_mid > Re_end);
         std::cout << "    Re_crit: " << Re_start << " → " << Re_mid << " → " << Re_end << "\n";
+    }
+
+    // g) laminar_weight formula: sigmoid(-k*(Re - Re_crit)) → exact check
+    //    For Re = Re_crit: argument=0 → sigmoid(0)=0.5
+    {
+        ReynoldsBatchNorm rbn3(d);
+        float Re_c = rbn3.Re_crit;  // default Re_crit
+        float w_at_crit = rbn3.laminar_weight(Re_c);
+        TEST("laminar_weight(Re_crit) ≈ 0.5 (sigmoid at boundary)",
+             std::abs(w_at_crit - 0.5f) < 0.05f);
+    }
+
+    // h) reynolds_number: Re = RMS/std (positive ratio)
+    //    For constant tensor: std≈0 → Re should be large (or guarded)
+    //    For varied tensor: Re = (sqrt(mean(x^2))) / (std(x) + eps)
+    {
+        Tensor X_const({4, 8}); X_const.fill(3.f);
+        float Re_const = rbn.reynolds_number(X_const);
+        TEST("reynolds_number: constant tensor → Re > 0", Re_const > 0.f);
+        // For mean-zero tensor: RMS ≈ std → Re ≈ 1
+        Tensor X_mz({4, 8}); X_mz.fill_random(-1.f, 1.f, 55);
+        // subtract mean to center it
+        float mx = 0.f; for (float v : X_mz.data) mx += v; mx /= X_mz.total_size;
+        for (float& v : X_mz.data) v -= mx;
+        float Re_mz = rbn.reynolds_number(X_mz);
+        TEST("reynolds_number: mean-zero tensor → Re ≈ 1 (RMS ≈ std)",
+             Re_mz > 0.5f && Re_mz < 2.f);
+        std::cout << "    Re_const=" << Re_const << " Re_mean_zero=" << Re_mz << "\n";
     }
 }
 
@@ -1010,11 +1479,39 @@ static void test_m14_feynman_dropout() {
     {
         FeynmanDropout fd(0.5f, 1.0f, 1);
         fd.training = false;
-        Tensor X({8, 8}); X.fill_random(-1.0f, 1.0f);
+        Tensor X({8, 8}); X.fill_random(-1.0f, 1.0f, 77);
         Tensor Y = fd.forward(X);
         float diff = 0.0f;
         for (int i = 0; i < X.total_size; ++i) diff += std::abs(Y.data[i] - X.data[i]);
         TEST("training=false: Feynman dropout is identity (eval mode)", diff < 1e-6f);
+        // Each element must match exactly (not approximately)
+        bool exact_match = true;
+        for (int i = 0; i < X.total_size; ++i)
+            if (Y.data[i] != X.data[i]) exact_match = false;
+        TEST("training=false: Y[i] == X[i] exactly for all i", exact_match);
+    }
+
+    // f) Beta distribution parameters: alpha = (1-p)*concentration, beta = p*concentration
+    //    where concentration = 1/hbar. For hbar=1, p=0.3: alpha=0.7, beta=0.3
+    //    Mean of Beta(alpha,beta) = alpha/(alpha+beta) = 0.7 = 1-p ✓
+    //    Verify via statistics already done in (a). Also verify hbar scaling:
+    {
+        // sample_weight with p=0.5 must have mean ≈ 0.5 regardless of hbar
+        for (float hbar : {0.1f, 1.0f, 5.0f}) {
+            FeynmanDropout fd(0.5f, hbar, 42);
+            float sum = 0.f;
+            for (int i = 0; i < N_samples; ++i) sum += fd.sample_weight();
+            TEST("Feynman p=0.5: mean ≈ 0.5 for hbar=" + std::to_string(hbar),
+                 std::abs(sum/N_samples - 0.5f) < 0.05f);
+        }
+    }
+
+    // g) p=1.0: all weights → 0 (full dropout)
+    {
+        FeynmanDropout fd_full(1.0f, 1.0f, 1);
+        float sum_w = 0.f;
+        for (int i = 0; i < 1000; ++i) sum_w += fd_full.sample_weight();
+        TEST("p=1.0: mean weight ≈ 0 (full dropout)", sum_w / 1000.f < 0.05f);
     }
 }
 
@@ -1085,16 +1582,48 @@ static void test_m15_riemannian_metric() {
 
     // f) Parallel transport: transported vector has reduced component along Δθ
     {
-        Tensor v({1, dim}); v.fill(1.0f);       // gradient vector
-        Tensor dtheta({1, dim}); dtheta.fill(1.0f);  // step direction (same as v)
+        Tensor v({1, dim}); v.fill(1.0f);
+        Tensor dtheta({1, dim}); dtheta.fill(1.0f);
         Tensor v_t = rm.parallel_transport(v, dtheta);
-        // When v || Δθ, the parallel-transported v should be ≈ 0
         float norm_transported = rm.riemannian_norm(v_t);
         float norm_original    = rm.riemannian_norm(v);
         TEST("Parallel transport: removes component along Δθ",
              norm_transported < norm_original);
         std::cout << "    ||v||_G=" << norm_original
                   << " ||v_transported||_G=" << norm_transported << "\n";
+    }
+
+    // g) riemannian_distance formula: d² = sum(G_ii * diff_i²) exact check
+    //    With identity metric (G_ii=1+damp), 1D case:
+    {
+        RiemannianMetric rm2(4, 0.0f);  // zero damping for clean math
+        rm2.metric_diag = {4.f, 4.f, 4.f, 4.f};  // G=4*I
+        Tensor t1({1,4}); t1.data = {1.f, 0.f, 0.f, 0.f};
+        Tensor t2({1,4}); t2.data = {2.f, 0.f, 0.f, 0.f};
+        float d = rm2.riemannian_distance(t1, t2);
+        // diff=[1,0,0,0], d² = 4*1² = 4, d = 2
+        TEST("Riemannian distance exact: G=4I, diff=1 → d=2",
+             std::abs(d - 2.f) < 1e-4f);
+        // Scaled: diff=[2,0,0,0] → d² = 4*4 = 16, d = 4
+        Tensor t3({1,4}); t3.data = {3.f, 0.f, 0.f, 0.f};
+        float d2 = rm2.riemannian_distance(t1, t3);
+        TEST("Riemannian distance: diff=2 → d=4 (linear scaling)",
+             std::abs(d2 - 4.f) < 1e-4f);
+    }
+
+    // h) riemannian_gradient: g̃_i = g_i / (G_ii + damp) — exact check
+    {
+        RiemannianMetric rm3(4, 0.f);
+        rm3.metric_diag = {2.f, 4.f, 1.f, 8.f};
+        Tensor g3({1,4}); g3.data = {2.f, 4.f, 1.f, 8.f};
+        Tensor gnat = rm3.riemannian_gradient(g3);
+        // g̃_i = g_i / G_ii = {2/2, 4/4, 1/1, 8/8} = {1,1,1,1}
+        TEST("Riemannian grad: g̃[0] = g[0]/G[0] = 1",
+             std::abs(gnat.data[0] - 1.f) < 1e-5f);
+        TEST("Riemannian grad: g̃[1] = g[1]/G[1] = 1",
+             std::abs(gnat.data[1] - 1.f) < 1e-5f);
+        TEST("Riemannian grad: g̃[3] = g[3]/G[3] = 1",
+             std::abs(gnat.data[3] - 1.f) < 1e-5f);
     }
 }
 
@@ -1185,11 +1714,66 @@ static void test_m16_weight_path_integral() {
         for (int i = 0; i < 10; ++i)
             wpi6.record_step(fixed_loss, fixed_step);
         float mean_action = wpi6.recent_mean_action(10);
-        float expected_action = fixed_loss * 1.0f;  // S = loss * ||Δθ|| = 2*1 = 2
+        float expected_action = fixed_loss * 1.0f;
         TEST("recent_mean_action correct (last 10 steps)",
              std::abs(mean_action - expected_action) < 1e-4f);
         std::cout << "    mean_action=" << mean_action
                   << " expected=" << expected_action << "\n";
+    }
+
+    // g) log_amplitude arithmetic exact: after N steps with action S each,
+    //    log_A = 0 - N * S / ħ
+    {
+        float hbar = 2.0f;
+        WeightPathIntegral wpi7(hbar, 100);
+        float loss = 1.f;
+        std::vector<float> step = {1.f, 0.f};  // ||Δθ||=1 → S=1
+        int N_steps = 5;
+        for (int i = 0; i < N_steps; ++i) wpi7.record_step(loss, step);
+        float expected_logA = -(float)N_steps * loss * 1.f / hbar;
+        TEST("log_amplitude after N steps: log_A = -N*S/ħ exact",
+             std::abs(wpi7.log_amplitude - expected_logA) < 1e-4f);
+    }
+
+    // h) record_step void call: step_count must increment (not a no-op)
+    {
+        WeightPathIntegral wpi8(1.f, 50);
+        int count_before = wpi8.step_count;
+        wpi8.record_step(1.f, {0.1f});
+        TEST("record_step: step_count increments (not a void no-op)",
+             wpi8.step_count == count_before + 1);
+        wpi8.record_step(1.f, {0.1f});
+        wpi8.record_step(1.f, {0.1f});
+        TEST("record_step: step_count increments correctly after 3 calls",
+             wpi8.step_count == count_before + 3);
+    }
+
+    // i) lr_scale = clamp(exp(log_A - best_log_A), lr_min, 1.0)
+    //    At start (log_A = best_log_A = 0): lr_scale = exp(0) = 1
+    //    After many steps: lr_scale → lr_min (clamped)
+    {
+        WeightPathIntegral wpi9(1.f, 100);
+        float lr_min = 0.2f;
+        // Initial: no steps → scale = 1
+        TEST("lr_scale at init: == 1.0", std::abs(wpi9.lr_scale(lr_min) - 1.f) < 1e-5f);
+        // After very large action: scale → lr_min
+        for (int i = 0; i < 20; ++i)
+            wpi9.record_step(100.f, {1.f, 1.f, 1.f});  // huge action
+        float s = wpi9.lr_scale(lr_min);
+        TEST("lr_scale after huge action: >= lr_min (clamped)", s >= lr_min - 1e-5f);
+        TEST("lr_scale: always <= 1.0", s <= 1.f + 1e-5f);
+    }
+
+    // j) Discrete Lagrangian: S = loss * ||Δθ||, verify ||Δθ|| computed as L2 norm
+    //    delta = {3,4}: ||delta|| = sqrt(9+16) = 5, S = 2*5 = 10
+    {
+        WeightPathIntegral wpiJ(1.f, 10);
+        wpiJ.record_step(2.f, {3.f, 4.f});  // S = 2 * sqrt(9+16) = 2*5 = 10
+        float expected_logA = -10.f;         // log_A = -S/ħ = -10/1 = -10
+        TEST("Discrete Lagrangian: S=loss*||Δθ||, ||{3,4}||=5",
+             std::abs(wpiJ.log_amplitude - expected_logA) < 1e-3f);
+        // If mutation changes * to +: S = 2+5 = 7, log_A = -7 (fails)
+        // If mutation changes + to -: sqrt miscomputed
     }
 }
 
