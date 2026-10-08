@@ -447,15 +447,49 @@ else()
     )
     logos_set_cpu_test_options(test_large_data_scale)
 
-    enable_testing()
-    add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
-    add_test(NAME "T2b_Checkpoint"      COMMAND test_checkpoint)
-    add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
-    set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
-    set_tests_properties("T2b_Checkpoint"      PROPERTIES TIMEOUT 60)
-    set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
+    # ── RapidCheck — CPU-only mode mein bhi support ──────────
+    # cmake -DLOGOS_RAPIDCHECK=ON ..
+    # cmake --build build_rc --target test_rapidcheck
+    option(LOGOS_RAPIDCHECK "Enable RapidCheck C++ property-based tests" OFF)
+    if(LOGOS_RAPIDCHECK)
+        find_package(rapidcheck QUIET)
+        if(NOT rapidcheck_FOUND)
+            include(FetchContent)
+            FetchContent_Declare(
+                rapidcheck
+                GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
+                GIT_TAG        master
+            )
+            FetchContent_MakeAvailable(rapidcheck)
+        endif()
 
-    message(STATUS "CPU-only tests: T2_Math_Unit, T2b_Checkpoint, T4_Large_Data_Scale")
+        add_executable(test_rapidcheck
+            tests/test_rapidcheck.cpp
+            src/VedicGEMM.cpp
+            src/Checkpoint.cpp
+        )
+        target_include_directories(test_rapidcheck PRIVATE include tests)
+        logos_set_cpu_test_options(test_rapidcheck)
+        target_link_libraries(test_rapidcheck PRIVATE rapidcheck)
+
+        enable_testing()
+        add_test(NAME "T7_RapidCheck" COMMAND test_rapidcheck)
+        set_tests_properties("T7_RapidCheck" PROPERTIES TIMEOUT 300 LABELS "PROPERTY")
+        message(STATUS "✅ RapidCheck ENABLED (CPU-only mode) — target: test_rapidcheck")
+        message(STATUS "   Run: cmake --build build_rc --target test_rapidcheck")
+    else()
+        enable_testing()
+        add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
+        add_test(NAME "T2b_Checkpoint"      COMMAND test_checkpoint)
+        add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
+        set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
+        set_tests_properties("T2b_Checkpoint"      PROPERTIES TIMEOUT 60)
+        set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
+    endif()
+
+    if(NOT LOGOS_RAPIDCHECK)
+        message(STATUS "CPU-only tests: T2_Math_Unit, T2b_Checkpoint, T4_Large_Data_Scale")
+    endif()
 endif()
 
 install(TARGETS logos DESTINATION bin)
@@ -624,6 +658,24 @@ if(LOGOS_MUTATION_TEST)
     target_link_libraries(mull_math_unit PRIVATE stdc++fs stdc++)
 
     # ── Mutation target: test_checkpoint (T2b roundtrip) ────────
+    # GCC-14 ABI FIX: std::filesystem::directory_iterator ke internals
+    # (std::__shared_ptr<_Dir>::operator bool) GCC-14 mein fully inline ho gaye.
+    # Clang-15 + GCC-14 headers = undefined reference at link time.
+    # Solution: GCC-12 ka libstdc++.a statically link karo taaki symbol present ho.
+    #
+    # Find GCC-12 libstdc++.a path
+    if(_GCC12_TOOLCHAIN)
+        # GCC-12 multilib dir dhundho
+        execute_process(
+            COMMAND ${GCC12_EXE} -print-file-name=libstdc++.a
+            OUTPUT_VARIABLE _GCC12_LIBSTDCXX_A OUTPUT_STRIP_TRAILING_WHITESPACE)
+        execute_process(
+            COMMAND ${GCC12_EXE} -print-file-name=libstdc++fs.a
+            OUTPUT_VARIABLE _GCC12_LIBSTDCXXFS_A OUTPUT_STRIP_TRAILING_WHITESPACE)
+        message(STATUS "[MULL] GCC-12 libstdc++.a   : ${_GCC12_LIBSTDCXX_A}")
+        message(STATUS "[MULL] GCC-12 libstdc++fs.a : ${_GCC12_LIBSTDCXXFS_A}")
+    endif()
+
     add_executable(mull_checkpoint
         tests/test_checkpoint.cpp
         src/Checkpoint.cpp
@@ -643,14 +695,23 @@ if(LOGOS_MUTATION_TEST)
     )
     target_link_options(mull_checkpoint PRIVATE
         -fprofile-instr-generate
-        # clang-15 + GCC-14 ABI mismatch fix:
-        # std::__shared_ptr<_Dir>::operator bool() GCC-14 mein inline ho gaya.
-        # GCC-12 toolchain force karo taaki yeh symbol available ho.
         -Wl,--no-as-needed
         ${MULL_GCC_TOOLCHAIN_FLAG}        # link time bhi GCC-12 toolchain
     )
-    # stdc++fs pehle (filesystem), phir stdc++ (base runtime) — order matters.
-    target_link_libraries(mull_checkpoint PRIVATE stdc++fs stdc++)
+    # GCC-14 ABI fix: GCC-12 ke static archives directly link karo.
+    # stdc++fs pehle (filesystem symbols), phir stdc++ (base runtime) — order critical hai.
+    # Agar GCC-12 archives mile toh unhe use karo, warna dynamic fallback.
+    if(EXISTS "${_GCC12_LIBSTDCXXFS_A}" AND EXISTS "${_GCC12_LIBSTDCXX_A}")
+        target_link_libraries(mull_checkpoint PRIVATE
+            ${_GCC12_LIBSTDCXXFS_A}
+            ${_GCC12_LIBSTDCXX_A}
+        )
+        message(STATUS "[MULL] mull_checkpoint: GCC-12 static libstdc++fs + libstdc++ linked")
+    else()
+        # Fallback: dynamic linking (GCC-12 toolchain flag se sahi version milna chahiye)
+        target_link_libraries(mull_checkpoint PRIVATE stdc++fs stdc++)
+        message(STATUS "[MULL] mull_checkpoint: dynamic stdc++fs + stdc++ (GCC-12 archive not found)")
+    endif()
 
     # ── MULL config file ────────────────────────────────────────
     # mull.yml: kaunse operators chalein, kaunsi files mutate hon,

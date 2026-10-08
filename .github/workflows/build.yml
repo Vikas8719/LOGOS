@@ -398,6 +398,10 @@ jobs:
           cmake --build build_rc \
             --target test_rapidcheck \
             --parallel $(nproc)
+        env:
+          # Agar build mein CUDA nahi hai toh bhi test_rapidcheck target hona chahiye
+          # (CPU-only branch mein LOGOS_RAPIDCHECK=ON se yeh target define hota hai)
+          NINJA_STATUS: "[%f/%t] "
 
       - name: Run RapidCheck property tests (T7)
         id: rc_run
@@ -516,6 +520,13 @@ jobs:
           # Verify karo ki GCC-12 wahan hai
           ls /usr/bin/g++-12
           ls /usr/lib/gcc/x86_64-linux-gnu/12/crtbeginS.o
+
+          # GCC-12 static archive paths verify karo (mull_checkpoint ke liye critical)
+          GCC12_LIBDIR=$(g++-12 -print-file-name=libstdc++.a | xargs dirname)
+          echo "GCC-12 libdir: ${GCC12_LIBDIR}"
+          echo "libstdc++.a  : $(g++-12 -print-file-name=libstdc++.a)"
+          echo "libstdc++fs.a: $(g++-12 -print-file-name=libstdc++fs.a)"
+
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=clang++ \
