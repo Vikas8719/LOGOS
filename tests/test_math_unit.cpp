@@ -289,10 +289,15 @@ static void test_m1_vedic_gemm() {
         Tensor W2({2,2}); W2.data = {1.f, 0.f, 0.f, 1.f};  // identity
         Tensor b({2});    b.data  = {3.f, 5.f};
         Tensor R = vedic_gemm_bias(A2, W2, b);
-        // R[0] = 1*1+0*0 + 3 = 4; R[1] = 1*0+0*1 + 5 = 5
+        // identity @ identity = identity = [[1,0],[0,1]]
+        // After bias[j] add per column:
+        // R[0,0] = 1 + bias[0] = 1+3 = 4
+        // R[0,1] = 0 + bias[1] = 0+5 = 5
+        // R[1,0] = 0 + bias[0] = 0+3 = 3
+        // R[1,1] = 1 + bias[1] = 1+5 = 6
         TEST("vedic_gemm_bias: R[0,0] = 1+3 = 4", std::abs(R.at(0,0) - 4.f) < 1e-4f);
-        TEST("vedic_gemm_bias: R[0,1] = 1+5 = 6", std::abs(R.at(0,1) - 6.f) < 1e-4f);
-        TEST("vedic_gemm_bias: R[1,0] = 1+3 = 4", std::abs(R.at(1,0) - 4.f) < 1e-4f);
+        TEST("vedic_gemm_bias: R[0,1] = 0+5 = 5", std::abs(R.at(0,1) - 5.f) < 1e-4f);
+        TEST("vedic_gemm_bias: R[1,0] = 0+3 = 3", std::abs(R.at(1,0) - 3.f) < 1e-4f);
         TEST("vedic_gemm_bias: R[1,1] = 1+5 = 6", std::abs(R.at(1,1) - 6.f) < 1e-4f);
     }
 }
@@ -1107,7 +1112,9 @@ static void test_m11_natural_gradient() {
     {
         Tensor W({4, 4}); W.fill_random(-0.1f, 0.1f, 42);
         Tensor G({4, 4}); G.fill(0.05f);
-        NaturalGradientOptimizer opt(1e-3f, 0.99f, 1e-8f, 0.9f, 0.01f, 1e-6f, 100);
+        // T_start=0.0f → noise_scale=0 → deterministic gradient descent
+        // This ensures positive grad always decreases weight (no Langevin noise flip)
+        NaturalGradientOptimizer opt(1e-3f, 0.99f, 1e-8f, 0.9f, 0.0f, 0.0f, 100);
         std::vector<Tensor*> ps = {&W};
         std::vector<Tensor*> gs = {&G};
         std::vector<float> W_before = W.data;
@@ -1118,7 +1125,7 @@ static void test_m11_natural_gradient() {
             if (std::abs(W.data[i] - W_before[i]) > 1e-9f) ++changed_count;
         TEST("NaturalGradOpt: weights change after step", changed_count > 0);
         TEST("NaturalGradOpt: no NaN after step",         !W.has_nan());
-        // Gradient is positive → weights must DECREASE (gradient descent)
+        // Gradient is positive → weights must DECREASE (gradient descent, no noise)
         TEST("NaturalGradOpt: positive grad → weight decreases",
              W.data[0] < W_before[0]);
     }
