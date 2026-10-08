@@ -27,7 +27,7 @@
 //        RC_ASSERT(some_property(x, v));         // property check
 //    });
 //    Failure pe → automatically simplest failing case dhundta hai (shrinking)
-//    T7 config 250 successful cases per property run karta hai.
+//    T7 config 500 successful cases per property run karta hai.
 // ============================================================
 #include "../include/VedicGEMM.hpp"
 #include "../include/Tensor.hpp"
@@ -145,7 +145,7 @@ static void rc1_vedic_matches_reference() {
 //  Off-by-one tiling bugs sirf specific sizes pe dikhte hain
 // ═══════════════════════════════════════════════════════════════
 static void rc2_tiling_boundary() {
-    // Fixed boundary sizes — 250 generated matrices per boundary size.
+    // Fixed boundary sizes — 500 generated matrices per boundary size.
     const std::vector<int> boundary_sizes = {1, 63, 64, 65, 127, 128, 129, 192, 193};
 
     for (int sz : boundary_sizes) {

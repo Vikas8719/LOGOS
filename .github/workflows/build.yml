@@ -407,7 +407,7 @@ jobs:
       - name: Run RapidCheck property tests (T7)
         id: rc_run
         run: |
-          ./build_rc/test_rapidcheck 2>&1 | tee rc_output.log
+          RC_PARAMS="max_success=500" ./build_rc/test_rapidcheck 2>&1 | tee rc_output.log
           echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
 
       - name: RapidCheck Summary
@@ -582,6 +582,13 @@ jobs:
         run: |
           mkdir -p build/mull-report/math build/mull-report/math-run
 
+          echo "--- Collecting LLVM coverage for math tests ---"
+          LLVM_PROFILE_FILE="$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profraw" \
+            "$GITHUB_WORKSPACE/build/mull_math_unit" > /dev/null
+          llvm-profdata-15 merge -sparse \
+            "$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profraw" \
+            -o "$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profdata"
+
           echo "--- Running mull-runner on mull_math_unit ---"
           (
             cd build/mull-report/math-run
@@ -589,6 +596,7 @@ jobs:
             --workers 2 \
             --timeout 30000 \
             --report-dir "$GITHUB_WORKSPACE/build/mull-report/math" \
+            --coverage-info "$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profdata" \
             --ld-search-path "$GITHUB_WORKSPACE/build" \
             "$GITHUB_WORKSPACE/build/mull_math_unit" \
             2>&1 | tee "$GITHUB_WORKSPACE/build/mull-report/math/runner.log"
@@ -641,6 +649,13 @@ jobs:
         run: |
           mkdir -p build/mull-report/checkpoint build/mull-report/checkpoint-run
 
+          echo "--- Collecting LLVM coverage for checkpoint tests ---"
+          LLVM_PROFILE_FILE="$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profraw" \
+            "$GITHUB_WORKSPACE/build/mull_checkpoint" > /dev/null
+          llvm-profdata-15 merge -sparse \
+            "$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profraw" \
+            -o "$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profdata"
+
           echo "--- Running mull-runner on mull_checkpoint ---"
           (
             cd build/mull-report/checkpoint-run
@@ -648,6 +663,7 @@ jobs:
             --workers 2 \
             --timeout 30000 \
             --report-dir "$GITHUB_WORKSPACE/build/mull-report/checkpoint" \
+            --coverage-info "$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profdata" \
             --ld-search-path "$GITHUB_WORKSPACE/build" \
             "$GITHUB_WORKSPACE/build/mull_checkpoint" \
             2>&1 | tee "$GITHUB_WORKSPACE/build/mull-report/checkpoint/runner.log"

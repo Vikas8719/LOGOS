@@ -261,7 +261,7 @@ if(CMAKE_CUDA_COMPILER)
         set_tests_properties("T7_RapidCheck" PROPERTIES
             TIMEOUT 900
             LABELS "PROPERTY"
-            ENVIRONMENT "RC_PARAMS=max_success=250")
+            ENVIRONMENT "RC_PARAMS=max_success=500")
         message(STATUS "✅ RapidCheck ENABLED — target: test_rapidcheck")
         message(STATUS "   Run: cmake --build build --target test_rapidcheck")
         message(STATUS "   CTest: ctest -L PROPERTY --output-on-failure")
@@ -499,7 +499,7 @@ else()
         set_tests_properties("T7_RapidCheck" PROPERTIES
             TIMEOUT 900
             LABELS "PROPERTY"
-            ENVIRONMENT "RC_PARAMS=max_success=250")
+            ENVIRONMENT "RC_PARAMS=max_success=500")
         message(STATUS "✅ RapidCheck ENABLED (CPU-only mode) — target: test_rapidcheck")
         message(STATUS "   Run: cmake --build build_rc --target test_rapidcheck")
     else()
@@ -615,6 +615,15 @@ if(LOGOS_MUTATION_TEST)
             "         Manual:\n"
             "           https://github.com/mull-project/mull/releases\n"
             "       Ya MULL_PATH env var set karo.")
+    endif()
+
+    find_program(MULL_LLVM_PROFDATA_EXE
+        NAMES llvm-profdata-15 llvm-profdata-14 llvm-profdata-16 llvm-profdata
+        PATHS /usr/bin /usr/local/bin /opt/homebrew/bin)
+    if(NOT MULL_LLVM_PROFDATA_EXE)
+        message(FATAL_ERROR
+            "[MULL] llvm-profdata nahi mila. Raw .profraw coverage ko Mull-15 ke "
+            "compatible .profdata mein merge karne ke liye LLVM tools install karo.")
     endif()
 
     message(STATUS "✅ MULL found: ${MULL_RUNNER_EXE}")
@@ -774,6 +783,10 @@ if(LOGOS_MUTATION_TEST)
     set(MULL_REPORT_DIR  "${CMAKE_BINARY_DIR}/mull-report")
     set(MULL_MATH_RUN_DIR "${MULL_REPORT_DIR}/math-run")
     set(MULL_CHECKPOINT_RUN_DIR "${MULL_REPORT_DIR}/checkpoint-run")
+    set(MULL_MATH_PROFILE_RAW "${MULL_MATH_RUN_DIR}/coverage.profraw")
+    set(MULL_MATH_PROFILE_DATA "${MULL_MATH_RUN_DIR}/coverage.profdata")
+    set(MULL_CHECKPOINT_PROFILE_RAW "${MULL_CHECKPOINT_RUN_DIR}/coverage.profraw")
+    set(MULL_CHECKPOINT_PROFILE_DATA "${MULL_CHECKPOINT_RUN_DIR}/coverage.profdata")
 
     # Source files jo MULL mutate karega (sirf yeh files, test files nahi)
     # Relative to project source dir
@@ -837,23 +850,37 @@ excludePaths:
         # Step 1: report dir banao
         COMMAND ${CMAKE_COMMAND} -E make_directory "${MULL_REPORT_DIR}"
 
-        # Step 2: mull_math_unit pe mull-runner chalao (M1-M16 tests)
+        # Step 2: raw coverage ko LLVM profdata mein convert karo (Mull-15 raw nahi padhta)
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
+            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_MATH_PROFILE_RAW}"
+            "$<TARGET_FILE:mull_math_unit>"
+        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
+            "${MULL_MATH_PROFILE_RAW}" -o "${MULL_MATH_PROFILE_DATA}"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
+            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_CHECKPOINT_PROFILE_RAW}"
+            "$<TARGET_FILE:mull_checkpoint>"
+        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
+            "${MULL_CHECKPOINT_PROFILE_RAW}" -o "${MULL_CHECKPOINT_PROFILE_DATA}"
+
+        # Step 3: mull_math_unit pe mull-runner chalao (M1-M16 tests)
         COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
+            --coverage-info "${MULL_MATH_PROFILE_DATA}"
             --ld-search-path "${CMAKE_BINARY_DIR}"
             "$<TARGET_FILE:mull_math_unit>"
         COMMENT "[MULL 1/2] Mutation testing: test_math_unit (M1-M16)"
 
-        # Step 3: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
+        # Step 4: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
         COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
+            --coverage-info "${MULL_CHECKPOINT_PROFILE_DATA}"
             --ld-search-path "${CMAKE_BINARY_DIR}"
             "$<TARGET_FILE:mull_checkpoint>"
         COMMENT "[MULL 2/2] Mutation testing: test_checkpoint (T2b)"
 
-        # Step 4: summary print karo
+        # Step 5: summary print karo
         COMMAND ${CMAKE_COMMAND} -E echo ""
         COMMAND ${CMAKE_COMMAND} -E echo "══════════════════════════════════════════"
         COMMAND ${CMAKE_COMMAND} -E echo "  MULL Mutation Testing Complete"
@@ -871,10 +898,43 @@ excludePaths:
     # ctest -L MUTATION se chalega
     # Note: mull lamba chalta hai (sabhi mutants × tests) → timeout 1800s
     enable_testing()
+    add_test(NAME "T6_Coverage_Math"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
+            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_MATH_PROFILE_RAW}"
+            "$<TARGET_FILE:mull_math_unit>"
+    )
+    add_test(NAME "T6_Coverage_Math_Merge"
+        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
+            "${MULL_MATH_PROFILE_RAW}" -o "${MULL_MATH_PROFILE_DATA}"
+    )
+    set_tests_properties("T6_Coverage_Math" PROPERTIES
+        FIXTURES_SETUP MULL_MATH_PROFILE LABELS "MUTATION_SETUP")
+    set_tests_properties("T6_Coverage_Math_Merge" PROPERTIES
+        FIXTURES_REQUIRED MULL_MATH_PROFILE
+        FIXTURES_SETUP MULL_MATH_PROFILE_READY
+        LABELS "MUTATION_SETUP")
+
+    add_test(NAME "T6_Coverage_Checkpoint"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
+            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_CHECKPOINT_PROFILE_RAW}"
+            "$<TARGET_FILE:mull_checkpoint>"
+    )
+    add_test(NAME "T6_Coverage_Checkpoint_Merge"
+        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
+            "${MULL_CHECKPOINT_PROFILE_RAW}" -o "${MULL_CHECKPOINT_PROFILE_DATA}"
+    )
+    set_tests_properties("T6_Coverage_Checkpoint" PROPERTIES
+        FIXTURES_SETUP MULL_CHECKPOINT_PROFILE LABELS "MUTATION_SETUP")
+    set_tests_properties("T6_Coverage_Checkpoint_Merge" PROPERTIES
+        FIXTURES_REQUIRED MULL_CHECKPOINT_PROFILE
+        FIXTURES_SETUP MULL_CHECKPOINT_PROFILE_READY
+        LABELS "MUTATION_SETUP")
+
     add_test(NAME "T6_Mutation_Math"
         COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
+            --coverage-info "${MULL_MATH_PROFILE_DATA}"
             --ld-search-path "${CMAKE_BINARY_DIR}"
             "$<TARGET_FILE:mull_math_unit>"
     )
@@ -882,6 +942,7 @@ excludePaths:
         COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
+            --coverage-info "${MULL_CHECKPOINT_PROFILE_DATA}"
             --ld-search-path "${CMAKE_BINARY_DIR}"
             "$<TARGET_FILE:mull_checkpoint>"
     )
@@ -889,12 +950,14 @@ excludePaths:
         PROPERTIES
             TIMEOUT 1800
             LABELS "MUTATION"
+            FIXTURES_REQUIRED MULL_MATH_PROFILE_READY
             PASS_REGULAR_EXPRESSION "Mutation score: [89][0-9]\\.[0-9]+%|Mutation score: 100"
     )
     set_tests_properties("T6_Mutation_Checkpoint"
         PROPERTIES
             TIMEOUT 600
             LABELS "MUTATION"
+            FIXTURES_REQUIRED MULL_CHECKPOINT_PROFILE_READY
             PASS_REGULAR_EXPRESSION "Mutation score: [89][0-9]\\.[0-9]+%|Mutation score: 100"
     )
 
