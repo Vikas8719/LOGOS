@@ -781,17 +781,11 @@ mutators:
   - cxx_negate_mutator
   - cxx_remove_void_call
 
-timeout_per_test_ms: 10000
-jobs: 4
-include_paths:
+includePaths:
 __MULL_INCLUDE_PATHS__
-exclude_paths:
-  - \"${CMAKE_SOURCE_DIR}/tests/\"
-  - \"${CMAKE_SOURCE_DIR}/cuda/\"
-reporters:
-  - IDE
-  - HTML
-report_dir: \"${MULL_REPORT_DIR}\"
+excludePaths:
+  - \"${CMAKE_SOURCE_DIR}/tests/.*\"
+  - \"${CMAKE_SOURCE_DIR}/cuda/.*\"
 ")
     set(MULL_MATH_INCLUDE_PATHS "  - \"${CMAKE_SOURCE_DIR}/src/VedicGEMM.cpp\"
   - \"${CMAKE_SOURCE_DIR}/src/PhysicsTestDriver.cpp\"
@@ -820,16 +814,16 @@ report_dir: \"${MULL_REPORT_DIR}\"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${MULL_REPORT_DIR}"
 
         # Step 2: mull_math_unit pe mull-runner chalao (M1-M16 tests)
-        COMMAND ${MULL_RUNNER_EXE}
-            --config "${MULL_MATH_CONFIG_PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_MATH_CONFIG_PATH}"
+            ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
             --test-program "$<TARGET_FILE:mull_math_unit>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
         COMMENT "[MULL 1/2] Mutation testing: test_math_unit (M1-M16)"
 
         # Step 3: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
-        COMMAND ${MULL_RUNNER_EXE}
-            --config "${MULL_CHECKPOINT_CONFIG_PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_CHECKPOINT_CONFIG_PATH}"
+            ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
             --test-program "$<TARGET_FILE:mull_checkpoint>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
@@ -854,15 +848,15 @@ report_dir: \"${MULL_REPORT_DIR}\"
     # Note: mull lamba chalta hai (sabhi mutants × tests) → timeout 1800s
     enable_testing()
     add_test(NAME "T6_Mutation_Math"
-        COMMAND ${MULL_RUNNER_EXE}
-            --config "${MULL_MATH_CONFIG_PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_MATH_CONFIG_PATH}"
+            ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
             --test-program "$<TARGET_FILE:mull_math_unit>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
     )
     add_test(NAME "T6_Mutation_Checkpoint"
-        COMMAND ${MULL_RUNNER_EXE}
-            --config "${MULL_CHECKPOINT_CONFIG_PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_CHECKPOINT_CONFIG_PATH}"
+            ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
             --test-program "$<TARGET_FILE:mull_checkpoint>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
