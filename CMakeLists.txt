@@ -631,6 +631,29 @@ if(LOGOS_MUTATION_TEST)
         set(MULL_GCC_TOOLCHAIN_FLAG "")
     endif()
 
+    # ── MULL IR Frontend Plugin ─────────────────────────────────
+    # mull-runner binary mein mutations inject karne ke liye
+    # clang ko mull ka LLVM IR pass plugin load karna hota hai at compile time.
+    # Plugin path: /usr/lib/mull-15/libmull-ir-frontend-15.so (ya similar)
+    set(MULL_PASS_PLUGIN "" CACHE STRING "Path to mull IR frontend .so plugin")
+
+    if(MULL_PASS_PLUGIN AND EXISTS "${MULL_PASS_PLUGIN}")
+        message(STATUS "[MULL] IR frontend plugin: ${MULL_PASS_PLUGIN}")
+        set(MULL_PLUGIN_FLAGS
+            -fpass-plugin=${MULL_PASS_PLUGIN}
+            -g
+            -fdebug-info-for-profiling
+        )
+    else()
+        message(STATUS "[MULL] IR frontend plugin not found: '${MULL_PASS_PLUGIN}'")
+        message(STATUS "[MULL] Trying bitcode embed approach (-fembed-bitcode)")
+        # Fallback: bitcode embedding (older mull versions)
+        set(MULL_PLUGIN_FLAGS
+            -fembed-bitcode
+            -g
+        )
+    endif()
+
     add_executable(mull_math_unit
         tests/test_math_unit.cpp
         src/VedicGEMM.cpp
@@ -647,6 +670,7 @@ if(LOGOS_MUTATION_TEST)
         -femit-all-decls
         -fno-omit-frame-pointer
         -std=c++20
+        ${MULL_PLUGIN_FLAGS}
         # NOTE: -fexperimental-new-pass-manager clang-15 mein DEPRECATED hai
         # Hatane se LLVM new pass manager automatically enable hota hai (clang-15 default)
         # Yahi MULL ko mutation metadata embed karne deta hai
@@ -693,6 +717,7 @@ if(LOGOS_MUTATION_TEST)
         -femit-all-decls
         -fno-omit-frame-pointer
         -std=c++20
+        ${MULL_PLUGIN_FLAGS}
         # NOTE: -fexperimental-new-pass-manager clang-15 mein DEPRECATED hai — hata diya
         ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
     )

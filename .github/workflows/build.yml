@@ -508,30 +508,40 @@ jobs:
           mull-runner --version 2>&1 | head -1
 
 
+      - name: Find mull LLVM pass plugin
+        run: |
+          echo "=== mull pass plugin search ==="
+          find /usr /opt -name "libmull-ir-frontend*.so" 2>/dev/null || true
+          find /usr /opt -name "mull-ir-frontend*" 2>/dev/null || true
+          find /usr /opt -name "libmull*.so" 2>/dev/null || true
+          find /usr/lib/mull* /usr/local/lib/mull* 2>/dev/null || true
+          dpkg -L mull-15 2>/dev/null | grep -E "\.so$|plugin" || true
+          echo "=== clang-15 resource dir ==="
+          clang-15 -print-resource-dir
+
       - name: Configure (MULL + Debug + clang++ + GCC-12 sysroot)
         run: |
-          # clang++ ko GCC-12 ka sysroot explicitly batao.
-          # --gcc-toolchain ka matlab hai: clang GCC-12 ke installed prefix se
-          # headers aur runtime libraries dhundega.
-          # Ubuntu pe GCC-12 prefix hamesha /usr hota hai (bin/gcc-12, lib/gcc/... sab wahan hai).
-          # dirname chain se galat /usr/lib aa sakta hai — isliye hardcode /usr use karo.
           GCC12_PREFIX=/usr
           echo "GCC-12 prefix: ${GCC12_PREFIX}"
-          # Verify karo ki GCC-12 wahan hai
           ls /usr/bin/g++-12
           ls /usr/lib/gcc/x86_64-linux-gnu/12/crtbeginS.o
 
-          # GCC-12 static archive paths verify karo (mull_checkpoint ke liye critical)
           GCC12_LIBDIR=$(g++-12 -print-file-name=libstdc++.a | xargs dirname)
           echo "GCC-12 libdir: ${GCC12_LIBDIR}"
-          echo "libstdc++.a  : $(g++-12 -print-file-name=libstdc++.a)"
-          echo "libstdc++fs.a: $(g++-12 -print-file-name=libstdc++fs.a)"
+
+          # MULL_PASS: mull-15 ka IR frontend plugin dhundho
+          MULL_PASS=$(find /usr -name "libmull-ir-frontend*.so" 2>/dev/null | head -1)
+          if [ -z "$MULL_PASS" ]; then
+            MULL_PASS=$(dpkg -L mull-15 2>/dev/null | grep "\.so$" | head -1)
+          fi
+          echo "MULL pass plugin: ${MULL_PASS:-NOT FOUND}"
 
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DLOGOS_MUTATION_TEST=ON \
-            -DCMAKE_CXX_FLAGS="--gcc-toolchain=${GCC12_PREFIX}"
+            -DCMAKE_CXX_FLAGS="--gcc-toolchain=${GCC12_PREFIX}" \
+            -DMULL_PASS_PLUGIN="${MULL_PASS}"
 
       - name: Build mutation targets
         run: |
