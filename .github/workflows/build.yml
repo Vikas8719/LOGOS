@@ -253,12 +253,12 @@ jobs:
       - name: Prepare dataset
         run: |
           curl -L "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
-            --max-filesize 5242880 -o dataset_raw.txt --fail --silent --show-error \
-            && head -c 1048576 dataset_raw.txt > dataset.txt \
+            --max-filesize 524288 -o dataset_raw.txt --fail --silent --show-error \
+            && head -c 102400 dataset_raw.txt > dataset.txt \
             || python3 -c "
           import random; random.seed(42)
           w=['the','cat','sat','on','mat','a','dog','ran','fast','slow','big','small','red','blue','Once','upon','time','there','was','little','girl','named','Lily']
-          print('\n'.join([' '.join(random.choices(w,k=random.randint(10,30)))+'.' for _ in range(5000)]))" > dataset.txt
+          print('\n'.join([' '.join(random.choices(w,k=random.randint(10,30)))+'.' for _ in range(500)]))" > dataset.txt
           echo "Dataset: $(wc -c < dataset.txt) bytes"
 
       - name: Train

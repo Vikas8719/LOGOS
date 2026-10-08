@@ -548,7 +548,12 @@ if(LOGOS_MUTATION_TEST)
     )
     target_link_options(mull_math_unit PRIVATE
         -fprofile-instr-generate
+        # clang + GCC libstdc++ ABI mismatch fix (same as mull_checkpoint):
+        # --no-as-needed ensures libstdc++fs + libstdc++ fully linked.
+        -Wl,--no-as-needed
     )
+    # stdc++fs pehle, phir stdc++ (dependency order correct rakhna zaroori hai)
+    target_link_libraries(mull_math_unit PRIVATE stdc++fs stdc++)
 
     # ── Mutation target: test_checkpoint (T2b roundtrip) ────────
     add_executable(mull_checkpoint
@@ -569,7 +574,16 @@ if(LOGOS_MUTATION_TEST)
     )
     target_link_options(mull_checkpoint PRIVATE
         -fprofile-instr-generate
+        # clang + GCC libstdc++ ABI mismatch fix:
+        # directory_iterator::operator== aur recursive_directory_iterator::operator==
+        # ke liye std::__shared_ptr<_Dir>::operator bool() GCC libstdc++ se chahiye.
+        # --no-as-needed: linker silently skip na kare even if direct call na ho.
+        -Wl,--no-as-needed
     )
+    # clang + GCC libstdc++ mix pe std::filesystem explicitly link karna padta hai.
+    # Ordering matters: stdc++fs pehle (filesystem), phir stdc++ (base runtime).
+    # -Wl,--no-as-needed upar set hai taaki both libraries fully pulled in hon.
+    target_link_libraries(mull_checkpoint PRIVATE stdc++fs stdc++)
 
     # ── MULL config file ────────────────────────────────────────
     # mull.yml: kaunse operators chalein, kaunsi files mutate hon,
