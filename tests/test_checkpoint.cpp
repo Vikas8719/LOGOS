@@ -7,6 +7,8 @@
 #include <cmath>
 #include <vector>
 #include <cstdint>
+#include <algorithm>
+#include <sstream>
 
 int main() {
     ModelConfig cfg;
@@ -455,38 +457,59 @@ int main() {
     {
         const std::string bad_file = "logos_ckpt_invalid_config.bin";
         LOGOSModel target(cfg);
+        const auto load_rejects_with = [&](const ModelConfig& file_cfg,
+                                           const std::string& expected_error) {
+            {
+                std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
+                f.write(reinterpret_cast<const char*>(&file_cfg), sizeof(file_cfg));
+            }
+            std::ostringstream captured;
+            std::streambuf* previous = std::cerr.rdbuf(captured.rdbuf());
+            const bool loaded = load_checkpoint(target, bad_file);
+            std::cerr.rdbuf(previous);
+            return !loaded && captured.str().find(expected_error) != std::string::npos;
+        };
         {
             std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
             const int partial = 8;
             f.write(reinterpret_cast<const char*>(&partial), sizeof(partial));
         }
-        if (load_checkpoint(target, bad_file)) {
-            std::remove(bad_file.c_str());
-            std::cerr << "short checkpoint config was accepted\n";
-            return 1;
+        {
+            std::ostringstream captured;
+            std::streambuf* previous = std::cerr.rdbuf(captured.rdbuf());
+            const bool loaded = load_checkpoint(target, bad_file);
+            std::cerr.rdbuf(previous);
+            if (loaded || captured.str().find("truncated (can't read cfg)") == std::string::npos) {
+                std::remove(bad_file.c_str());
+                std::cerr << "short checkpoint config was not rejected at the header\n";
+                return 1;
+            }
         }
-
         ModelConfig invalid = cfg;
         invalid.d_model = 3; // not divisible by num_heads
-        {
-            std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
-            f.write(reinterpret_cast<const char*>(&invalid), sizeof(invalid));
-        }
-        if (load_checkpoint(target, bad_file)) {
+        if (!load_rejects_with(invalid, "not divisible by num_heads")) {
             std::remove(bad_file.c_str());
-            std::cerr << "invalid checkpoint dimensions were accepted\n";
+            std::cerr << "invalid checkpoint dimensions were not rejected by validation\n";
             return 1;
         }
 
         invalid = cfg;
         invalid.vocab_size = 100001; // above the supported bound
-        {
-            std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
-            f.write(reinterpret_cast<const char*>(&invalid), sizeof(invalid));
-        }
-        if (load_checkpoint(target, bad_file)) {
+        if (!load_rejects_with(invalid, "out of range")) {
             std::remove(bad_file.c_str());
-            std::cerr << "out-of-range checkpoint dimensions were accepted\n";
+            std::cerr << "out-of-range checkpoint dimensions were not rejected by validation\n";
+            return 1;
+        }
+
+        invalid = cfg;
+        invalid.vocab_size = 100000;
+        invalid.d_model = 8192;
+        invalid.num_heads = 256;
+        invalid.num_layers = 2;
+        invalid.max_seq_len = 1;
+        if (!load_rejects_with(invalid, "exceeds max")) {
+            std::remove(bad_file.c_str());
+            std::cerr << "oversized checkpoint dimensions were not rejected by validation\n";
             return 1;
         }
         std::remove(bad_file.c_str());
@@ -517,6 +540,109 @@ int main() {
             }
         }
         std::remove(mismatch_file.c_str());
+    }
+
+    // Strict loading supports older checkpoints that end before BN statistics.
+    // Seed the target stats with non-zero values so zero-initialisation is visible.
+    {
+        const std::string legacy_base = "logos_ckpt_legacy_stats";
+        const std::string legacy_file = legacy_base + "_step4.bin";
+        std::remove(legacy_file.c_str());
+        if (!save_checkpoint(source, legacy_base, 4)) {
+            std::cerr << "legacy stats fixture save failed\n";
+            return 1;
+        }
+        const size_t stats_bytes = static_cast<size_t>(cfg.num_layers) * 4 *
+                                   static_cast<size_t>(cfg.d_model) * sizeof(float);
+        const size_t full_size = std::filesystem::file_size(legacy_file);
+        std::filesystem::resize_file(legacy_file, full_size - stats_bytes);
+
+        LOGOSModel legacy_target(cfg);
+        for (auto& block : legacy_target.layers) {
+            std::fill(block.ln1.running_mean.begin(), block.ln1.running_mean.end(), 9.0f);
+            std::fill(block.ln1.running_var.begin(), block.ln1.running_var.end(), 9.0f);
+            std::fill(block.ln2.running_mean.begin(), block.ln2.running_mean.end(), 9.0f);
+            std::fill(block.ln2.running_var.begin(), block.ln2.running_var.end(), 9.0f);
+        }
+        if (!load_checkpoint(legacy_target, legacy_file)) {
+            std::remove(legacy_file.c_str());
+            std::cerr << "legacy checkpoint without BN stats failed to load\n";
+            return 1;
+        }
+        for (const auto& block : legacy_target.layers) {
+            const auto all_zero = [](const std::vector<float>& values) {
+                return std::all_of(values.begin(), values.end(),
+                                   [](float value) { return value == 0.0f; });
+            };
+            if (!block.ln1.initialized || !block.ln2.initialized ||
+                !all_zero(block.ln1.running_mean) || !all_zero(block.ln1.running_var) ||
+                !all_zero(block.ln2.running_mean) || !all_zero(block.ln2.running_var)) {
+                std::remove(legacy_file.c_str());
+                std::cerr << "missing BN statistics were not zero-initialized\n";
+                return 1;
+            }
+        }
+        std::remove(legacy_file.c_str());
+    }
+
+    // Force-load handles both exact-size reads and partial tensor reads safely.
+    {
+        const std::string force_base = "logos_ckpt_force_read";
+        const std::string force_file = force_base + "_step6.bin";
+        std::remove(force_file.c_str());
+        if (!save_checkpoint(source, force_base, 6)) {
+            std::cerr << "force-load fixture save failed\n";
+            return 1;
+        }
+
+        LOGOSModel exact_target(cfg);
+        if (!load_checkpoint_force(exact_target, force_file)) {
+            std::remove(force_file.c_str());
+            std::cerr << "force-load rejected a complete matching checkpoint\n";
+            return 1;
+        }
+        const auto exact_expected = source.parameters();
+        const auto exact_actual = exact_target.parameters();
+        if (exact_expected.size() != exact_actual.size()) {
+            std::remove(force_file.c_str());
+            std::cerr << "force-load parameter count mismatch\n";
+            return 1;
+        }
+        for (size_t i = 0; i < exact_expected.size(); ++i) {
+            if (exact_expected[i]->data != exact_actual[i]->data) {
+                std::remove(force_file.c_str());
+                std::cerr << "force-load changed a complete tensor\n";
+                return 1;
+            }
+        }
+
+        // Stop one byte into lm_head: complete floats must be kept and the
+        // partial float plus remaining elements must be zero-filled.
+        const size_t position = sizeof(ModelConfig) +
+            static_cast<size_t>(source.embedding.total_size) * sizeof(float) +
+            static_cast<size_t>(cfg.max_seq_len) * cfg.d_model * sizeof(float);
+        const size_t partial_bytes = static_cast<size_t>(source.lm_head.total_size) *
+                                    sizeof(float) / 2 + 1;
+        std::filesystem::resize_file(force_file, position + partial_bytes);
+
+        LOGOSModel partial_target(cfg);
+        std::fill(partial_target.lm_head.data.begin(), partial_target.lm_head.data.end(), 9.0f);
+        if (!load_checkpoint_force(partial_target, force_file)) {
+            std::remove(force_file.c_str());
+            std::cerr << "force-load rejected a truncated tensor\n";
+            return 1;
+        }
+        const size_t complete_floats = partial_bytes / sizeof(float);
+        for (size_t i = 0; i < partial_target.lm_head.data.size(); ++i) {
+            const float expected_value = i < complete_floats
+                ? source.lm_head.data[i] : 0.0f;
+            if (partial_target.lm_head.data[i] != expected_value) {
+                std::remove(force_file.c_str());
+                std::cerr << "force-load did not preserve/zero-fill the partial tensor correctly\n";
+                return 1;
+            }
+        }
+        std::remove(force_file.c_str());
     }
 
     return 0;
