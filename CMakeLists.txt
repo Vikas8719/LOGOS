@@ -838,21 +838,19 @@ excludePaths:
         COMMAND ${CMAKE_COMMAND} -E make_directory "${MULL_REPORT_DIR}"
 
         # Step 2: mull_math_unit pe mull-runner chalao (M1-M16 tests)
-        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_MATH_CONFIG_PATH}"
-            ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
-            --test-program "$<TARGET_FILE:mull_math_unit>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
+            "$<TARGET_FILE:mull_math_unit>"
         COMMENT "[MULL 1/2] Mutation testing: test_math_unit (M1-M16)"
 
         # Step 3: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
-        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_CHECKPOINT_CONFIG_PATH}"
-            ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
-            --test-program "$<TARGET_FILE:mull_checkpoint>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
+            "$<TARGET_FILE:mull_checkpoint>"
         COMMENT "[MULL 2/2] Mutation testing: test_checkpoint (T2b)"
 
         # Step 4: summary print karo
@@ -874,20 +872,18 @@ excludePaths:
     # Note: mull lamba chalta hai (sabhi mutants × tests) → timeout 1800s
     enable_testing()
     add_test(NAME "T6_Mutation_Math"
-        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_MATH_CONFIG_PATH}"
-            ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
-            --test-program "$<TARGET_FILE:mull_math_unit>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
+            "$<TARGET_FILE:mull_math_unit>"
     )
     add_test(NAME "T6_Mutation_Checkpoint"
-        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_CHECKPOINT_CONFIG_PATH}"
-            ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
-            --test-program "$<TARGET_FILE:mull_checkpoint>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
+            "$<TARGET_FILE:mull_checkpoint>"
     )
     set_tests_properties("T6_Mutation_Math"
         PROPERTIES
