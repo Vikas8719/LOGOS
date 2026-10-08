@@ -220,6 +220,42 @@ if(CMAKE_CUDA_COMPILER)
     target_include_directories(test_math_unit PRIVATE include tests)
     logos_set_cpu_test_options(test_math_unit)
 
+    # ── RapidCheck — C++ Property-Based Testing ──────────────
+    # cmake -DLOGOS_RAPIDCHECK=ON ..
+    # cmake --build build --target test_rapidcheck
+    # RC1: VedicGEMM == reference, RC2: VEDIC_BLOCK boundaries,
+    # RC3: gemm_bias, RC4: Free Energy, RC5: reshape, RC6: Riemannian,
+    # RC7: checkpoint size, RC8: leapfrog vs euler
+    option(LOGOS_RAPIDCHECK "Enable RapidCheck C++ property-based tests" OFF)
+    if(LOGOS_RAPIDCHECK)
+        find_package(rapidcheck QUIET)
+        if(NOT rapidcheck_FOUND)
+            include(FetchContent)
+            FetchContent_Declare(
+                rapidcheck
+                GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
+                GIT_TAG        master
+            )
+            FetchContent_MakeAvailable(rapidcheck)
+        endif()
+
+        add_executable(test_rapidcheck
+            tests/test_rapidcheck.cpp
+            src/VedicGEMM.cpp
+            src/Checkpoint.cpp
+        )
+        target_include_directories(test_rapidcheck PRIVATE include tests)
+        logos_set_cpu_test_options(test_rapidcheck)
+        target_link_libraries(test_rapidcheck PRIVATE rapidcheck)
+
+        enable_testing()
+        add_test(NAME "T7_RapidCheck" COMMAND test_rapidcheck)
+        set_tests_properties("T7_RapidCheck" PROPERTIES TIMEOUT 300 LABELS "PROPERTY")
+        message(STATUS "✅ RapidCheck ENABLED — target: test_rapidcheck")
+        message(STATUS "   Run: cmake --build build --target test_rapidcheck")
+        message(STATUS "   CTest: ctest -L PROPERTY --output-on-failure")
+    endif()
+
     # ── TEST 2b: Checkpoint roundtrip ────────────────────────
     add_executable(test_checkpoint
         tests/test_checkpoint.cpp
@@ -529,24 +565,33 @@ if(LOGOS_MUTATION_TEST)
     # -fprofile-instr-generate: LLVM instrumentation for mull
     # -fcoverage-mapping  : line coverage data
     # -g -O0              : debug symbols, no optimization (mutations readable hote hain)
-    # ── GCC-12 toolchain path detect karo (clang ABI fix ke liye) ──
+    # ── GCC-12 toolchain path (clang ABI fix ke liye) ──────────────
     # Problem: ubuntu-22.04 pe clang-15 default GCC-14 ka libstdc++ use karta hai.
     # GCC-14 mein std::__shared_ptr<_Dir>::operator bool() inline ho gaya —
     # yeh symbol .so mein nahi hota, isliye undefined reference linker error aata hai.
-    # Fix: clang ko explicitly GCC-12 ka sysroot/toolchain use karwao.
-    # --gcc-toolchain=<path>: clang GCC-12 ke headers + libstdc++ dhundta hai.
+    # Fix: clang ko explicitly GCC-12 ka toolchain use karwao.
+    #
+    # --gcc-toolchain=/usr : clang /usr/lib/gcc/x86_64-linux-gnu/12/ se
+    #   crtbeginS.o, libstdc++.a, libstdc++.so sab dhundta hai.
+    # Ubuntu pe GCC prefix hamesha /usr hota hai — dirname chain se
+    #   kabhi kabhi /usr/lib aa jata hai jo galat hai.
     find_program(GCC12_EXE NAMES g++-12 PATHS /usr/bin)
     if(GCC12_EXE)
+        # GCC-12 ka actual multilib dir verify karo
         execute_process(
-            COMMAND ${GCC12_EXE} -print-file-name=libstdc++.a
-            OUTPUT_VARIABLE _GCC12_LIBPATH OUTPUT_STRIP_TRAILING_WHITESPACE)
-        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_LIBPATH}" DIRECTORY)
-        # toolchain root = lib dir se 3 levels upar (lib/gcc/x86_64-linux-gnu/12 → /)
-        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_TOOLCHAIN}" DIRECTORY)
-        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_TOOLCHAIN}" DIRECTORY)
-        get_filename_component(_GCC12_TOOLCHAIN "${_GCC12_TOOLCHAIN}" DIRECTORY)
-        message(STATUS "[MULL] GCC-12 toolchain: ${_GCC12_TOOLCHAIN}")
-        set(MULL_GCC_TOOLCHAIN_FLAG "--gcc-toolchain=${_GCC12_TOOLCHAIN}")
+            COMMAND ${GCC12_EXE} -print-file-name=crtbeginS.o
+            OUTPUT_VARIABLE _GCC12_CRTPATH OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(EXISTS "${_GCC12_CRTPATH}")
+            # crtbeginS.o mila — GCC-12 sahi se installed hai
+            # clang ka --gcc-toolchain hamesha GCC install PREFIX hota hai (/usr)
+            set(_GCC12_TOOLCHAIN "/usr")
+            message(STATUS "[MULL] GCC-12 toolchain prefix: ${_GCC12_TOOLCHAIN}")
+            message(STATUS "[MULL] crtbeginS.o: ${_GCC12_CRTPATH}")
+            set(MULL_GCC_TOOLCHAIN_FLAG "--gcc-toolchain=${_GCC12_TOOLCHAIN}")
+        else()
+            message(WARNING "[MULL] GCC-12 crtbeginS.o nahi mila (${_GCC12_CRTPATH}) — toolchain flag skip")
+            set(MULL_GCC_TOOLCHAIN_FLAG "")
+        endif()
     else()
         message(STATUS "[MULL] g++-12 nahi mila — system default GCC use hoga")
         set(MULL_GCC_TOOLCHAIN_FLAG "")

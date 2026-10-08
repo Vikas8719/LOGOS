@@ -1,4 +1,4 @@
-name: LOGOS CI v25-MULL
+name: LOGOS CI v26-RapidCheck
 
 permissions:
   contents: read
@@ -14,12 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 # ─────────────────────────────────────────────────────────────────
-#  JOB OVERVIEW  (v25 — MULL mutation testing added)
+#  JOB OVERVIEW  (v26 — Hypothesis → RapidCheck C++ replaced)
 #  ┌──────────────────────────────────────────────────────────────┐
 #  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-windows → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  gpu-tests         → T1+T3+T4+T5 via ctest -L GPU           │
+#  │  rapidcheck-tests  → T7 RapidCheck C++ property tests       │
 #  │  mutation-tests    → T6 MULL (clang++, non-blocking)        │
 #  │  linux-build       → full Linux build + E2E smoke            │
 #  │  windows-build     → full Windows build smoke                │
@@ -352,6 +353,98 @@ jobs:
             build/test_math_unit
           retention-days: 7
 
+  # ═══════════════════════════════════════════════════════════════
+  #  RAPIDCHECK — C++ Property-Based Tests (T7)
+  #  Hypothesis (Python) ko replace kiya — woh C++ ka Python re-implementation tha.
+  #  RapidCheck actual C++ headers directly include karta hai:
+  #    VedicGEMM.hpp, Tensor.hpp, PhysicsOpt.hpp, Checkpoint.hpp, LayerNorm.hpp
+  #  Tests:
+  #    RC1: VedicGEMM == reference (random sizes + values)
+  #    RC2: VEDIC_BLOCK=64 boundary (63,64,65,128,129)
+  #    RC3: vedic_gemm_bias correctness
+  #    RC4: Free Energy F=CE-T*S properties
+  #    RC5: Tensor reshape roundtrip
+  #    RC6: Riemannian distance symmetry, self=0, triangle
+  #    RC7: Checkpoint size formula (random ModelConfig)
+  #    RC8: Leapfrog energy drift < Euler drift
+  #  Non-blocking: continue-on-error: true
+  # ═══════════════════════════════════════════════════════════════
+  rapidcheck-tests:
+    name: "RapidCheck C++ Property Tests (T7)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build git
+          sudo update-alternatives --install /usr/bin/gcc gcc \
+            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Configure (LOGOS_RAPIDCHECK=ON — FetchContent se rapidcheck download hoga)
+        run: |
+          cmake -B build_rc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20" \
+            -DLOGOS_RAPIDCHECK=ON
+
+      - name: Build test_rapidcheck
+        run: |
+          cmake --build build_rc \
+            --target test_rapidcheck \
+            --parallel $(nproc)
+
+      - name: Run RapidCheck property tests (T7)
+        id: rc_run
+        run: |
+          ./build_rc/test_rapidcheck 2>&1 | tee rc_output.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: RapidCheck Summary
+        if: always()
+        run: |
+          PASSED=$(grep -c "✅" rc_output.log 2>/dev/null || echo 0)
+          FAILED=$(grep -c "❌" rc_output.log 2>/dev/null || echo 0)
+
+          echo "════════════════════════════════════════════════════"
+          echo "  RapidCheck C++ Property Test Results (T7)"
+          echo "════════════════════════════════════════════════════"
+          grep -E "(RC[0-9]|✅|❌|PASSED|FAILED)" rc_output.log || true
+          echo "════════════════════════════════════════════════════"
+
+          python3 - <<'PYEOF'
+          log = open("rc_output.log").read() if __import__("os").path.exists("rc_output.log") else ""
+          passed = log.count("✅")
+          failed = log.count("❌")
+          total  = passed + failed
+          emoji  = "✅" if failed == 0 else "❌"
+          with open("$GITHUB_STEP_SUMMARY", "a") as f:
+              f.write("## 🔬 RapidCheck C++ Property Tests — T7\n\n")
+              f.write("| Test | Result |\n")
+              f.write("|------|--------|\n")
+              for line in log.splitlines():
+                  if "RC" in line and ("✅" in line or "❌" in line):
+                      icon = "✅" if "✅" in line else "❌"
+                      f.write(f"| {line.strip()} | {icon} |\n")
+              f.write(f"\n**Overall: {emoji} {passed}/{total} passed**\n\n")
+              f.write("> RapidCheck actual C++ headers directly test karta hai —\n")
+              f.write("> VedicGEMM.hpp, Tensor.hpp, PhysicsOpt.hpp, Checkpoint.hpp\n")
+          PYEOF
+
+      - name: Upload RapidCheck results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapidcheck-results
+          path: rc_output.log
+          if-no-files-found: ignore
+          retention-days: 7
+
     # ═══════════════════════════════════════════════════════════════
   #  MULL MUTATION TESTING
   #  Test suite ki weakness dhundta hai:
@@ -404,22 +497,30 @@ jobs:
           sudo ln -sf /usr/bin/clang++-15  /usr/local/bin/clang++
           sudo ln -sf /usr/bin/mull-runner-15 /usr/local/bin/mull-runner
 
-          # verify: gcc-12 sysroot available hai
-          echo "GCC-12 sysroot: $(dirname $(g++-12 -print-file-name=libstdc++.a))"
+          # verify: gcc-12 crtbeginS.o available hai (clang ko yahi chahiye)
+          echo "GCC-12 crtbeginS.o: $(g++-12 -print-file-name=crtbeginS.o)"
+          ls $(g++-12 -print-file-name=crtbeginS.o)
           clang++ --version | head -1
           mull-runner --version 2>&1 | head -1
 
 
       - name: Configure (MULL + Debug + clang++ + GCC-12 sysroot)
         run: |
-          # GCC-12 toolchain root find karo
-          GCC12_TOOLCHAIN=$(dirname $(dirname $(dirname $(dirname $(g++-12 -print-file-name=libstdc++.a)))))
-          echo "GCC-12 toolchain root: ${GCC12_TOOLCHAIN}"
+          # clang++ ko GCC-12 ka sysroot explicitly batao.
+          # --gcc-toolchain ka matlab hai: clang GCC-12 ke installed prefix se
+          # headers aur runtime libraries dhundega.
+          # Ubuntu pe GCC-12 prefix hamesha /usr hota hai (bin/gcc-12, lib/gcc/... sab wahan hai).
+          # dirname chain se galat /usr/lib aa sakta hai — isliye hardcode /usr use karo.
+          GCC12_PREFIX=/usr
+          echo "GCC-12 prefix: ${GCC12_PREFIX}"
+          # Verify karo ki GCC-12 wahan hai
+          ls /usr/bin/g++-12
+          ls /usr/lib/gcc/x86_64-linux-gnu/12/crtbeginS.o
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DLOGOS_MUTATION_TEST=ON \
-            -DCMAKE_CXX_FLAGS="--gcc-toolchain=${GCC12_TOOLCHAIN}"
+            -DCMAKE_CXX_FLAGS="--gcc-toolchain=${GCC12_PREFIX}"
 
       - name: Build mutation targets
         run: |
@@ -545,6 +646,7 @@ jobs:
       - linux-build
       - windows-build
       - macos-build
+      - rapidcheck-tests
       - mutation-tests
     if: always()
     steps:
@@ -558,9 +660,10 @@ jobs:
           R_WIN_BLD: ${{ needs.windows-build.result }}
           R_MAC_BLD: ${{ needs.macos-build.result }}
           R_MULL: ${{ needs.mutation-tests.result }}
+          R_RC: ${{ needs.rapidcheck-tests.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v25-MULL"
+          echo "  LOGOS CI Summary — v26-RapidCheck"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -570,6 +673,7 @@ jobs:
           echo "  Linux Build + E2E:    $R_LX_BLD"
           echo "  Windows Build:        $R_WIN_BLD"
           echo "  macOS Build:          $R_MAC_BLD"
+          echo "  RapidCheck Tests:     $R_RC (non-blocking)"
           echo "  MULL Mutation Tests:  $R_MULL (non-blocking)"
           echo "  Kaggle GPU Trigger:   async (non-blocking)"
           echo ""
@@ -581,6 +685,7 @@ jobs:
           echo "    T3  Memory Stress (GPU)"
           echo "    T5  CUDA Kernels  (GPU)"
           echo "    T6  MULL Mutation (Linux, non-blocking)"
+          echo "    T7  RapidCheck C++ property tests (Linux, non-blocking)"
           echo ""
           echo "  Sanitizer layers:"
           echo "    ASan+UBSan  → CPU test bugs (LOGOS_SANITIZE=ON)"
@@ -588,6 +693,14 @@ jobs:
           echo "    MULL        → Test suite weakness (LOGOS_MUTATION_TEST=ON)"
           echo ""
           echo "════════════════════════════════════════════════════"
+          echo ""
+          echo "  Changes in v26 (RapidCheck):"
+          echo "    ✅ hypothesis-tests job hataya — Python C++ re-implementation tha"
+          echo "    ✅ rapidcheck-tests job add kiya — actual C++ headers directly test"
+          echo "    ✅ LOGOS_RAPIDCHECK=ON cmake flag — FetchContent se rapidcheck"
+          echo "    ✅ T7_RapidCheck CTest target — PROPERTY label"
+          echo "    ✅ RC1-RC8: GEMM, tiling, bias, FreeEnergy, reshape, Riemannian, ckpt, leapfrog"
+          echo "    ✅ Artifact: rapidcheck-results (log, 7 day retention)"
           echo ""
           echo "  Changes in v25 (MULL):"
           echo "    ✅ CMakeLists.txt: LOGOS_MUTATION_TEST=ON option added"
@@ -614,6 +727,9 @@ jobs:
 
           if [ "$R_GPU" = "failure" ]; then
             echo "⚠️  GPU tests failed (non-blocking if no CUDA runner)"
+          fi
+          if [ "$R_RC" = "failure" ]; then
+            echo "⚠️  RapidCheck C++ property tests failed (non-blocking — check rapidcheck-results artifact)"
           fi
           if [ "$R_MULL" = "failure" ]; then
             echo "⚠️  MULL mutation tests failed (non-blocking — check mull-reports artifact)"
