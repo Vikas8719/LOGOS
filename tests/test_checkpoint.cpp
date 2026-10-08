@@ -6,6 +6,7 @@
 #include <iostream>
 #include <cmath>
 #include <vector>
+#include <cstdint>
 
 int main() {
     ModelConfig cfg;
@@ -350,6 +351,172 @@ int main() {
         }
         std::remove(file4.c_str());
         std::cout << "offset arithmetic test passed\n";
+    }
+
+    // Optimizer state is part of checkpoint recovery too: cover its complete
+    // round trip and reject malformed headers and truncated velocity data.
+    {
+        const std::string opt_base = "logos_ckpt_optstate_test";
+        const std::string opt_file = opt_base + "_step11.optstate";
+        std::remove(opt_file.c_str());
+
+        OptimizerState saved;
+        saved.velocities = {{0.25f, -0.5f}, {1.5f}};
+        saved.ema_action = 2.75f;
+        saved.log_amplitude = -0.125f;
+        saved.step_count = 42;
+        if (!save_optimizer_state(saved, opt_base, 11)) {
+            std::cerr << "optimizer state save failed\n";
+            return 1;
+        }
+
+        OptimizerState loaded;
+        if (!load_optimizer_state(loaded, opt_base, 11) ||
+            loaded.velocities != saved.velocities ||
+            loaded.ema_action != saved.ema_action ||
+            loaded.log_amplitude != saved.log_amplitude ||
+            loaded.step_count != saved.step_count) {
+            std::remove(opt_file.c_str());
+            std::cerr << "optimizer state round-trip mismatch\n";
+            return 1;
+        }
+
+        // Invalid magic, version, parameter count, and vector sizes must fail.
+        const auto write_header = [&](uint32_t magic, uint32_t version,
+                                      int64_t count, uint32_t vector_size) {
+            std::ofstream f(opt_file, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+            f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+            f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            if (count > 0)
+                f.write(reinterpret_cast<const char*>(&vector_size), sizeof(vector_size));
+        };
+        constexpr uint32_t magic = 0x4F505431u;
+        write_header(0, 1, 1, 1);
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "bad optimizer magic was accepted\n";
+            return 1;
+        }
+        write_header(magic, 2, 1, 1);
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "bad optimizer version was accepted\n";
+            return 1;
+        }
+        write_header(magic, 1, 0, 1);
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "empty optimizer state was accepted\n";
+            return 1;
+        }
+        write_header(magic, 1, 1, 0);
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "empty optimizer velocity was accepted\n";
+            return 1;
+        }
+        write_header(magic, 1, 1, 2); // size claims two floats; file has none
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "truncated optimizer velocity was accepted\n";
+            return 1;
+        }
+
+        // A legacy file without the EMA footer still restores velocity data
+        // and resets the EMA values to their cold-start defaults.
+        {
+            std::ofstream f(opt_file, std::ios::binary | std::ios::trunc);
+            const uint32_t version = 1, size = 1;
+            const int64_t count = 1;
+            const float velocity = 3.5f;
+            f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+            f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+            f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            f.write(reinterpret_cast<const char*>(&size), sizeof(size));
+            f.write(reinterpret_cast<const char*>(&velocity), sizeof(velocity));
+        }
+        loaded.ema_action = 9.0f;
+        loaded.log_amplitude = 8.0f;
+        loaded.step_count = 7;
+        if (!load_optimizer_state(loaded, opt_base, 11) ||
+            loaded.velocities.size() != 1 || loaded.velocities[0].size() != 1 ||
+            loaded.velocities[0][0] != 3.5f || loaded.ema_action != 0.0f ||
+            loaded.log_amplitude != 0.0f || loaded.step_count != 0) {
+            std::remove(opt_file.c_str());
+            std::cerr << "legacy optimizer state was not restored safely\n";
+            return 1;
+        }
+        std::remove(opt_file.c_str());
+    }
+
+    // Reject a short config header and invalid config values before trying to
+    // read model tensors. These malformed files must never be partially loaded.
+    {
+        const std::string bad_file = "logos_ckpt_invalid_config.bin";
+        LOGOSModel target(cfg);
+        {
+            std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
+            const int partial = 8;
+            f.write(reinterpret_cast<const char*>(&partial), sizeof(partial));
+        }
+        if (load_checkpoint(target, bad_file)) {
+            std::remove(bad_file.c_str());
+            std::cerr << "short checkpoint config was accepted\n";
+            return 1;
+        }
+
+        ModelConfig invalid = cfg;
+        invalid.d_model = 3; // not divisible by num_heads
+        {
+            std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(&invalid), sizeof(invalid));
+        }
+        if (load_checkpoint(target, bad_file)) {
+            std::remove(bad_file.c_str());
+            std::cerr << "invalid checkpoint dimensions were accepted\n";
+            return 1;
+        }
+
+        invalid = cfg;
+        invalid.vocab_size = 100001; // above the supported bound
+        {
+            std::ofstream f(bad_file, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(&invalid), sizeof(invalid));
+        }
+        if (load_checkpoint(target, bad_file)) {
+            std::remove(bad_file.c_str());
+            std::cerr << "out-of-range checkpoint dimensions were accepted\n";
+            return 1;
+        }
+        std::remove(bad_file.c_str());
+    }
+
+    // Every serialized architecture field participates in strict matching.
+    {
+        const std::string mismatch_base = "logos_ckpt_mismatch";
+        const std::string mismatch_file = mismatch_base + "_step2.bin";
+        std::remove(mismatch_file.c_str());
+        if (!save_checkpoint(source, mismatch_base, 2)) {
+            std::cerr << "mismatch fixture save failed\n";
+            return 1;
+        }
+        std::vector<ModelConfig> mismatches;
+        ModelConfig changed = cfg;
+        changed.vocab_size += 1; mismatches.push_back(changed);
+        changed = cfg; changed.d_model += 2; mismatches.push_back(changed);
+        changed = cfg; changed.num_layers += 1; mismatches.push_back(changed);
+        changed = cfg; changed.num_heads = 1; mismatches.push_back(changed);
+        changed = cfg; changed.max_seq_len += 1; mismatches.push_back(changed);
+        for (const ModelConfig& mismatch_cfg : mismatches) {
+            LOGOSModel mismatch_model(mismatch_cfg);
+            if (load_checkpoint(mismatch_model, mismatch_file)) {
+                std::remove(mismatch_file.c_str());
+                std::cerr << "strict loader accepted a mismatched config\n";
+                return 1;
+            }
+        }
+        std::remove(mismatch_file.c_str());
     }
 
     return 0;
