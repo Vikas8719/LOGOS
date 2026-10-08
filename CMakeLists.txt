@@ -213,6 +213,14 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
+    # ── TEST 2: CUDA Mathematical Unit Test ────────────────────
+    add_executable(test_math_units_gpu
+        tests/test_math_units.cu
+    )
+    target_include_directories(test_math_units_gpu PRIVATE include cuda tests)
+    target_compile_options(test_math_units_gpu PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
+    target_link_libraries(test_math_units_gpu PRIVATE logos_core)
+
     # ── TEST 2: Mathematical Unit Test (CPU-only) ─────────────
     add_executable(test_math_unit
         tests/test_math_unit.cpp
@@ -362,6 +370,13 @@ if(CMAKE_CUDA_COMPILER)
                     --log-file sanitizer_t1.log
                     $<TARGET_FILE:test_syntax_build>)
 
+            add_test(NAME "T2_Math_Unit_GPU"
+                COMMAND ${COMPUTE_SANITIZER_EXE}
+                    --tool memcheck
+                    --error-exitcode 1
+                    --log-file sanitizer_t2_gpu.log
+                    $<TARGET_FILE:test_math_units_gpu>)
+
             add_test(NAME "T3_Memory_Stress"
                 COMMAND ${COMPUTE_SANITIZER_EXE}
                     --tool memcheck
@@ -387,6 +402,7 @@ if(CMAKE_CUDA_COMPILER)
             message(WARNING "  PATH mein add karo: export PATH=/usr/local/cuda/bin:$PATH")
             # Fallback: bina sanitizer ke
             add_test(NAME "T1_Syntax_Build"     COMMAND test_syntax_build)
+            add_test(NAME "T2_Math_Unit_GPU"    COMMAND test_math_units_gpu)
             add_test(NAME "T3_Memory_Stress"    COMMAND test_memory_stress)
             add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
             add_test(NAME "T5_CUDA_Kernels"     COMMAND test_cuda_kernels)
@@ -394,12 +410,14 @@ if(CMAKE_CUDA_COMPILER)
     else()
         # Default: bina compute-sanitizer (fast, CI default)
         add_test(NAME "T1_Syntax_Build"     COMMAND test_syntax_build)
+        add_test(NAME "T2_Math_Unit_GPU"    COMMAND test_math_units_gpu)
         add_test(NAME "T3_Memory_Stress"    COMMAND test_memory_stress)
         add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
         add_test(NAME "T5_CUDA_Kernels"     COMMAND test_cuda_kernels)
     endif()
 
     set_tests_properties("T1_Syntax_Build"     PROPERTIES TIMEOUT 300  LABELS "GPU")
+    set_tests_properties("T2_Math_Unit_GPU"    PROPERTIES TIMEOUT 300  LABELS "GPU")
     set_tests_properties("T3_Memory_Stress"    PROPERTIES TIMEOUT 600  LABELS "GPU")
     set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 900  LABELS "GPU")
     set_tests_properties("T5_CUDA_Kernels"     PROPERTIES TIMEOUT 300  LABELS "GPU")
@@ -407,6 +425,7 @@ if(CMAKE_CUDA_COMPILER)
     # ── CTest resource guard: GPU tests serialize on device 0 ──
     set_tests_properties(
         "T1_Syntax_Build"
+        "T2_Math_Unit_GPU"
         "T3_Memory_Stress"
         "T4_Large_Data_Scale"
         "T5_CUDA_Kernels"
@@ -819,7 +838,8 @@ excludePaths:
         COMMAND ${CMAKE_COMMAND} -E make_directory "${MULL_REPORT_DIR}"
 
         # Step 2: mull_math_unit pe mull-runner chalao (M1-M16 tests)
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_MATH_CONFIG_PATH}"
+            ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
             --test-program "$<TARGET_FILE:mull_math_unit>"
@@ -827,7 +847,8 @@ excludePaths:
         COMMENT "[MULL 1/2] Mutation testing: test_math_unit (M1-M16)"
 
         # Step 3: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_CHECKPOINT_CONFIG_PATH}"
+            ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
             --test-program "$<TARGET_FILE:mull_checkpoint>"
@@ -853,14 +874,16 @@ excludePaths:
     # Note: mull lamba chalta hai (sabhi mutants × tests) → timeout 1800s
     enable_testing()
     add_test(NAME "T6_Mutation_Math"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_MATH_CONFIG_PATH}"
+            ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/math"
             --test-program "$<TARGET_FILE:mull_math_unit>"
             --ld-search-path "${CMAKE_BINARY_DIR}"
     )
     add_test(NAME "T6_Mutation_Checkpoint"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env "MULL_CONFIG=${MULL_CHECKPOINT_CONFIG_PATH}"
+            ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
             ${MULL_RUNNER_EXE}
             --report-dir "${MULL_REPORT_DIR}/checkpoint"
             --test-program "$<TARGET_FILE:mull_checkpoint>"

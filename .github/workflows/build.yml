@@ -19,7 +19,7 @@ concurrency:
 #  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-windows → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
-#  │  gpu-tests         → T1+T3+T4+T5 via ctest -L GPU           │
+  #  │  gpu-tests         → T1+T2 GPU+T3+T4+T5 via ctest -L GPU    │
 #  │  rapidcheck-tests  → T7 RapidCheck C++ property tests       │
 #  │  mutation-tests    → T6 MULL (clang++, non-blocking)        │
 #  │  linux-build       → full Linux build + E2E smoke            │
@@ -116,10 +116,10 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════
   #  GPU TESTS
-  #  Runs T1+T3+T4+T5 via: ctest -L GPU --output-on-failure
+  #  Runs T1+T2 GPU+T3+T4+T5 via: ctest -L GPU --output-on-failure
   # ═══════════════════════════════════════════════════════════════
   gpu-tests:
-    name: "GPU Tests (T1+T3+T4+T5 via ctest)"
+    name: "GPU Tests (T1+T2 GPU+T3+T4+T5 via ctest)"
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -167,6 +167,7 @@ jobs:
           cmake --build build \
             --target logos_gpu \
                      test_syntax_build \
+                     test_math_units_gpu \
                      test_math_unit \
                      test_memory_stress \
                      test_large_data_scale \
@@ -180,7 +181,7 @@ jobs:
             --target logos test_math_unit test_checkpoint test_large_data_scale \
             --parallel $(nproc)
 
-      - name: CTest — GPU tests (T1 T3 T4 T5)
+      - name: CTest — GPU tests (T1 T2 T3 T4 T5)
         if: steps.cuda.outputs.available == 'true'
         working-directory: build
         run: |
