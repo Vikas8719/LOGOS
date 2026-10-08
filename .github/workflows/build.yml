@@ -572,27 +572,27 @@ jobs:
           echo "=== mull-runner full --help ==="
           mull-runner --help 2>&1 || true
 
-          echo "=== mull config file ==="
-          cat build/mull.yml 2>&1 || echo "mull.yml not found in build/"
+          echo "=== generated MULL config files ==="
+          cat build/mull_math.yml 2>&1 || echo "mull_math.yml not found in build/"
+          cat build/mull_checkpoint.yml 2>&1 || echo "mull_checkpoint.yml not found in build/"
 
       - name: Run MULL — test_math_unit (M1-M16)
         id: mull_math
         continue-on-error: true
         run: |
-          mkdir -p build/mull-report/math
-
-          # mull-runner 0.34.1 mein --config flag NAHI hai
-          # mull.yml auto-discover: binary ke saath same dir mein hona chahiye
-          # ya current working directory mein
-          cp build/mull.yml .   # cwd mein copy karo — mull yahan dhundta hai
+          mkdir -p build/mull-report/math build/mull-report/math-run
 
           echo "--- Running mull-runner on mull_math_unit ---"
-          mull-runner \
+          (
+            cd build/mull-report/math-run
+            MULL_CONFIG="$GITHUB_WORKSPACE/build/mull_math.yml" mull-runner \
             --workers 2 \
             --timeout 30000 \
-            --report-dir build/mull-report/math \
-            build/mull_math_unit \
-            2>&1 | tee build/mull-report/math/runner.log || true
+            --report-dir "$GITHUB_WORKSPACE/build/mull-report/math" \
+            --test-program "$GITHUB_WORKSPACE/build/mull_math_unit" \
+            --ld-search-path "$GITHUB_WORKSPACE/build" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build/mull-report/math/runner.log"
+          ) || true
 
           LOG=build/mull-report/math/runner.log
 
@@ -639,16 +639,19 @@ jobs:
         id: mull_ckpt
         continue-on-error: true
         run: |
-          mkdir -p build/mull-report/checkpoint
+          mkdir -p build/mull-report/checkpoint build/mull-report/checkpoint-run
 
-          # mull.yml already CWD mein hai (prev step se copy hua)
           echo "--- Running mull-runner on mull_checkpoint ---"
-          mull-runner \
+          (
+            cd build/mull-report/checkpoint-run
+            MULL_CONFIG="$GITHUB_WORKSPACE/build/mull_checkpoint.yml" mull-runner \
             --workers 2 \
             --timeout 30000 \
-            --report-dir build/mull-report/checkpoint \
-            build/mull_checkpoint \
-            2>&1 | tee build/mull-report/checkpoint/runner.log || true
+            --report-dir "$GITHUB_WORKSPACE/build/mull-report/checkpoint" \
+            --test-program "$GITHUB_WORKSPACE/build/mull_checkpoint" \
+            --ld-search-path "$GITHUB_WORKSPACE/build" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build/mull-report/checkpoint/runner.log"
+          ) || true
 
           LOG=build/mull-report/checkpoint/runner.log
 
@@ -681,6 +684,8 @@ jobs:
         run: |
           MATH_SCORE="${{ steps.mull_math.outputs.score }}"
           CKPT_SCORE="${{ steps.mull_ckpt.outputs.score }}"
+          MATH_SCORE="${MATH_SCORE:-N/A}"
+          CKPT_SCORE="${CKPT_SCORE:-N/A}"
           echo "════════════════════════════════════════════════════"
           echo "  LOGOS MULL Mutation Testing Results"
           echo "════════════════════════════════════════════════════"
