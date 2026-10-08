@@ -546,19 +546,41 @@ jobs:
           echo "=== mull-runner help (first 20 lines) ==="
           mull-runner --help 2>&1 | head -20 || true
 
+      - name: Diagnose mull-runner + binaries
+        run: |
+          echo "=== mull-runner full path ==="
+          which mull-runner || echo "NOT IN PATH"
+          ls -la /usr/local/bin/mull-runner || true
+          ls -la /usr/bin/mull-runner-15 || true
+
+          echo "=== Built binaries ==="
+          ls -la build/mull_math_unit build/mull_checkpoint 2>&1 || echo "BINARIES NOT FOUND"
+
+          echo "=== Binary execute test ==="
+          ./build/mull_math_unit 2>&1 | head -5 || echo "Binary execute failed with $?"
+          ./build/mull_checkpoint 2>&1 | head -5 || echo "Binary execute failed with $?"
+
+          echo "=== mull-runner full --help ==="
+          mull-runner --help 2>&1 || true
+
+          echo "=== mull config file ==="
+          cat build/mull.yml 2>&1 || echo "mull.yml not found in build/"
+
       - name: Run MULL — test_math_unit (M1-M16)
         id: mull_math
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/math
 
-          # mull-runner 0.34.1 correct syntax:
+          # mull-runner 0.34.1 syntax (confirmed from --help):
           #   mull-runner [OPTIONS] <EXECUTABLE> [RUNNER_ARGS]
-          # --config / --report-dir / --test-program flags is version mein NAHI hain
-          # --workers aur --timeout hain (help se confirmed)
+          # Config file se options load hoti hain (--config flag)
+          # Report dir bhi config se aata hai ya default
+          echo "--- Running mull-runner on mull_math_unit ---"
           mull-runner \
             --workers 2 \
             --timeout 30000 \
+            --report-dir build/mull-report/math \
             build/mull_math_unit \
             2>&1 | tee build/mull-report/math/runner.log || true
 
@@ -566,7 +588,7 @@ jobs:
 
           echo "════ FULL MULL OUTPUT (math) ════"
           cat "$LOG"
-          echo "════ END MULL OUTPUT ════"
+          echo "════ END MULL OUTPUT (math) ════"
 
           # Format 1: "Mutation score: 85.71%"
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
@@ -589,14 +611,9 @@ jobs:
             fi
           fi
 
-          # Format 4: summary line mein percentage
+          # Format 4: koi bhi percentage "NN.NN%" ya "NN%"
           if [ -z "$SCORE" ]; then
-            SCORE=$(grep -oP '(?i)(score|killed|result)[^\n]*\K\d+\.\d+(?=%)' "$LOG" 2>/dev/null | tail -1)
-          fi
-
-          # Format 5: standalone "NN.NN%" koi bhi line mein
-          if [ -z "$SCORE" ]; then
-            SCORE=$(grep -oP '\b\d+\.\d+(?=%)' "$LOG" 2>/dev/null | tail -1)
+            SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
           fi
 
           echo "Parsed math score: '${SCORE:-NOT_FOUND}'"
@@ -608,9 +625,11 @@ jobs:
         run: |
           mkdir -p build/mull-report/checkpoint
 
+          echo "--- Running mull-runner on mull_checkpoint ---"
           mull-runner \
             --workers 2 \
             --timeout 30000 \
+            --report-dir build/mull-report/checkpoint \
             build/mull_checkpoint \
             2>&1 | tee build/mull-report/checkpoint/runner.log || true
 
@@ -618,7 +637,7 @@ jobs:
 
           echo "════ FULL MULL OUTPUT (checkpoint) ════"
           cat "$LOG"
-          echo "════ END MULL OUTPUT ════"
+          echo "════ END MULL OUTPUT (checkpoint) ════"
 
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
           if [ -z "$SCORE" ]; then
@@ -629,14 +648,7 @@ jobs:
             fi
           fi
           if [ -z "$SCORE" ]; then
-            KILLED=$(grep -oP '[Kk]illed mutants?:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            TOTAL=$(grep -oP '[Kk]illed mutants?:\s*\d+\s*/\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-              SCORE=$(python3 -c "print(f'{100*int(\"$KILLED\")/int(\"$TOTAL\"):.1f}')")
-            fi
-          fi
-          if [ -z "$SCORE" ]; then
-            SCORE=$(grep -oP '\b\d+\.\d+(?=%)' "$LOG" 2>/dev/null | tail -1)
+            SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
           fi
 
           echo "Parsed checkpoint score: '${SCORE:-NOT_FOUND}'"
