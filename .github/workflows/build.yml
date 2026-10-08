@@ -508,17 +508,6 @@ jobs:
           mull-runner --version 2>&1 | head -1
 
 
-      - name: Find mull LLVM pass plugin
-        run: |
-          echo "=== mull pass plugin search ==="
-          find /usr /opt -name "libmull-ir-frontend*.so" 2>/dev/null || true
-          find /usr /opt -name "mull-ir-frontend*" 2>/dev/null || true
-          find /usr /opt -name "libmull*.so" 2>/dev/null || true
-          find /usr/lib/mull* /usr/local/lib/mull* 2>/dev/null || true
-          dpkg -L mull-15 2>/dev/null | grep -E "\.so$|plugin" || true
-          echo "=== clang-15 resource dir ==="
-          clang-15 -print-resource-dir
-
       - name: Configure (MULL + Debug + clang++ + GCC-12 sysroot)
         run: |
           GCC12_PREFIX=/usr
@@ -526,22 +515,31 @@ jobs:
           ls /usr/bin/g++-12
           ls /usr/lib/gcc/x86_64-linux-gnu/12/crtbeginS.o
 
-          GCC12_LIBDIR=$(g++-12 -print-file-name=libstdc++.a | xargs dirname)
-          echo "GCC-12 libdir: ${GCC12_LIBDIR}"
-
-          # MULL_PASS: mull-15 ka IR frontend plugin dhundho
-          MULL_PASS=$(find /usr -name "libmull-ir-frontend*.so" 2>/dev/null | head -1)
-          if [ -z "$MULL_PASS" ]; then
-            MULL_PASS=$(dpkg -L mull-15 2>/dev/null | grep "\.so$" | head -1)
+          # mull-15 IR frontend plugin — mutations inject karne ke liye ZARURI hai
+          # Without this: "No mutants found. Mutation score: infinitely high"
+          # Plugin path verified from mull docs + mull-15 package contents
+          MULL_PLUGIN=""
+          for p in \
+            /usr/lib/mull-ir-frontend-15 \
+            /usr/lib/mull-ir-frontend-15.so \
+            /usr/lib/x86_64-linux-gnu/mull-ir-frontend-15 \
+            /usr/local/lib/mull-ir-frontend-15 \
+            /usr/lib/llvm-15/lib/mull-ir-frontend-15.so; do
+            if [ -f "$p" ]; then MULL_PLUGIN="$p"; break; fi
+          done
+          # dpkg fallback
+          if [ -z "$MULL_PLUGIN" ]; then
+            MULL_PLUGIN=$(dpkg -L mull-15 2>/dev/null | grep -E "mull-ir-frontend" | head -1)
           fi
-          echo "MULL pass plugin: ${MULL_PASS:-NOT FOUND}"
+          echo "MULL plugin: '${MULL_PLUGIN:-NOT FOUND}'"
+          ls -la "$MULL_PLUGIN" 2>/dev/null || echo "Plugin file not found at above path"
 
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DLOGOS_MUTATION_TEST=ON \
             -DCMAKE_CXX_FLAGS="--gcc-toolchain=${GCC12_PREFIX}" \
-            -DMULL_PASS_PLUGIN="${MULL_PASS}"
+            -DMULL_PASS_PLUGIN="${MULL_PLUGIN}"
 
       - name: Build mutation targets
         run: |
