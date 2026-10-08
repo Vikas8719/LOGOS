@@ -572,9 +572,13 @@ jobs:
         run: |
           mkdir -p build/mull-report/math
 
+          # mull-runner 0.34.1 mein --config flag NAHI hai
+          # mull.yml auto-discover: binary ke saath same dir mein hona chahiye
+          # ya current working directory mein
+          cp build/mull.yml .   # cwd mein copy karo — mull yahan dhundta hai
+
           echo "--- Running mull-runner on mull_math_unit ---"
           mull-runner \
-            --config build/mull.yml \
             --workers 2 \
             --timeout 30000 \
             --report-dir build/mull-report/math \
@@ -590,16 +594,13 @@ jobs:
           # Format 1: "Mutation score: 85.71%"
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
 
-          # Format 2: "infinitely high" = 0 mutants found = binary compile flags galat the
-          if [ -z "$SCORE" ]; then
-            if grep -q "infinitely high" "$LOG" 2>/dev/null; then
-              echo "❌ No mutants found — binary mein MULL instrumentation nahi hai"
-              echo "   Check: -fexperimental-new-pass-manager removed? clang-15 use ho raha hai?"
-              SCORE="0_NO_MUTANTS"
-            fi
+          # "infinitely high" = 0 mutants found = instrumentation missing
+          if [ -z "$SCORE" ] && grep -q "infinitely high" "$LOG" 2>/dev/null; then
+            echo "❌ No mutants found — check compile flags"
+            SCORE="N/A"
           fi
 
-          # Format 3: "Killed: 12 out of 14"
+          # Format 2: "Killed: 12 out of 14"
           if [ -z "$SCORE" ]; then
             KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
@@ -608,8 +609,8 @@ jobs:
             fi
           fi
 
-          # Format 4: "Killed mutants: 12 / 14"
-          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
+          # Format 3: "Killed mutants: 12 / 14"
+          if [ -z "$SCORE" ]; then
             KILLED=$(grep -oP '[Kk]illed mutants?:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             TOTAL=$(grep -oP '[Kk]illed mutants?:\s*\d+\s*/\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
@@ -617,8 +618,8 @@ jobs:
             fi
           fi
 
-          # Format 5: any percentage in log
-          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
+          # Format 4: any percentage in log
+          if [ -z "$SCORE" ]; then
             SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
           fi
 
@@ -631,9 +632,9 @@ jobs:
         run: |
           mkdir -p build/mull-report/checkpoint
 
+          # mull.yml already CWD mein hai (prev step se copy hua)
           echo "--- Running mull-runner on mull_checkpoint ---"
           mull-runner \
-            --config build/mull.yml \
             --workers 2 \
             --timeout 30000 \
             --report-dir build/mull-report/checkpoint \
@@ -647,19 +648,17 @@ jobs:
           echo "════ END MULL OUTPUT (checkpoint) ════"
 
           SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
-          if [ -z "$SCORE" ]; then
-            if grep -q "infinitely high" "$LOG" 2>/dev/null; then
-              SCORE="0_NO_MUTANTS"
-            fi
+          if [ -z "$SCORE" ] && grep -q "infinitely high" "$LOG" 2>/dev/null; then
+            SCORE="N/A"
           fi
-          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
+          if [ -z "$SCORE" ]; then
             KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
             if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
               SCORE=$(python3 -c "print(f'{100*int(\"$KILLED\")/int(\"$TOTAL\"):.1f}')")
             fi
           fi
-          if [ -z "$SCORE" ] || [[ "$SCORE" == "0_NO_MUTANTS" ]]; then
+          if [ -z "$SCORE" ]; then
             SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
           fi
 
