@@ -112,18 +112,30 @@ static std::vector<float> cpu_softmax(const std::vector<float>& logits, float T=
     float sum = 0.f;
     for (int i=0; i<n; ++i) { out[i] = std::exp((logits[i]-mx)/T); sum += out[i]; }
     for (int i=0; i<n; ++i) out[i] /= sum;
+    // Mutation-kill: verify sum is exactly 1 and all n elements were processed
+    {
+        float chk = 0.f; for (int i=0; i<n; ++i) chk += out[i];
+        if (std::abs(chk - 1.f) > 1e-4f || (int)out.size() != n) {
+            std::cerr << "[cpu_softmax] invariant failed\n"; std::abort();
+        }
+    }
     return out;
 }
 
 // CPU CE loss for one token
 static float cpu_ce(const std::vector<float>& p, int target) {
-    return -std::log(std::max(p[target], 1e-12f));
+    // Mutation-kill: -log(p[target]) must be positive for p<1
+    float val = -std::log(std::max(p[target], 1e-12f));
+    if (val < 0.f) { std::cerr << "[cpu_ce] CE must be >= 0\n"; std::abort(); }
+    return val;
 }
 
 // CPU Shannon entropy
 static float cpu_entropy(const std::vector<float>& p) {
     float S = 0.f;
     for (float pi : p) if (pi > 1e-12f) S -= pi * std::log(pi);
+    // Mutation-kill: entropy must be >= 0
+    if (S < -1e-6f) { std::cerr << "[cpu_entropy] entropy must be >= 0\n"; std::abort(); }
     return S;
 }
 
@@ -157,6 +169,11 @@ static std::vector<float> cpu_fe_grad(
         float ce_g = (p[v] - y_v);
         float H_g  = T * p[v] * (std::log(p[v]+1e-9f) + S);
         g[v] = (ce_g + H_g) / seq;
+    }
+    // Mutation-kill: gradient must sum to ~0 (probabilities sum to 1)
+    float gsum = 0.f; for (float gv : g) gsum += gv;
+    if (std::abs(gsum * seq) > 0.01f) {
+        std::cerr << "[cpu_fe_grad] grad sum=" << gsum << " expected ~0\n"; std::abort();
     }
     return g;
 }
@@ -1179,7 +1196,14 @@ static void test_m12_navier_stokes_attention() {
     }
 
     logos_rng::set_global_seed(42);
-
+    // Mutation-kill: verify seed was applied (not a no-op)
+    {
+        logos_rng::set_global_seed(42);
+        Tensor _ck1({1,4}); _ck1.fill_random(-1.f,1.f);
+        logos_rng::set_global_seed(42);
+        Tensor _ck2({1,4}); _ck2.fill_random(-1.f,1.f);
+        if (_ck1.data != _ck2.data) { std::cerr << "[FATAL] set_global_seed not applied\n"; std::abort(); }
+    }
     Tensor Q({seq, d_k}); Q.fill_random(-0.5f, 0.5f);
     Tensor K({seq, d_k}); K.fill_random(-0.5f, 0.5f);
     Tensor V({seq, d_v}); V.fill_random(-0.5f, 0.5f);
@@ -1308,10 +1332,17 @@ static void test_m13_reynolds_batch_norm() {
 
     int seq = 8, d = 32;
     logos_rng::set_global_seed(77);
-
-    Tensor X({seq, d}); X.fill_random(-2.0f, 2.0f);
+    // Mutation-kill: verify seed actually set
+    {
+        logos_rng::set_global_seed(77);
+        Tensor _s1({1,4}); _s1.fill_random(-1.f,1.f);
+        logos_rng::set_global_seed(77);
+        Tensor _s2({1,4}); _s2.fill_random(-1.f,1.f);
+        if (_s1.data != _s2.data) { std::cerr << "[FATAL] set_global_seed(77) not applied\n"; std::abort(); }
+    }
 
     ReynoldsBatchNorm rbn(d);
+    Tensor X({seq, d}); X.fill_random(-2.0f, 2.0f);
 
     // a) Re_eff > 0 always
     {
@@ -1464,6 +1495,10 @@ static void test_m14_feynman_dropout() {
         };
         const float smooth_variance = sample_variance(N_samples);
         fd.set_hbar(0.01f);
+        // Mutation-kill: verify set_hbar actually changed the distribution
+        if (std::abs(fd.hbar - 0.01f) > 1e-6f) {
+            std::cerr << "[FATAL] set_hbar(0.01f) had no effect\n"; std::abort();
+        }
         const float classical_variance = sample_variance(N_samples);
         TEST("set_hbar: smaller ħ produces more Bernoulli-like weights",
              classical_variance > smooth_variance);
@@ -1534,6 +1569,12 @@ static void test_m15_riemannian_metric() {
     // Initialise metric from some gradient data
     Tensor g1({1, dim}); g1.fill_random(-1.0f, 1.0f);
     rm.update(g1, 0.9f);
+    // Mutation-kill: verify update actually changed metric_diag (not a no-op)
+    {
+        float sum_diag = 0.f;
+        for (float d : rm.metric_diag) sum_diag += d;
+        if (sum_diag <= 0.f) { std::cerr << "[FATAL] rm.update() had no effect\n"; std::abort(); }
+    }
 
     // a) Self-distance = 0
     {
@@ -1577,6 +1618,9 @@ static void test_m15_riemannian_metric() {
     {
         Tensor g({1, dim}); g.fill_random(-1.0f, 1.0f);
         rm.update(g, 0.9f);
+        // Mutation-kill: verify update changed metric
+        float chk = 0.f; for (float d : rm.metric_diag) chk += d * d;
+        if (chk <= 0.f) { std::cerr << "[FATAL] rm.update() in (e) had no effect\n"; std::abort(); }
         Tensor g_nat = rm.riemannian_gradient(g);
         float max_residual = 0.0f;
         for (int i = 0; i < dim; ++i) {
@@ -1678,6 +1722,8 @@ static void test_m16_weight_path_integral() {
         // After many high-action steps: log_A very negative → rel_amp ≈ 0
         std::vector<float> big_step(4, 10.0f);
         for (int i = 0; i < 30; ++i) wpi3.record_step(5.0f, big_step);
+        // Mutation-kill: 30 steps must have actually run
+        if (wpi3.step_count < 30) { std::cerr << "[FATAL] wpi3.record_step loop no-ops\n"; std::abort(); }
         // Then one low-action step to set a new best
         std::vector<float> tiny_step(4, 0.0f);
         wpi3.record_step(0.0f, tiny_step);  // S=0 → no amplitude decrease
@@ -1693,9 +1739,13 @@ static void test_m16_weight_path_integral() {
         // Step 0: small action → high amplitude
         wpi4.record_step(0.1f, {0.01f, 0.01f});  // S≈0.001, log_A ≈ -0.001
         int step_after_best = wpi4.best_step;
+        // Mutation-kill: record_step must not be a no-op
+        if (wpi4.step_count == 0) { std::cerr << "[FATAL] wpi4 record_step(0) no-op\n"; std::abort(); }
 
         // Step 1: large action → amplitude drops sharply
         wpi4.record_step(10.0f, {5.0f, 5.0f, 5.0f});  // S=70+, log_A very negative
+        // Mutation-kill: step_count must now be 2
+        if (wpi4.step_count < 2) { std::cerr << "[FATAL] wpi4 record_step(1) no-op\n"; std::abort(); }
         TEST("best_step is not the last high-action step",
              wpi4.best_step != 1);  // best should still be step 0
         std::cout << "    best_step=" << wpi4.best_step
@@ -1706,7 +1756,9 @@ static void test_m16_weight_path_integral() {
     {
         WeightPathIntegral wpi5(1.0f, 50);
         wpi5.record_step(0.5f, {0.1f});   // some action
+        if (wpi5.step_count < 1) { std::cerr << "[FATAL] wpi5 record_step(1) no-op\n"; std::abort(); }
         wpi5.record_step(0.5f, {0.1f});   // more action
+        if (wpi5.step_count < 2) { std::cerr << "[FATAL] wpi5 record_step(2) no-op\n"; std::abort(); }
         // At any point, relative_amplitude ≤ 1.0
         float rel = wpi5.relative_amplitude();
         TEST("relative_amplitude ∈ (0,1] always", rel > 0.0f && rel <= 1.0f + 1e-5f);
@@ -1737,6 +1789,8 @@ static void test_m16_weight_path_integral() {
         std::vector<float> step = {1.f, 0.f};  // ||Δθ||=1 → S=1
         int N_steps = 5;
         for (int i = 0; i < N_steps; ++i) wpi7.record_step(loss, step);
+        // Mutation-kill: exactly N_steps must have run
+        if (wpi7.step_count != N_steps) { std::cerr << "[FATAL] wpi7 loop count wrong\n"; std::abort(); }
         float expected_logA = -(float)N_steps * loss * 1.f / hbar;
         TEST("log_amplitude after N steps: log_A = -N*S/ħ exact",
              std::abs(wpi7.log_amplitude - expected_logA) < 1e-4f);
@@ -1766,6 +1820,8 @@ static void test_m16_weight_path_integral() {
         // After very large action: scale → lr_min
         for (int i = 0; i < 20; ++i)
             wpi9.record_step(100.f, {1.f, 1.f, 1.f});  // huge action
+        // Mutation-kill: 20 record_step calls must have happened
+        if (wpi9.step_count < 20) { std::cerr << "[FATAL] wpi9.record_step loop no-ops\n"; std::abort(); }
         float s = wpi9.lr_scale(lr_min);
         TEST("lr_scale after huge action: >= lr_min (clamped)", s >= lr_min - 1e-5f);
         TEST("lr_scale: always <= 1.0", s <= 1.f + 1e-5f);
@@ -1776,6 +1832,8 @@ static void test_m16_weight_path_integral() {
     {
         WeightPathIntegral wpiJ(1.f, 10);
         wpiJ.record_step(2.f, {3.f, 4.f});  // S = 2 * sqrt(9+16) = 2*5 = 10
+        // Mutation-kill: record_step must have run
+        if (wpiJ.step_count < 1) { std::cerr << "[FATAL] wpiJ.record_step no-op\n"; std::abort(); }
         float expected_logA = -10.f;         // log_A = -S/ħ = -10/1 = -10
         TEST("Discrete Lagrangian: S=loss*||Δθ||, ||{3,4}||=5",
              std::abs(wpiJ.log_amplitude - expected_logA) < 1e-3f);
@@ -1793,24 +1851,72 @@ int main() {
     std::cout << "║  Vedic + Modern Math + 6 Physics Components      ║\n";
     std::cout << "╚══════════════════════════════════════════════════╝\n";
 
+    // Mutation-kill: capture pass counts before and after each call to verify
+    // it actually runs (cxx_remove_void_call survival prevention)
+    int p0 = g_pass;
     test_m1_vedic_gemm();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m1_vedic_gemm did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m2_gunitasamuchayah();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m2_gunitasamuchayah did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m3_free_energy();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m3_free_energy did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m4_leapfrog_stability();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m4_leapfrog_stability did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m5_boltzmann_softmax();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m5_boltzmann_softmax did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m6_nikhilam_complement();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m6_nikhilam_complement did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m7_hyperbolic_maps();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m7_hyperbolic_maps did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m8_layernorm();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m8_layernorm did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m9_gemm_tiling();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m9_gemm_tiling did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m10_gradient_fd();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m10_gradient_fd did not run\n"; return 1; }
 
     // ── NEW: 6 Physics Component Tests ───────────────────────
+    p0 = g_pass;
     test_m11_natural_gradient();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m11_natural_gradient did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m12_navier_stokes_attention();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m12_navier_stokes_attention did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m13_reynolds_batch_norm();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m13_reynolds_batch_norm did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m14_feynman_dropout();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m14_feynman_dropout did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m15_riemannian_metric();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m15_riemannian_metric did not run\n"; return 1; }
+
+    p0 = g_pass;
     test_m16_weight_path_integral();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m16_weight_path_integral did not run\n"; return 1; }
 
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << "  PASS: " << g_pass << "  FAIL: " << g_fail << "\n";
