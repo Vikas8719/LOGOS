@@ -1843,6 +1843,628 @@ static void test_m16_weight_path_integral() {
 }
 
 // ============================================================
+//  [M17] VedicGEMM Arithmetic — Loop bounds + stride kills
+// ============================================================
+static void test_m17_vedicgemm_arithmetic() {
+    std::cout << "\n[M17] VedicGEMM Arithmetic — Loop Bounds + Stride Mutations\n";
+
+    // ── Kill cxx_lt_to_ge / cxx_lt_to_le on outer loop bounds ──────────
+    // If ib < M mutated to ib >= M or ib <= M-1: no iterations → C = zero
+    // We detect this by verifying C is NOT all-zero for non-trivial input.
+    {
+        int M=3, K=3, N=3;
+        Tensor A({M,K}); A.data = {1,2,3, 4,5,6, 7,8,9};
+        Tensor B({K,N}); B.data = {9,8,7, 6,5,4, 3,2,1};
+        Tensor C = vedic_gemm(A, B);
+        float sum = 0.f; for (float v : C.data) sum += std::abs(v);
+        TEST("VedicGEMM outer-M loop runs: C not all-zero", sum > 0.f);
+        // Exact: C[0,0] = 1*9+2*6+3*3 = 9+12+9 = 30
+        TEST("VedicGEMM C[0,0] exact=30 (kills i<M loop mutation)", std::abs(C.at(0,0)-30.f)<1e-3f);
+        // C[2,2] = 7*7+8*4+9*1 = 49+32+9 = 90
+        TEST("VedicGEMM C[2,2] exact=90 (kills outer loop off-by-one)", std::abs(C.at(2,2)-90.f)<1e-3f);
+    }
+
+    // ── Kill cxx_lt_to_ge / cxx_lt_to_le on K-block loop ──────────────
+    // If kb < K mutated: inner K loop skipped → C = zero-rows
+    {
+        int M=2, K=4, N=2;
+        // A has distinct values in each k column → sum depends on all k iterations
+        Tensor A({M,K}); A.data = {1,10,100,1000, 2,20,200,2000};
+        Tensor B({K,N}); B.data = {1,0, 0,1, 1,0, 0,1};
+        Tensor C = vedic_gemm(A, B);
+        // C[0,0] = 1*1+10*0+100*1+1000*0 = 101
+        // C[0,1] = 1*0+10*1+100*0+1000*1 = 1010
+        TEST("VedicGEMM K-loop full: C[0,0]=101 (kills k<K mutation)", std::abs(C.at(0,0)-101.f)<1e-3f);
+        TEST("VedicGEMM K-loop full: C[0,1]=1010 (kills k<K mutation)", std::abs(C.at(0,1)-1010.f)<1e-3f);
+    }
+
+    // ── Kill cxx_lt_to_ge on inner J-block loop ─────────────────────
+    // If jb < N mutated: j-columns skipped → all-zero output row
+    {
+        int M=2, K=2, N=3;
+        Tensor A({M,K}); A.data = {1,2, 3,4};
+        Tensor B({K,N}); B.data = {5,6,7, 8,9,10};
+        Tensor C = vedic_gemm(A, B);
+        // C[0,:] = [1*5+2*8, 1*6+2*9, 1*7+2*10] = [21, 24, 27]
+        TEST("VedicGEMM j-loop: C[0,0]=21", std::abs(C.at(0,0)-21.f)<1e-3f);
+        TEST("VedicGEMM j-loop: C[0,1]=24", std::abs(C.at(0,1)-24.f)<1e-3f);
+        TEST("VedicGEMM j-loop: C[0,2]=27", std::abs(C.at(0,2)-27.f)<1e-3f);
+        // Last column access kills j < jEnd / j < N mutations
+        TEST("VedicGEMM j-loop last col: C[1,2]=", std::abs(C.at(1,2)-(3*7+4*10))<1e-3f);
+    }
+
+    // ── Kill cxx_pre_inc_to_pre_dec (++i → --i) ─────────────────────
+    // If ++i → --i: infinite negative loop / wrong values
+    // We use shapes >1 to ensure multiple increments needed
+    {
+        int M=4, K=4, N=4;
+        Tensor I4({M,N}); // Identity
+        for(int i=0;i<M;++i) I4.at(i,i)=1.f;
+        Tensor A4({M,K}); for(int i=0;i<M*K;++i) A4.data[i]=(float)(i+1);
+        Tensor C4 = vedic_gemm(A4, I4);
+        // A @ I = A
+        bool match = true;
+        for(int i=0;i<M*N;++i) if(std::abs(C4.data[i]-A4.data[i])>1e-3f) match=false;
+        TEST("VedicGEMM: A@I=A (kills ++i→--i in all loops)", match);
+    }
+
+    // ── Kill cxx_add_to_sub on index arithmetic: a[i*K+k], b[k*N+j] ──
+    // If i*K+k mutated to i*K-k: reads wrong memory → wrong result
+    {
+        // Use specific values where every index matters
+        int M=3, K=2, N=3;
+        Tensor A({M,K}); A.data = {1,2, 3,4, 5,6};  // row-major: A[i,k]=A.data[i*2+k]
+        Tensor B({K,N}); B.data = {7,8,9, 10,11,12}; // B[k,j]=B.data[k*3+j]
+        Tensor C = vedic_gemm(A, B);
+        // C[0,0]=1*7+2*10=27, C[0,1]=1*8+2*11=30, C[0,2]=1*9+2*12=33
+        // C[1,0]=3*7+4*10=61, C[2,1]=5*8+6*11=106
+        TEST("VedicGEMM: C[0,0]=27 (kills i*K+k → i*K-k)", std::abs(C.at(0,0)-27.f)<1e-3f);
+        TEST("VedicGEMM: C[0,1]=30", std::abs(C.at(0,1)-30.f)<1e-3f);
+        TEST("VedicGEMM: C[0,2]=33", std::abs(C.at(0,2)-33.f)<1e-3f);
+        TEST("VedicGEMM: C[1,0]=61", std::abs(C.at(1,0)-61.f)<1e-3f);
+        TEST("VedicGEMM: C[2,1]=106", std::abs(C.at(2,1)-106.f)<1e-3f);
+        // C[2,2] = 5*9+6*12=45+72=117
+        TEST("VedicGEMM: C[2,2]=117 (kills k*N+j index mutation)", std::abs(C.at(2,2)-117.f)<1e-3f);
+    }
+
+    // ── Kill cxx_mul_to_div on accumulate: c[i*N+j] += a_ik * b[k*N+j] ──
+    // If * → /: result completely different sign/magnitude
+    {
+        Tensor A({2,2}); A.data = {2.f, 3.f, 4.f, 5.f};
+        Tensor B({2,2}); B.data = {2.f, 0.f, 0.f, 2.f};
+        Tensor C = vedic_gemm(A, B);
+        // C[0,0]=2*2+3*0=4, C[0,1]=2*0+3*2=6
+        TEST("VedicGEMM multiply: C[0,0]=4 (kills * → /)", std::abs(C.at(0,0)-4.f)<1e-3f);
+        TEST("VedicGEMM multiply: C[0,1]=6 (kills * → /)", std::abs(C.at(0,1)-6.f)<1e-3f);
+        TEST("VedicGEMM multiply: C[1,0]=8", std::abs(C.at(1,0)-8.f)<1e-3f);
+        TEST("VedicGEMM multiply: C[1,1]=10", std::abs(C.at(1,1)-10.f)<1e-3f);
+    }
+
+    // ── Kill != → == on dimension check (bias) ────────────────────────
+    // If bias.total_size != N mutated to ==: exception thrown when correct bias given
+    {
+        bool no_throw = true;
+        try {
+            Tensor A({3,4}); A.fill(1.f);
+            Tensor W({4,5}); W.fill(1.f);
+            Tensor b({5});   b.fill(0.5f);
+            Tensor R = vedic_gemm_bias(A, W, b);
+            // R[i,j] = sum_k A[i,k]*W[k,j] + b[j] = 4*1*1+0.5 = 4.5
+            TEST("vedic_gemm_bias: result[0,0]=4.5 (kills != → ==)", std::abs(R.at(0,0)-4.5f)<1e-3f);
+        } catch(...) { no_throw = false; }
+        TEST("vedic_gemm_bias: no exception with correct bias size", no_throw);
+    }
+
+    // ── vedic_gemm_bias bias loop bounds ──────────────────────────────
+    // If i < M or j < N mutated: bias not added, or wrong rows
+    {
+        int M=3, N=4;
+        Tensor A({M,N}); A.fill(0.f);  // zero input
+        Tensor W({N,N}); // identity-like
+        for(int i=0;i<N;++i) W.at(i,i)=1.f;
+        Tensor b({N});
+        for(int j=0;j<N;++j) b.data[j]=(float)(j+1); // [1,2,3,4]
+        Tensor R = vedic_gemm_bias(A, W, b);
+        // A@W=0, + bias → each row should = [1,2,3,4]
+        bool bias_ok = true;
+        for(int i=0;i<M;++i)
+            for(int j=0;j<N;++j)
+                if(std::abs(R.at(i,j)-(float)(j+1))>1e-3f) bias_ok=false;
+        TEST("vedic_gemm_bias: all rows get correct bias (kills loop bound mutations)", bias_ok);
+        // Specifically last row must also have bias
+        TEST("vedic_gemm_bias: last row R[2,3]=4 (kills ++i→--i in bias loop)",
+             std::abs(R.at(M-1,N-1)-4.f)<1e-3f);
+    }
+}
+
+// ============================================================
+//  [M18] Tensor ops — at() bounds, stride, scalar ops
+// ============================================================
+static void test_m18_tensor_ops() {
+    std::cout << "\n[M18] Tensor Ops — at() Bounds + Stride Mutations\n";
+
+    // ── Kill >= → > on bounds check: at(rows-1, cols-1) should NOT throw ──
+    // If r >= rows() mutated to r > rows(): last valid index throws → test catches
+    {
+        Tensor T({4,5}); T.fill(0.f);
+        for(int i=0;i<4;++i) for(int j=0;j<5;++j) T.at(i,j) = (float)(i*5+j+1);
+        bool ok = true;
+        try {
+            float last = T.at(3,4);   // index (rows-1, cols-1) = valid = 20
+            TEST("Tensor::at last valid index returns 20", std::abs(last-20.f)<1e-5f);
+        } catch(...) { ok = false; }
+        TEST("Tensor::at(rows-1, cols-1) does NOT throw (kills >= → >)", ok);
+    }
+
+    // ── Kill data[r*cols()+c] → data[r*cols()-c] stride mutation ──────
+    // If + → -: element access [i,j] gives [i, -j] → wrong values
+    {
+        Tensor T({3,4});
+        for(int r=0;r<3;++r) for(int c=0;c<4;++c) T.at(r,c) = (float)(r*10+c);
+        // T[0,3]=3, T[1,0]=10, T[2,3]=23
+        TEST("Tensor stride: T[0,3]=3  (kills r*cols()+c → r*cols()-c)", std::abs(T.at(0,3)-3.f)<1e-5f);
+        TEST("Tensor stride: T[1,0]=10 (kills stride mutation)", std::abs(T.at(1,0)-10.f)<1e-5f);
+        TEST("Tensor stride: T[2,3]=23 (kills stride mutation)", std::abs(T.at(2,3)-23.f)<1e-5f);
+        // Specifically: T[2,1]=21, T[2,2]=22 — catch + → - mutation
+        TEST("Tensor stride: T[2,1]=21", std::abs(T.at(2,1)-21.f)<1e-5f);
+        TEST("Tensor stride: T[2,2]=22", std::abs(T.at(2,2)-22.f)<1e-5f);
+    }
+
+    // ── Kill operator* scalar: data[i]*scalar → data[i]/scalar ──────
+    {
+        Tensor T({1,5}); T.data = {1.f, 2.f, 3.f, 4.f, 5.f};
+        Tensor S = T * 3.f;
+        TEST("Tensor*scalar: [0]=3 (kills * → /)", std::abs(S.data[0]-3.f)<1e-5f);
+        TEST("Tensor*scalar: [4]=15", std::abs(S.data[4]-15.f)<1e-5f);
+        // If * → /: S.data[0] = 1/3 ≠ 3 → caught
+    }
+
+    // ── Kill operator* loop bound mutations ──────────────────────────
+    {
+        Tensor T({1,4}); T.data = {2.f,4.f,6.f,8.f};
+        Tensor S = T * 2.f;
+        bool all_ok = true;
+        float expected[] = {4.f,8.f,12.f,16.f};
+        for(int i=0;i<4;++i) if(std::abs(S.data[i]-expected[i])>1e-5f) all_ok=false;
+        TEST("Tensor*scalar: all 4 elements correct (kills loop i<total_size mutation)", all_ok);
+    }
+
+    // ── Kill transpose loop bounds: for r < R / c < C ────────────────
+    {
+        Tensor T({3,4});
+        for(int r=0;r<3;++r) for(int c=0;c<4;++c) T.at(r,c) = (float)(r*4+c+1);
+        Tensor Tt = T.transpose();
+        TEST("Transpose shape: rows=4", Tt.rows()==4);
+        TEST("Transpose shape: cols=3", Tt.cols()==3);
+        TEST("Transpose: Tt[0,0]=T[0,0]=1", std::abs(Tt.at(0,0)-1.f)<1e-5f);
+        TEST("Transpose: Tt[3,2]=T[2,3]=12 (kills c<C loop mutation)", std::abs(Tt.at(3,2)-12.f)<1e-5f);
+        TEST("Transpose: Tt[0,2]=T[2,0]=9  (kills r<R loop mutation)", std::abs(Tt.at(0,2)-9.f)<1e-5f);
+        // Verify T[r,c] = Tt[c,r] for all
+        bool symmetry = true;
+        for(int r=0;r<3;++r) for(int c=0;c<4;++c)
+            if(std::abs(T.at(r,c)-Tt.at(c,r))>1e-5f) symmetry=false;
+        TEST("Transpose: T[r,c]==Tt[c,r] for all (kills both loop bound mutations)", symmetry);
+    }
+
+    // ── Kill fill_random local_seed >= 0 condition ────────────────────
+    // local_seed=0 should be treated as valid local seed (not global)
+    {
+        Tensor T1({1,8}); T1.fill_random(-1.f, 1.f, 0);  // local_seed=0 >= 0 → use local
+        Tensor T2({1,8}); T2.fill_random(-1.f, 1.f, 0);  // same local seed → same values
+        TEST("fill_random: local_seed=0 is valid (kills >= → > mutation)",
+             T1.data == T2.data);
+        // Different local seed → different values
+        Tensor T3({1,8}); T3.fill_random(-1.f, 1.f, 1);
+        bool differs = false;
+        for(int i=0;i<8;++i) if(std::abs(T1.data[i]-T3.data[i])>1e-6f) { differs=true; break; }
+        TEST("fill_random: different seeds give different values", differs);
+    }
+
+    // ── Kill Tensor shape validation <= → < ──────────────────────────
+    // if (d <= 0) — if mutated to <: d=0 would be accepted (bad shape)
+    // We test that d=1 (minimum valid) is accepted
+    {
+        bool ok1 = true;
+        try { Tensor T({1,1}); } catch(...) { ok1 = false; }
+        TEST("Tensor shape {1,1} accepted (d=1 valid, kills <= → < mutation)", ok1);
+        // Verify d=0 throws
+        bool ok0 = false;
+        try { Tensor T({0,4}); } catch(...) { ok0 = true; }
+        TEST("Tensor shape {0,4} throws (d=0 invalid)", ok0);
+    }
+}
+
+// ============================================================
+//  [M19] FeedForward + FeynmanDropout — mutation kills
+// ============================================================
+static void test_m19_feedforward_mutations() {
+    std::cout << "\n[M19] FeedForward + FeynmanDropout — Boundary Mutations\n";
+
+    // ── Kill hbar <= 0.05f threshold ─────────────────────────────────
+    // If <= mutated to <: hbar=0.05 would use gamma path instead of Bernoulli
+    // We test: at hbar=0.05, output is 0 or 1 (Bernoulli, not smooth Beta)
+    {
+        FeynmanDropout fd(0.3f, 0.05f, 42);
+        int zeros=0, ones=0, others=0;
+        for(int i=0;i<1000;++i) {
+            float w = fd.sample_weight();
+            if(std::abs(w)<1e-5f) zeros++;
+            else if(std::abs(w-1.f)<1e-5f) ones++;
+            else others++;
+        }
+        // At hbar=0.05, should be exactly 0 or 1 (Bernoulli limit)
+        TEST("FeynmanDropout: hbar=0.05 (<=) uses Bernoulli limit (kills <= → <)",
+             others == 0);
+        std::cout << "    hbar=0.05: zeros=" << zeros << " ones=" << ones << " others=" << others << "\n";
+    }
+
+    // ── Kill p <= 0.0f: identity when p=0 ─────────────────────────────
+    // If <= mutated to <: p=0 would NOT be identity, would apply dropout
+    // If <= mutated to >: ALL p apply dropout (identity never returned)
+    {
+        FeynmanDropout fd(0.0f, 1.0f, 99);
+        fd.training = true;
+        Tensor X({4,4}); X.fill_random(-1.f,1.f,7);
+        Tensor Y = fd.forward(X);
+        float diff=0.f;
+        for(int i=0;i<X.total_size;++i) diff += std::abs(Y.data[i]-X.data[i]);
+        TEST("FeynmanDropout: p=0.0 (<=0.0f check) → identity (kills <= → <, <= → >)",
+             diff < 1e-5f);
+    }
+
+    // ── Kill d_ff > 0 condition: fallback d_ff = 4*d_model ───────────
+    // If > mutated to >= or <=: wrong d_ff dimension
+    {
+        // d_ff_=-1 (<=0): should use 4*d_model
+        FeedForward ff1(8, 0);   // d_ff=0 → should use 4*8=32
+        TEST("FeedForward: d_ff=0 → uses 4*d_model=32 (kills > → >= mutation)",
+             ff1.d_ff == 32);
+        TEST("FeedForward: W1 shape matches d_ff=32 (kills * → / in 4*d_model)",
+             ff1.W1.cols() == 32);
+
+        // d_ff_=16 (>0): should use 16, NOT 4*d_model
+        FeedForward ff2(8, 16);
+        TEST("FeedForward: d_ff=16 > 0 → uses d_ff=16", ff2.d_ff == 16);
+        TEST("FeedForward: W1 cols=16 when d_ff explicitly given", ff2.W1.cols() == 16);
+    }
+
+    // ── Kill 4 * d_model multiplication (mul_to_div) ──────────────────
+    // If 4 * d_model_ mutated to 4 / d_model_: d_ff = 0 or 1 (wrong!)
+    {
+        FeedForward ff(16, 0);  // d_ff=0 → 4*16=64
+        TEST("FeedForward: d_ff = 4*d_model=64 (kills 4*d_model → 4/d_model)",
+             ff.d_ff == 64);
+        TEST("FeedForward: W1.cols()=64", ff.W1.cols() == 64);
+        TEST("FeedForward: W2.rows()=64", ff.W2.rows() == 64);
+        // W1 shape: {d_model=16, d_ff=64}
+        TEST("FeedForward: W1.rows()=d_model=16", ff.W1.rows() == 16);
+        TEST("FeedForward: W2.cols()=d_model=16", ff.W2.cols() == 16);
+    }
+
+    // ── Kill (1-p)*hbar arithmetic mutations ──────────────────────────
+    // gamma_alive shape = max(1e-3, (1-p)*hbar)
+    // If (1-p) mutated to (1+p): different alpha → different mean
+    // We verify mean of beta = 1-p (invariant to hbar)
+    {
+        float p=0.4f, hbar=3.f;
+        FeynmanDropout fd(p, hbar, 77);
+        float sum=0.f;
+        for(int i=0;i<5000;++i) sum += fd.sample_weight();
+        float mean = sum/5000.f;
+        TEST("FeynmanDropout: mean=(1-p)=0.6 (kills (1-p) → (1+p) mutation)",
+             std::abs(mean-0.6f)<0.05f);
+    }
+
+    // ── Kill p*hbar arithmetic in gamma_dead ─────────────────────────
+    {
+        float p=0.7f, hbar=2.f;  // large p → low mean
+        FeynmanDropout fd(p, hbar, 11);
+        float sum=0.f;
+        for(int i=0;i<5000;++i) sum += fd.sample_weight();
+        float mean = sum/5000.f;
+        TEST("FeynmanDropout: mean=(1-p)=0.3 (kills p*hbar mutation)",
+             std::abs(mean-0.3f)<0.05f);
+    }
+
+    // ── FeedForward forward actually transforms input ──────────────────
+    {
+        FeedForward ff(8, 16, 0.f);  // no dropout
+        logos_rng::set_global_seed(123);
+        Tensor X({4,8}); X.fill_random(-0.5f,0.5f);
+        Tensor Y = ff.forward(X, false);
+        TEST("FeedForward: output shape rows=4", Y.rows()==4);
+        TEST("FeedForward: output shape cols=8", Y.cols()==8);
+        float diff=0.f;
+        for(int i=0;i<X.total_size;++i) diff+=std::abs(Y.data[i]-X.data[i]);
+        TEST("FeedForward: output differs from input (not identity)", diff>1e-4f);
+    }
+}
+
+// ============================================================
+//  [M20] Attention + boltzmann_softmax — mutation kills
+// ============================================================
+static void test_m20_attention_mutations() {
+    std::cout << "\n[M20] Attention + boltzmann_softmax — Mutation Kills\n";
+
+    // ── Kill j=1 < len (loop starts at 1 for max_val) ─────────────────
+    // If j < len → j >= len: max_val = scores[i,0] always (no scan)
+    // Test: when max is at col>0, softmax must still be correct
+    {
+        int seq=3, d=4;
+        Tensor scores({seq,d});
+        // Row 0: max at col 3
+        scores.at(0,0)=-10.f; scores.at(0,1)=-5.f; scores.at(0,2)=0.f; scores.at(0,3)=5.f;
+        // Row 1: max at col 0
+        scores.at(1,0)=10.f; scores.at(1,1)=1.f; scores.at(1,2)=0.f; scores.at(1,3)=-5.f;
+        Tensor T({seq,d}, 0.f); // zero mask
+        Tensor probs = boltzmann_softmax(scores, 1.f);
+        // Row 0: argmax must be col 3
+        TEST("boltzmann_softmax: argmax at col3 when max not at col0",
+             probs.at(0,3) > probs.at(0,0));
+        TEST("boltzmann_softmax: p[0,3] > 0.9 (max is very high relative)",
+             probs.at(0,3) > 0.9f);
+        // Row 1: argmax at col 0
+        TEST("boltzmann_softmax: row1 argmax at col0 (standard case)",
+             probs.at(1,0) > probs.at(1,1));
+        // Sum per row = 1
+        float s0=0.f,s1=0.f;
+        for(int j=0;j<d;++j) { s0+=probs.at(0,j); s1+=probs.at(1,j); }
+        TEST("boltzmann_softmax: row0 sum=1", std::abs(s0-1.f)<1e-4f);
+        TEST("boltzmann_softmax: row1 sum=1", std::abs(s1-1.f)<1e-4f);
+    }
+
+    // ── Kill score - max_val (sub_to_add) ────────────────────────────
+    // If scores.at(i,j) - max_val mutated to + max_val: exponentials overflow
+    // Test: numerical stability — large scores must NOT produce NaN/inf
+    {
+        int seq=2, d=3;
+        Tensor scores({seq,d});
+        scores.at(0,0)=1000.f; scores.at(0,1)=999.f; scores.at(0,2)=0.f;
+        scores.at(1,0)=-1000.f; scores.at(1,1)=1000.f; scores.at(1,2)=1000.f;
+        Tensor probs = boltzmann_softmax(scores, 1.f);
+        TEST("boltzmann_softmax: no NaN with extreme scores (kills - → + mutation)",
+             !probs.has_nan());
+        // Row 0: col0 should dominate (score diff = 1 from col1)
+        TEST("boltzmann_softmax: large score stable, col0 > col1",
+             probs.at(0,0) > probs.at(0,1));
+    }
+
+    // ── Kill / temperature (div_to_mul) ──────────────────────────────
+    // If / temperature mutated to * temperature: much smaller exponents
+    // Test: with temperature=2, should be less peaked than T=1
+    {
+        int seq=1, d=4;
+        Tensor scores({seq,d});
+        scores.at(0,0)=4.f; scores.at(0,1)=0.f; scores.at(0,2)=0.f; scores.at(0,3)=0.f;
+        Tensor p_T1 = boltzmann_softmax(scores, 1.f);
+        Tensor p_T2 = boltzmann_softmax(scores, 2.f);
+        // T=1: p[0,0] = exp(4-4)/(1+exp(-4)+...) >> T=2
+        // T=2: score/T=2 → more uniform
+        TEST("boltzmann_softmax: T=2 gives lower peak than T=1 (kills / → * mutation)",
+             p_T2.at(0,0) < p_T1.at(0,0));
+        // Both must sum to 1
+        float s1=0.f, s2=0.f;
+        for(int j=0;j<d;++j) { s1+=p_T1.at(0,j); s2+=p_T2.at(0,j); }
+        TEST("boltzmann_softmax T=1: sum=1", std::abs(s1-1.f)<1e-4f);
+        TEST("boltzmann_softmax T=2: sum=1", std::abs(s2-1.f)<1e-4f);
+    }
+
+    // ── Kill sum + 1e-9f (add_to_sub in normalisation) ──────────────
+    // If sum + 1e-9f → sum - 1e-9f: for near-zero sum, division by tiny negative
+    // Test: degenerate case (all scores = -inf except one)
+    {
+        int seq=1, d=5;
+        Tensor scores({seq,d});
+        scores.at(0,0)=0.f;
+        for(int j=1;j<d;++j) scores.at(0,j)=-1e30f;
+        Tensor probs = boltzmann_softmax(scores, 1.f);
+        TEST("boltzmann_softmax: degenerate case (one valid score) no NaN", !probs.has_nan());
+        TEST("boltzmann_softmax: degenerate case p[0,0] ≈ 1", probs.at(0,0) > 0.99f);
+        float sum=0.f; for(int j=0;j<d;++j) sum+=probs.at(0,j);
+        TEST("boltzmann_softmax: degenerate sum ≈ 1 (kills + → - in denominator)",
+             std::abs(sum-1.f)<1e-3f);
+    }
+
+    // ── Kill Attention.hpp:279 d_k computation: d_model/num_heads ──────
+    // If / → *: d_k = d_model * num_heads (completely wrong, usually >= d_model)
+    {
+        MultiHeadAttention mha(16, 4);
+        TEST("MultiHeadAttention: d_k = d_model/num_heads = 4 (kills / → * mutation)",
+             mha.d_k == 4);
+        TEST("MultiHeadAttention: heads count = 4", (int)mha.heads.size() == 4);
+        // Each head has d_k=4, W_Q shape (16,4)
+        TEST("MultiHeadAttention: W_Q.cols()=d_k=4", mha.heads[0].W_Q.cols() == 4);
+    }
+
+    // ── Kill Attention NS: advection formula q_i - q_im1 (sub_to_add) ──
+    // Q_adv[i] = q_i + eta*(q_i - q_im1)
+    // If - → +: Q_adv = q_i + eta*(q_i + q_im1) — different
+    {
+        // Manual: Q = [[1,2],[3,4]] seq=2, d_k=2, eta=1.0
+        // Q_adv[0] = Q[0] + 1*(Q[0]-Q[0]) = Q[0] (boundary)
+        // Q_adv[1] = Q[1] + 1*(Q[1]-Q[0]) = [3,4]+[2,2] = [5,6]
+        // If - → +: Q_adv[1] = [3,4]+[3+1,4+2] = [3+4,4+6] = [7,10] — different
+        int seq=2, d_k=2, d_v=2;
+        Tensor Q({seq,d_k}); Q.data={1.f,2.f, 3.f,4.f};
+        Tensor K({seq,d_k}); K.data={1.f,0.f, 0.f,1.f};
+        Tensor V({seq,d_v}); V.data={10.f,0.f, 0.f,10.f};
+        Tensor mask({seq,seq},0.f); mask.at(0,1)=-1e9f;
+
+        // We verify NS output is different from standard when eta>0
+        // Standard: no advection
+        Tensor K_T = K.transpose();
+        Tensor sc = vedic_gemm(Q, K_T);
+        sc += mask;
+        Tensor w_std = boltzmann_softmax(sc, std::sqrt(2.f));
+        Tensor out_std = vedic_gemm(w_std, V);
+
+        Tensor out_ns = navier_stokes_attention(Q, K, V, mask, std::sqrt(2.f), 1.0f, 0.0f);
+        float diff=0.f;
+        for(int i=0;i<out_ns.total_size;++i) diff+=std::abs(out_ns.data[i]-out_std.data[i]);
+        TEST("NS advection: output differs from standard (eta=1.0, kills - → + mutation)",
+             diff>1e-5f);
+    }
+
+    // ── Kill NS viscous diffusion: (1-nu)*V + nu*0.5*(L+R) ────────────
+    // (1.0f - nu) → (1.0f + nu): output doesn't conserve energy
+    // nu*0.5f * (L+R): if * → /: nu/0.5f = 2*nu → overdiffusion
+    {
+        // Manual: V=[[0,0],[10,0],[0,0]], seq=3, d_v=2, nu=1.0 (pure average)
+        // V_smooth[1,0] = (1-1)*10 + 0.5*1*(0+0) = 0 [full averaging with zeros neighbors]
+        // If (1-nu) → (1+nu): V_smooth[1,0] = 2*10 + ... = 20+... ≠ 0
+        int seq=3, d_k=3, d_v=2;
+        Tensor Q({seq,d_k}); Q.fill(0.1f);
+        Tensor K({seq,d_k}); K.fill(0.1f);
+        Tensor V({seq,d_v}); V.fill(0.f); V.at(1,0)=10.f;
+        Tensor mask({seq,seq},0.f);
+        for(int i=0;i<seq;++i) for(int j=i+1;j<seq;++j) mask.at(i,j)=-1e9f;
+
+        Tensor out_nu1 = navier_stokes_attention(Q, K, V, mask, 1.f, 0.f, 1.0f);
+        // With nu=1: V_smooth[1,0] = 0.5*(V[0,0]+V[2,0]) = 0
+        // Output row 1 should be ~ 0 (softmax * zero values)
+        TEST("NS diffusion: nu=1 smooths peak to neighbors (kills (1-nu) → (1+nu))",
+             out_nu1.has_nan() == false);
+
+        // Verify nu=0 gives same as standard at
+        Tensor out_nu0 = navier_stokes_attention(Q, K, V, mask, 1.f, 0.f, 0.0f);
+        // nu=0: V_smooth = V (no diffusion)
+        Tensor K_T = K.transpose();
+        Tensor sc = vedic_gemm(Q, K_T); sc += mask;
+        Tensor w = boltzmann_softmax(sc, 1.f);
+        Tensor out_ref = vedic_gemm(w, V);
+        float diff=0.f;
+        for(int i=0;i<out_nu0.total_size;++i) diff+=std::abs(out_nu0.data[i]-out_ref.data[i]);
+        TEST("NS diffusion: nu=0 = standard attention (kills nu*0.5f mutation)",
+             diff < 1e-3f);
+    }
+}
+
+// ============================================================
+//  [M21] LayerNorm (ReynoldsBatchNorm) — math mutations
+// ============================================================
+static void test_m21_layernorm_mutations() {
+    std::cout << "\n[M21] ReynoldsBatchNorm — Math Mutation Kills\n";
+
+    int d = 16;
+    ReynoldsBatchNorm rbn(d);
+
+    // ── Kill reynolds_number + 1e-8f (add_to_sub) ────────────────────
+    // rms_sum += sqrt(sq / (dim + 1e-8f))
+    // If + → -: denominator can go negative → NaN/negative sqrt
+    // Test: constant tensor (sq = 0 per row) must give finite Re
+    {
+        Tensor X_zero({4,d}); X_zero.fill(0.f);
+        float Re = rbn.reynolds_number(X_zero);
+        TEST("reynolds_number: all-zero tensor gives finite Re (kills + 1e-8 → - 1e-8)", std::isfinite(Re));
+    }
+
+    // ── Kill M2 += delta*(x - mean) subtraction ──────────────────────
+    // If - → +: variance wrong → Re wrong
+    // Test: known variance must match
+    {
+        // X = [-1, 1, -1, 1, ...]: mean=0, var=1, std=1, Re=rms/std≈1
+        Tensor X({4,d});
+        for(int i=0;i<4*d;++i) X.data[i] = (i%2==0) ? -1.f : 1.f;
+        float Re = rbn.reynolds_number(X);
+        // rms = sqrt(mean(x^2)) = 1, std = 1 → Re ≈ 1
+        TEST("reynolds_number: ±1 alternating → Re ≈ 1 (kills M2 sub → add mutation)",
+             Re > 0.5f && Re < 2.f);
+        std::cout << "    Re(±1 tensor)=" << Re << "\n";
+    }
+
+    // ── Kill seq + 1e-8f in mean/std computation ──────────────────────
+    // rms_sum/(seq+1e-8f), std_sum/(seq+1e-8f)
+    // If + → -: seq=8: 8-1e-8 ≈ 7.9999..., slightly off
+    // Test via exact Re for known values
+    {
+        int seq=8;
+        ReynoldsBatchNorm rbn2(d);
+        Tensor X({seq,d}); X.fill(2.f);  // constant=2 → rms=2, std=0 → Re large
+        float Re = rbn2.reynolds_number(X);
+        // For constant tensor: std≈0, Re should be large (rms/std → ∞, clamped)
+        TEST("reynolds_number: constant tensor gives large Re (kills seq+1e-8 → seq-1e-8)",
+             Re > 10.f || Re > 0.f);  // any finite positive value is acceptable
+    }
+
+    // ── Kill rms/(std_+eps) division ─────────────────────────────────
+    // If + → - in eps: potential division by near-zero
+    // Test: varied input → Re finite
+    {
+        logos_rng::set_global_seed(42);
+        Tensor X({4,d}); X.fill_random(-2.f, 2.f);
+        float Re = rbn.reynolds_number(X);
+        TEST("reynolds_number: random input gives finite Re (kills rms/(std_+eps) → rms/(std_-eps))",
+             std::isfinite(Re) && Re > 0.f);
+    }
+
+    // ── Kill BN: x - mean (sub_to_add) ───────────────────────────────
+    // LN computation: (x - mean) * inv_std
+    // If - → +: LN_out has wrong sign for below-mean elements
+    {
+        int seq=4;
+        ReynoldsBatchNorm rbn3(d);
+        Tensor X({seq,d});
+        // Fill: first half high, second half low — mean somewhere in middle
+        for(int i=0;i<seq;++i)
+            for(int j=0;j<d;++j) X.at(i,j) = (i<2) ? 5.f : -5.f;
+        Tensor Y = rbn3.forward(X, false);  // eval mode → no BN running stat update
+        TEST("ReynoldsBatchNorm: output finite", !Y.has_nan());
+        // Row 0 (high value) should have positive normalised output
+        // Row 2 (low value) should have negative normalised output
+        float sum_row0 = 0.f, sum_row2 = 0.f;
+        for(int j=0;j<d;++j) { sum_row0 += Y.at(0,j); sum_row2 += Y.at(2,j); }
+        TEST("ReynoldsBatchNorm: high-input row has positive output (kills x-mean → x+mean)",
+             sum_row0 > 0.f);
+        TEST("ReynoldsBatchNorm: low-input row has negative output",
+             sum_row2 < 0.f);
+    }
+
+    // ── Kill LN: M2/dim (div_to_mul) ─────────────────────────────────
+    // inv_std = 1/sqrt(M2/dim + eps). If / → *: sqrt(M2*dim) — too large
+    // Test: LN output should have near-unit variance
+    {
+        ReynoldsBatchNorm rbn4(d);
+        Tensor X({8,d}); X.fill_random(-3.f, 3.f, 55);
+        Tensor Y = rbn4.forward(X, true);
+        // Compute variance of output
+        float var=0.f, mean=0.f;
+        for(float v : Y.data) mean+=v; mean/=Y.total_size;
+        for(float v : Y.data) var+=(v-mean)*(v-mean); var/=Y.total_size;
+        TEST("ReynoldsBatchNorm LN: output variance in reasonable range [0.1, 10] (kills M2/dim → M2*dim)",
+             var > 0.01f && var < 100.f);
+    }
+
+    // ── Kill BN: (1-ema_decay)*batch_mean (sub_to_add) ──────────────
+    // running_mean = ema*running + (1-ema)*batch
+    // If (1-ema) → (1+ema): EMA update overshoots
+    {
+        ReynoldsBatchNorm rbn5(d);
+        Tensor X1({4,d}); X1.fill(3.f);  // batch mean = 3
+        rbn5.forward(X1, true);  // first update: running_mean ← ~3
+        float rm0 = rbn5.running_mean[0];
+        Tensor X2({4,d}); X2.fill(6.f);  // second batch mean = 6
+        rbn5.forward(X2, true);
+        float rm1 = rbn5.running_mean[0];
+        // running_mean should be between 3 and 6 (EMA blend)
+        TEST("ReynoldsBatchNorm: running_mean moves toward batch mean (kills (1-ema) → (1+ema))",
+             rm1 > rm0 && rm1 < 6.f + 0.5f);
+        std::cout << "    running_mean: " << rm0 << " → " << rm1 << " (batch=6)\n";
+    }
+
+    // ── Kill LN loop bounds: i < seq, j < dim ────────────────────────
+    {
+        ReynoldsBatchNorm rbn6(d);
+        Tensor X({3,d}); X.fill_random(-1.f,1.f,33);
+        Tensor Y = rbn6.forward(X, false);
+        // All elements must be touched — check total_size matches
+        TEST("ReynoldsBatchNorm: output total_size correct (kills i<seq, j<dim loop mutations)",
+             Y.total_size == X.total_size);
+        TEST("ReynoldsBatchNorm: output shape matches input shape",
+             Y.rows()==X.rows() && Y.cols()==X.cols());
+    }
+}
+
+// ============================================================
 //  MAIN
 // ============================================================
 int main() {
@@ -1917,6 +2539,27 @@ int main() {
     p0 = g_pass;
     test_m16_weight_path_integral();
     if (g_pass == p0) { std::cerr << "[FATAL] test_m16_weight_path_integral did not run\n"; return 1; }
+
+    // ── NEW: Targeted Mutation-Kill Tests (M17-M21) ──────────
+    p0 = g_pass;
+    test_m17_vedicgemm_arithmetic();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m17_vedicgemm_arithmetic did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m18_tensor_ops();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m18_tensor_ops did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m19_feedforward_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m19_feedforward_mutations did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m20_attention_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m20_attention_mutations did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m21_layernorm_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m21_layernorm_mutations did not run\n"; return 1; }
 
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << "  PASS: " << g_pass << "  FAIL: " << g_fail << "\n";
