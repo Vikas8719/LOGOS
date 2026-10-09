@@ -7,10 +7,30 @@
 #include "ModelGPU.cuh"
 #include "VedicGEMM.cuh"
 #include "MixedPrecision.cuh"   // [BUG-FIX] cast_fp32_to_fp16_kernel ModelGPU.cu line 772,792 mein use hota hai
-#include <cuda_runtime.h>
+
+#if defined(__has_include)
+  #if __has_include(<cuda_runtime.h>)
+    #include <cuda_runtime.h>
+  #elif __has_include(<cuda_runtime_api.h>)
+    #include <cuda_runtime_api.h>
+  #else
+    #error "CUDA runtime headers not found. Ensure the CUDA toolkit include directory is configured."
+  #endif
+#else
+  #include <cuda_runtime.h>
+#endif
+
 #include <cmath>
 #include <iostream>
-#include <cstring>
+#if defined(__has_include)
+  #if __has_include(<cstring>)
+    #include <cstring>
+  #else
+    #include <string.h>
+  #endif
+#else
+  #include <cstring>
+#endif
 #include <stdexcept>
 #include <climits>
 

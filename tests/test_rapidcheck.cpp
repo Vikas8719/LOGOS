@@ -1,34 +1,6 @@
 // ============================================================
 //  LOGOS — tests/test_rapidcheck.cpp
-//  RapidCheck Property-Based Tests (C++ ka Hypothesis)
-//
-//  Kya test karta hai:
-//    [RC1]  VedicGEMM == reference_gemm (random sizes + values)
-//    [RC2]  VEDIC_BLOCK=64 boundary sizes (63,64,65,128,129)
-//    [RC3]  vedic_gemm_bias correctness (random bias)
-//    [RC4]  Free Energy F = CE - T*S properties
-//    [RC5]  Tensor::reshape roundtrip
-//    [RC6]  Riemannian distance: symmetry, self-distance=0, triangle inequality
-//    [RC7]  Checkpoint expected_bytes formula (random ModelConfig)
-//    [RC8]  Leapfrog energy drift < Euler drift
-//
-//  Build karo:
-//    cmake -B build -DLOGOS_RAPIDCHECK=ON
-//    cmake --build build --target test_rapidcheck
-//    ./build/test_rapidcheck
-//
-//  Make shortcut:
-//    make rapidcheck
-//
-//  Kaise kaam karta hai RapidCheck:
-//    rc::check("description", []() {
-//        auto x = *rc::gen::inRange(1, 100);   // random int [1,100)
-//        auto v = *rc::gen::arbitrary<float>(); // any float
-//        RC_ASSERT(some_property(x, v));         // property check
-//    });
-//    Failure pe → automatically simplest failing case dhundta hai (shrinking)
-//    T7 config 500 successful cases per property run karta hai.
-// ============================================================
+
 #include "../include/VedicGEMM.hpp"
 #include "../include/Tensor.hpp"
 #include "../include/PhysicsOpt.hpp"

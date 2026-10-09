@@ -20,7 +20,6 @@
 #include "FeedForward.hpp"
 #include "LayerNorm.hpp"
 #include "PhysicsConfig.hpp"
-#include <numeric>
 
 // ── Divergence-free projection (∇·u = 0) ─────────────────────
 // Subtracts per-row mean → zero divergence in feature space

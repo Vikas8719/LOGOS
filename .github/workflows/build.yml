@@ -17,6 +17,7 @@ concurrency:
 #  JOB OVERVIEW  (v26 — Hypothesis → RapidCheck C++ replaced)
 #  ┌──────────────────────────────────────────────────────────────┐
 #  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
+#  │  sanitizer-tests-linux → T2 + T2b under ASan + UBSan       │
 #  │  cpu-tests-windows → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
   #  │  gpu-tests         → T1+T2 GPU+T3+T4+T5 via ctest -L GPU    │
@@ -71,6 +72,44 @@ jobs:
       - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
         run: ctest --output-on-failure -LE "GPU" --timeout 600 -j 1
+
+  # ═══════════════════════════════════════════════════════════════
+  #  CPU SANITIZERS — Linux (ASan + UBSan)
+  #  Run after the regular Linux CPU suite; failures block the CI gate.
+  # ═══════════════════════════════════════════════════════════════
+  sanitizer-tests-linux:
+    name: "ASan + UBSan — Linux (T2 + T2b)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build
+
+      - name: Configure (Debug + ASan + UBSan)
+        run: |
+          cmake -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DLOGOS_SANITIZE=ON
+
+      - name: Build sanitized CPU test targets
+        run: |
+          cmake --build build-sanitize \
+            --target test_math_unit test_checkpoint \
+            --parallel $(nproc)
+
+      - name: Run T2 + T2b with ASan + UBSan
+        working-directory: build-sanitize
+        run: |
+          ctest --output-on-failure \
+            -R "^(T2_Math_Unit|T2b_Checkpoint)$" \
+            --timeout 120 \
+            -j 1
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — Windows
@@ -769,6 +808,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs:
       - cpu-tests-linux
+      - sanitizer-tests-linux
       - cpu-tests-windows
       - cpu-tests-macos
       - gpu-tests
@@ -782,6 +822,7 @@ jobs:
       - name: Print results + gate
         env:
           R_CPU_LX: ${{ needs.cpu-tests-linux.result }}
+          R_SANITIZER: ${{ needs.sanitizer-tests-linux.result }}
           R_CPU_WIN: ${{ needs.cpu-tests-windows.result }}
           R_CPU_MAC: ${{ needs.cpu-tests-macos.result }}
           R_GPU: ${{ needs.gpu-tests.result }}
@@ -796,6 +837,7 @@ jobs:
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
+          echo "  ASan + UBSan Linux:   $R_SANITIZER"
           echo "  CPU Tests Windows:    $R_CPU_WIN"
           echo "  CPU Tests macOS:      $R_CPU_MAC"
           echo "  GPU Tests (ctest):    $R_GPU"
@@ -824,7 +866,7 @@ jobs:
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  Changes in v26 (RapidCheck):"
-          echo "    ✅ hypothesis-tests job hataya — Python C++ re-implementation tha"
+          
           echo "    ✅ rapidcheck-tests job add kiya — actual C++ headers directly test"
           echo "    ✅ LOGOS_RAPIDCHECK=ON cmake flag — FetchContent se rapidcheck"
           echo "    ✅ T7_RapidCheck CTest target — PROPERTY label"
@@ -849,7 +891,7 @@ jobs:
           echo "════════════════════════════════════════════════════"
 
           FAIL=false
-          for r in "$R_CPU_LX" "$R_CPU_WIN" "$R_CPU_MAC" \
+          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_CPU_WIN" "$R_CPU_MAC" \
                    "$R_LX_BLD" "$R_WIN_BLD" "$R_MAC_BLD"; do
             [ "$r" = "failure" ] && FAIL=true
           done
