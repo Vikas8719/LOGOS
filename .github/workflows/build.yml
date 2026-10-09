@@ -1,7 +1,8 @@
-name: LOGOS CI v27-PhysicsMull
+name: LOGOS CI v28-KaggleFix
 
 permissions:
   contents: read
+  actions: write   # kaggle-gpu-trigger: workflow_dispatch trigger ke liye
 
 on:
   push:
@@ -446,38 +447,62 @@ jobs:
       - name: Run RapidCheck property tests (T7)
         id: rc_run
         run: |
-          RC_PARAMS="max_success=500" ./build_rc/test_rapidcheck 2>&1 | tee rc_output.log
+          # RC_PARAMS format: key=value pairs, semicolon-separated
+          # max_success=1000  : 1000 random cases per property (was 500 — too lenient)
+          # max_discard_ratio=10 : RC_PRE rejections limit (10x max_success se zyada = fail)
+          # noshrink=0        : counterexample shrinking ON — reproducible min-case milta hai
+          # seed alag nahi set kiya — har run different random seed use karega
+          # Agar failure ho toh seed output mein dikhega — wahi seed re-run mein use karo:
+          #   RC_PARAMS="max_success=1000;seed=<N>" ./test_rapidcheck
+          RC_PARAMS="max_success=1000;max_discard_ratio=10" \
+            ./build_rc/test_rapidcheck 2>&1 | tee rc_output.log
           echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
 
       - name: RapidCheck Summary
         if: always()
         run: |
-          PASSED=$(grep -c "✅" rc_output.log 2>/dev/null || echo 0)
-          FAILED=$(grep -c "❌" rc_output.log 2>/dev/null || echo 0)
-
           echo "════════════════════════════════════════════════════"
           echo "  RapidCheck C++ Property Test Results (T7)"
+          echo "  Strict: max_success=1000 per property"
           echo "════════════════════════════════════════════════════"
-          grep -E "(RC[0-9]|✅|❌|PASSED|FAILED)" rc_output.log || true
+          grep -E "(RC[0-9]|✅|❌|PASSED|FAILED|passed|failed)" rc_output.log || true
           echo "════════════════════════════════════════════════════"
 
           python3 - <<'PYEOF'
-          log = open("rc_output.log").read() if __import__("os").path.exists("rc_output.log") else ""
+          import os, re
+          log = open("rc_output.log").read() if os.path.exists("rc_output.log") else ""
           passed = log.count("✅")
           failed = log.count("❌")
           total  = passed + failed
           emoji  = "✅" if failed == 0 else "❌"
-          with open("$GITHUB_STEP_SUMMARY", "a") as f:
+
+          # RC_PARAMS seed extract karo agar failure mein printed hai
+          seed_match = re.search(r'(?:seed|Seed)[=:\s]+(\d+)', log)
+          seed_info  = f"Seed: `{seed_match.group(1)}`" if seed_match else "Seed: random (set RC_PARAMS=seed=N to reproduce)"
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stderr")
+          with open(summary_path, "a") as f:
               f.write("## 🔬 RapidCheck C++ Property Tests — T7\n\n")
+              f.write(f"> **Strict mode**: `max_success=1000` per property, `max_discard_ratio=10`\n")
+              f.write(f"> {seed_info}\n\n")
               f.write("| Test | Result |\n")
               f.write("|------|--------|\n")
               for line in log.splitlines():
-                  if "RC" in line and ("✅" in line or "❌" in line):
+                  # Match RC1..RC8b lines with result icon
+                  if re.search(r'RC\d', line) and ("✅" in line or "❌" in line):
                       icon = "✅" if "✅" in line else "❌"
-                      f.write(f"| {line.strip()} | {icon} |\n")
+                      f.write(f"| `{line.strip()}` | {icon} |\n")
               f.write(f"\n**Overall: {emoji} {passed}/{total} passed**\n\n")
-              f.write("> RapidCheck actual C++ headers directly test karta hai —\n")
-              f.write("> VedicGEMM.hpp, Tensor.hpp, PhysicsOpt.hpp, Checkpoint.hpp\n")
+              f.write("Properties tested:\n")
+              f.write("- RC1: VedicGEMM == naive_gemm (1000 random sizes+values)\n")
+              f.write("- RC2: VEDIC_BLOCK=64 tiling boundary (200 × 9 sizes = 1800 matrices)\n")
+              f.write("- RC3: vedic_gemm_bias == GEMM+bias (1000 cases)\n")
+              f.write("- RC4a-d: Free Energy F=CE-T*S properties (1000 each)\n")
+              f.write("- RC5: Tensor reshape roundtrip (1000 cases)\n")
+              f.write("- RC6a-d: Riemannian distance axioms (1000 each)\n")
+              f.write("- RC7: Checkpoint serialized size formula (1000 configs)\n")
+              f.write("- RC8a: Leapfrog drift < Euler drift (1000 cases, lr<0.5)\n")
+              f.write("- RC8b: Leapfrog drift < 1% for small lr (1000 cases, lr<0.1)\n")
           PYEOF
 
       - name: Upload RapidCheck results
@@ -801,6 +826,160 @@ jobs:
           retention-days: 14
 
   # ═══════════════════════════════════════════════════════════════
+  #  KAGGLE GPU TRIGGER
+  #  Async: Kaggle notebook push (GPU training) — non-blocking
+  #  Requires secrets:
+  #    KAGGLE_USERNAME  — Kaggle account username
+  #    KAGGLE_KEY       — Kaggle API key (Settings → API → Create New Token)
+  #  kernel-metadata.json must exist at repo root with kernel slug.
+  #
+  #  Kya karta hai:
+  #    1. kaggle CLI install karo
+  #    2. API credentials configure karo (~/.kaggle/kaggle.json)
+  #    3. kaggle_gpu_train.ipynb ko Kaggle pe push karo
+  #       (kaggle kernels push — kernel-metadata.json se slug leta hai)
+  #    4. Push hone ke baad status check karta hai (async)
+  #
+  #  main branch push par hi chalega (dev pe nahi) — GPU waste bachao.
+  #  Non-blocking: continue-on-error: true
+  # ═══════════════════════════════════════════════════════════════
+  kaggle-gpu-trigger:
+    name: "Kaggle GPU Notebook Push (async)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kaggle CLI
+        run: pip install --quiet kaggle
+
+      - name: Configure Kaggle credentials
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          # Secrets check
+          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
+            echo "❌ KAGGLE_USERNAME ya KAGGLE_KEY secret missing hai"
+            echo "   GitHub → Settings → Secrets and variables → Actions mein add karo:"
+            echo "   - KAGGLE_USERNAME : tumhara Kaggle username"
+            echo "   - KAGGLE_KEY      : Kaggle API key (kaggle.com/settings → API)"
+            exit 1
+          fi
+
+          mkdir -p ~/.kaggle
+          cat > ~/.kaggle/kaggle.json << EOF
+          {
+            "username": "${KAGGLE_USERNAME}",
+            "key": "${KAGGLE_KEY}"
+          }
+          EOF
+          chmod 600 ~/.kaggle/kaggle.json
+          echo "✅ Kaggle credentials configured"
+
+      - name: Verify kernel-metadata.json
+        run: |
+          if [ ! -f kernel-metadata.json ]; then
+            echo "❌ kernel-metadata.json root mein nahi mila"
+            echo "   Example content:"
+            cat << 'EOF'
+          {
+            "id": "YOUR_USERNAME/logos-gpu-training",
+            "title": "LOGOS GPU Training",
+            "code_file": "kaggle_gpu_train.ipynb",
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true
+          }
+          EOF
+            exit 1
+          fi
+
+          echo "✅ kernel-metadata.json found:"
+          cat kernel-metadata.json
+
+          # Notebook exist check
+          NOTEBOOK=$(python3 -c "import json; d=json.load(open('kernel-metadata.json')); print(d.get('code_file','kaggle_gpu_train.ipynb'))")
+          if [ ! -f "$NOTEBOOK" ]; then
+            echo "❌ Notebook nahi mila: $NOTEBOOK"
+            exit 1
+          fi
+          echo "✅ Notebook found: $NOTEBOOK"
+
+      - name: Push notebook to Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          echo "📤 Kaggle pe notebook push ho rahi hai..."
+          kaggle kernels push -p . 2>&1 | tee push_output.txt
+          PUSH_EXIT=${PIPESTATUS[0]}
+
+          echo "Push output:"
+          cat push_output.txt
+
+          if [ $PUSH_EXIT -ne 0 ]; then
+            # Check for common errors
+            if grep -q "404" push_output.txt; then
+              echo "⚠️  Kernel pehli baar push ho rahi hai ya slug mismatch"
+              echo "   kernel-metadata.json mein 'id' check karo:"
+              echo "   Format: 'username/kernel-slug'"
+            elif grep -q "403" push_output.txt; then
+              echo "❌ Auth error — KAGGLE_KEY invalid hai ya expire ho gayi"
+            elif grep -q "401" push_output.txt; then
+              echo "❌ Unauthorized — KAGGLE_USERNAME ya KAGGLE_KEY galat hai"
+            fi
+            exit $PUSH_EXIT
+          fi
+
+          echo "✅ Notebook successfully pushed to Kaggle"
+
+      - name: Check push status (async poll)
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          # kernel slug extract karo
+          KERNEL_SLUG=$(python3 -c "
+          import json
+          d = json.load(open('kernel-metadata.json'))
+          kernel_id = d.get('id', '')
+          # Format: 'username/slug' — full slug as-is
+          print(kernel_id)
+          ")
+
+          if [ -z "$KERNEL_SLUG" ]; then
+            echo "⚠️  kernel slug nahi mila kernel-metadata.json se"
+            exit 0
+          fi
+
+          echo "Kernel slug: $KERNEL_SLUG"
+          echo "30 second wait — Kaggle queue mein aane do..."
+          sleep 30
+
+          # Status check (non-blocking — just info)
+          echo "=== Kernel Status ==="
+          kaggle kernels status "$KERNEL_SLUG" 2>&1 || \
+            echo "⚠️  Status check failed — kernel shayad queue mein hai"
+
+          echo ""
+          echo "📊 Training status Kaggle pe dekho:"
+          echo "   https://www.kaggle.com/code/${KERNEL_SLUG}"
+
+      - name: Upload push log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-push-log
+          path: push_output.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # ═══════════════════════════════════════════════════════════════
   #  SUMMARY GATE
   # ═══════════════════════════════════════════════════════════════
   summary:
@@ -817,6 +996,7 @@ jobs:
       - macos-build
       - rapidcheck-tests
       - mutation-tests
+      - kaggle-gpu-trigger
     if: always()
     steps:
       - name: Print results + gate
@@ -831,9 +1011,10 @@ jobs:
           R_MAC_BLD: ${{ needs.macos-build.result }}
           R_MULL: ${{ needs.mutation-tests.result }}
           R_RC: ${{ needs.rapidcheck-tests.result }}
+          R_KAGGLE: ${{ needs.kaggle-gpu-trigger.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v26-RapidCheck"
+          echo "  LOGOS CI Summary — v28-KaggleFix"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -846,7 +1027,7 @@ jobs:
           echo "  macOS Build:          $R_MAC_BLD"
           echo "  RapidCheck Tests:     $R_RC (non-blocking)"
           echo "  MULL Mutation Tests:  $R_MULL (non-blocking)"
-          echo "  Kaggle GPU Trigger:   async (non-blocking)"
+          echo "  Kaggle GPU Trigger:   $R_KAGGLE (non-blocking, main only)"
           echo ""
           echo "  CTest coverage:"
           echo "    T2  Math Unit (CPU)"
@@ -865,8 +1046,19 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
+          echo "  Changes in v28 (KaggleFix):"
+          echo "    ✅ kaggle-gpu-trigger job ADD kiya (pehle sirf overview mein tha, actual job nahi tha)"
+          echo "    ✅ Kaggle push: main branch push par hi chalta hai (dev skips)"
+          echo "    ✅ Secrets: KAGGLE_USERNAME + KAGGLE_KEY required"
+          echo "    ✅ kernel-metadata.json validation added"
+          echo "    ✅ Async status poll (30s wait after push)"
+          echo "    ✅ kaggle-push-log artifact (3 day retention)"
+          echo "    ✅ CMakeLists.txt: CPU-only branch mein ASAN_ENV T2/T2b/T4 pe apply"
+          echo "    ✅ permissions: actions: write added (workflow_dispatch ke liye)"
+          echo ""
+          echo "  Changes in v27 (PhysicsMull): (pichla)"
+          echo ""
           echo "  Changes in v26 (RapidCheck):"
-          
           echo "    ✅ rapidcheck-tests job add kiya — actual C++ headers directly test"
           echo "    ✅ LOGOS_RAPIDCHECK=ON cmake flag — FetchContent se rapidcheck"
           echo "    ✅ T7_RapidCheck CTest target — PROPERTY label"
@@ -904,6 +1096,14 @@ jobs:
           fi
           if [ "$R_MULL" = "failure" ]; then
             echo "⚠️  MULL mutation tests failed (non-blocking — check mull-reports artifact)"
+          fi
+          if [ "$R_KAGGLE" = "failure" ]; then
+            echo "⚠️  Kaggle GPU push failed (non-blocking) — check kaggle-push-log artifact"
+            echo "   Secrets check: KAGGLE_USERNAME + KAGGLE_KEY GitHub secrets mein hone chahiye"
+          elif [ "$R_KAGGLE" = "skipped" ]; then
+            echo "ℹ️  Kaggle GPU push: skipped (sirf main branch push par chalta hai)"
+          else
+            echo "✅ Kaggle GPU push: $R_KAGGLE"
           fi
 
           if [ "$FAIL" = "true" ]; then

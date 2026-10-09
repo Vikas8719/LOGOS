@@ -259,12 +259,18 @@ if(CMAKE_CUDA_COMPILER)
         enable_testing()
         add_test(NAME "T7_RapidCheck" COMMAND test_rapidcheck)
         set_tests_properties("T7_RapidCheck" PROPERTIES
-            TIMEOUT 900
+            TIMEOUT 1200
             LABELS "PROPERTY"
-            ENVIRONMENT "RC_PARAMS=max_success=500")
+            # RC_PARAMS: RapidCheck runtime config (semicolon-separated key=value)
+            # max_success=1000 : 1000 random cases per rc::check (was 500 — too lenient)
+            # max_discard_ratio=10 : RC_PRE rejections 10x se zyada ho toh fail
+            # noshrink=0         : counterexample shrinking ON (default) — important!
+            # seed=<N>           : reproducible run ke liye (CI mein unset = random)
+            ENVIRONMENT "RC_PARAMS=max_success=1000;max_discard_ratio=10")
         message(STATUS "✅ RapidCheck ENABLED — target: test_rapidcheck")
         message(STATUS "   Run: cmake --build build --target test_rapidcheck")
         message(STATUS "   CTest: ctest -L PROPERTY --output-on-failure")
+        message(STATUS "   Strict: RC_PARAMS=max_success=1000;max_discard_ratio=10")
     endif()
 
     # ── TEST 2b: Checkpoint roundtrip ────────────────────────
@@ -497,19 +503,29 @@ else()
         enable_testing()
         add_test(NAME "T7_RapidCheck" COMMAND test_rapidcheck)
         set_tests_properties("T7_RapidCheck" PROPERTIES
-            TIMEOUT 900
+            TIMEOUT 1200
             LABELS "PROPERTY"
-            ENVIRONMENT "RC_PARAMS=max_success=500")
+            ENVIRONMENT "RC_PARAMS=max_success=1000;max_discard_ratio=10")
         message(STATUS "✅ RapidCheck ENABLED (CPU-only mode) — target: test_rapidcheck")
         message(STATUS "   Run: cmake --build build_rc --target test_rapidcheck")
+        message(STATUS "   Strict: RC_PARAMS=max_success=1000;max_discard_ratio=10")
     else()
+        # ── CPU-only mode: ASan+UBSan env vars ───────────────────
+        set(ASAN_ENV
+            "ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:print_stats=1:check_initialization_order=1:detect_stack_use_after_return=1"
+            "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+        )
+
         enable_testing()
         add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
         add_test(NAME "T2b_Checkpoint"      COMMAND test_checkpoint)
         add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
-        set_tests_properties("T2_Math_Unit"        PROPERTIES TIMEOUT 60)
-        set_tests_properties("T2b_Checkpoint"      PROPERTIES TIMEOUT 60)
-        set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600)
+        set_tests_properties("T2_Math_Unit"   PROPERTIES TIMEOUT 60
+            ENVIRONMENT "${ASAN_ENV}")
+        set_tests_properties("T2b_Checkpoint" PROPERTIES TIMEOUT 60
+            ENVIRONMENT "${ASAN_ENV}")
+        set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600
+            ENVIRONMENT "${ASAN_ENV}")
     endif()
 
     if(NOT LOGOS_RAPIDCHECK)

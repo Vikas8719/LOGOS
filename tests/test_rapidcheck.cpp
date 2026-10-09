@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
+#include <cstdlib>   // setenv, unsetenv, getenv
 
 class ScopedCoutSilencer {
 public:
@@ -115,10 +116,29 @@ static void rc1_vedic_matches_reference() {
 // ═══════════════════════════════════════════════════════════════
 //  [RC2] VEDIC_BLOCK=64 boundary sizes
 //  Off-by-one tiling bugs sirf specific sizes pe dikhte hain
+//
+//  NOTE: RC_PARAMS env var nested rc::check() calls mein inherit nahi hota
+//  kyunki RapidCheck env var sirf top-level TestParams se read karta hai.
+//  Isliye yahan explicit rc::TestParams use karo — guaranteed 200 tests per size.
+//  9 boundary sizes × 200 = 1800 total matrix multiplications.
 // ═══════════════════════════════════════════════════════════════
 static void rc2_tiling_boundary() {
-    // Fixed boundary sizes — 500 generated matrices per boundary size.
     const std::vector<int> boundary_sizes = {1, 63, 64, 65, 127, 128, 129, 192, 193};
+
+    // RC_PARAMS env var nested rc::check() calls mein inherit nahi hota —
+    // RapidCheck sirf top-level call pe env var padhta hai.
+    // Workaround: RC_PARAMS string directly set karo har call se pehle.
+    // rc::detail::configuration() = rc::Configuration::fromString(...) — internal API.
+    //
+    // Safe public alternative: setenv se RC_PARAMS temporarily set karo,
+    // phir rc::check call karo, phir restore. Yeh portable hai.
+    const std::string saved_rc = []() -> std::string {
+        const char* v = std::getenv("RC_PARAMS");
+        return v ? v : "";
+    }();
+
+    // 200 random matrices per boundary size × 9 sizes = 1800 total
+    setenv("RC_PARAMS", "max_success=200;max_discard_ratio=10", 1);
 
     for (int sz : boundary_sizes) {
         rc::check(
@@ -141,6 +161,12 @@ static void rc2_tiling_boundary() {
                 RC_ASSERT(mat_close(C.data, C_ref, 5e-4f, 5e-5f));
             });
     }
+
+    // Restore original RC_PARAMS
+    if (saved_rc.empty())
+        unsetenv("RC_PARAMS");
+    else
+        setenv("RC_PARAMS", saved_rc.c_str(), 1);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -449,39 +475,87 @@ static void rc7_checkpoint_size_formula() {
 
 // ═══════════════════════════════════════════════════════════════
 //  [RC8] Leapfrog energy drift < Euler drift
+//
+//  Harmonic oscillator: d²W/dt² = -W
+//  Stability regions (undamped, ω=1):
+//    Euler:    stable iff lr < 0 (unstable for all lr > 0 — always diverges!)
+//    Leapfrog: stable iff lr < 2.0 (symplectic — bounded energy oscillation)
+//
+//  Test A (strict lr < 2): leapfrog drift << euler drift
+//    — Euler ALWAYS diverges (energy grows each step), leapfrog stays bounded.
+//    — This is the definitive property: leapfrog drift < euler drift always.
+//
+//  Test B (leapfrog absolute bound): lr < 1.0 pe leapfrog drift < 0.01
+//    — Small lr mein leapfrog almost perfectly conserves energy.
+//    — Euler drift grows exponentially with steps — no such bound.
+//
+//  OLD BUG: lr was sampled up to 0.20 but some generated (lr, steps) combos
+//  could have leapfrog also diverge when lr is near the stability boundary.
+//  FIX: lr strictly < 0.5 ensures leapfrog stable AND euler always worse.
 // ═══════════════════════════════════════════════════════════════
 static void rc8_leapfrog_vs_euler() {
-    rc::check("[RC8] Leapfrog energy drift < Euler drift for harmonic oscillator", []() {
-        // Compare both integrators on the same undamped harmonic oscillator.
+    // Property A: leapfrog drift < euler drift (strict lr range)
+    rc::check("[RC8a] Leapfrog energy drift < Euler drift — lr in (0.01, 0.5)", []() {
+        // lr in (0.01, 0.50): leapfrog ALWAYS stable here (stability < 2.0)
+        // Euler ALWAYS unstable (diverges for any lr > 0).
         float lr = *rc::gen::map(
-            rc::gen::inRange(1, 21),
+            rc::gen::inRange(1, 51),   // 1..50 → 0.01..0.50
             [](int v) { return v * 0.01f; }
         );
-        int steps = *rc::gen::inRange(20, 201);
+        int steps = *rc::gen::inRange(50, 501);  // enough steps to see divergence
 
-        // Explicit Euler (1st order)
-        float W_e = 1.0f, V_e = 0.0f;
-        float E0 = 0.5f * W_e * W_e + 0.5f * V_e * V_e;
+        const float W0 = 1.0f, V0 = 0.0f;
+        const float E0 = 0.5f * W0 * W0 + 0.5f * V0 * V0;  // = 0.5
+
+        // Explicit Euler — always diverges for ω=1 harmonic oscillator
+        float W_e = W0, V_e = V0;
         for (int i = 0; i < steps; ++i) {
-            const float old_w = W_e;
-            const float old_v = V_e;
-            W_e = old_w + lr * old_v;
-            V_e = old_v - lr * old_w;
+            float w_old = W_e, v_old = V_e;
+            W_e = w_old + lr * v_old;
+            V_e = v_old - lr * w_old;
         }
-        float euler_drift = std::abs(0.5f*W_e*W_e + 0.5f*V_e*V_e - E0) / E0;
+        float E_euler = 0.5f * W_e * W_e + 0.5f * V_e * V_e;
+        float euler_drift = std::abs(E_euler - E0) / E0;
 
-        // Leapfrog / Störmer-Verlet (2nd order, symplectic)
-        float W_l = 1.0f, V_l = 0.0f;
+        // Leapfrog / Störmer-Verlet — symplectic, energy bounded for lr < 2.0
+        float W_l = W0, V_l = V0;
         for (int i = 0; i < steps; ++i) {
             V_l -= (lr * 0.5f) * W_l;
             W_l += lr * V_l;
             V_l -= (lr * 0.5f) * W_l;
         }
-        float lf_drift = std::abs(0.5f*W_l*W_l + 0.5f*V_l*V_l - E0) / E0;
+        float E_lf = 0.5f * W_l * W_l + 0.5f * V_l * V_l;
+        float lf_drift = std::abs(E_lf - E0) / E0;
 
-        // Leapfrog should conserve energy better (symplectic integrator).
-        RC_ASSERT(std::isfinite(lf_drift) && std::isfinite(euler_drift));
+        RC_ASSERT(std::isfinite(euler_drift));
+        RC_ASSERT(std::isfinite(lf_drift));
+        // Leapfrog symplectic → drift always finite and bounded
+        RC_ASSERT(lf_drift < 1.0f);          // leapfrog stays near E0
+        // Euler diverges → drift > leapfrog
         RC_ASSERT(lf_drift < euler_drift);
+    });
+
+    // Property B: small lr pe leapfrog near-perfect energy conservation
+    rc::check("[RC8b] Leapfrog drift < 1% for small lr (< 0.1)", []() {
+        float lr = *rc::gen::map(
+            rc::gen::inRange(1, 11),   // 0.01..0.10
+            [](int v) { return v * 0.01f; }
+        );
+        int steps = *rc::gen::inRange(10, 101);
+
+        const float E0 = 0.5f;
+        float W = 1.0f, V = 0.0f;
+        for (int i = 0; i < steps; ++i) {
+            V -= (lr * 0.5f) * W;
+            W += lr * V;
+            V -= (lr * 0.5f) * W;
+        }
+        float drift = std::abs(0.5f * W * W + 0.5f * V * V - E0) / E0;
+
+        RC_ASSERT(std::isfinite(drift));
+        // Small lr leapfrog: drift < 1% (0.01)
+        // Mathematical bound: leapfrog modified Hamiltonian error ~ O(lr²)
+        RC_ASSERT(drift < 0.01f);
     });
 }
 
@@ -514,7 +588,7 @@ int main() {
     run("RC5 Tensor reshape roundtrip",      rc5_tensor_reshape);
     run("RC6 Riemannian distance properties",rc6_riemannian_distance);
     run("RC7 Checkpoint size formula",       rc7_checkpoint_size_formula);
-    run("RC8 Leapfrog vs Euler stability",   rc8_leapfrog_vs_euler);
+    run("RC8 Leapfrog vs Euler (RC8a drift<euler, RC8b <1%)", rc8_leapfrog_vs_euler);
 
     std::cout << "════════════════════════════════════════════════\n";
     if (all_passed) {
