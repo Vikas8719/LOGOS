@@ -2283,10 +2283,15 @@ static void test_m20_attention_mutations() {
         // Manual: Q = [[1,2],[3,4]] seq=2, d_k=2, eta=1.0
         // Q_adv[0] = Q[0] + 1*(Q[0]-Q[0]) = Q[0] (boundary)
         // Q_adv[1] = Q[1] + 1*(Q[1]-Q[0]) = [3,4]+[2,2] = [5,6]
-        // If - → +: Q_adv[1] = [3,4]+[3+1,4+2] = [3+4,4+6] = [7,10] — different
+        //
+        // Key: Use asymmetric K so score ratios change with advection.
+        // K = [[2,0],[0,1]] → Standard scores row1: [3*2+4*0, 3*0+4*1] = [6,4]
+        //                     NS scores row1:        [5*2+6*0, 5*0+6*1] = [10,6]
+        // softmax([6,4]/sqrt(2)) ≠ softmax([10,6]/sqrt(2)) because (6-4)≠(10-6)
+        // If - → +: Q_adv[1] = [3,4]+[3+1,4+2] = [7,10] → scores [14,10] — also different
         int seq=2, d_k=2, d_v=2;
         Tensor Q({seq,d_k}); Q.data={1.f,2.f, 3.f,4.f};
-        Tensor K({seq,d_k}); K.data={1.f,0.f, 0.f,1.f};
+        Tensor K({seq,d_k}); K.data={2.f,0.f, 0.f,1.f};   // asymmetric K: score gap (6-4) != NS gap (10-6), so outputs differ
         Tensor V({seq,d_v}); V.data={10.f,0.f, 0.f,10.f};
         Tensor mask({seq,seq},0.f); mask.at(0,1)=-1e9f;
 
