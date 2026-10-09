@@ -849,6 +849,10 @@ jobs:
     needs: [cpu-tests-linux]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     continue-on-error: true
+    concurrency:
+      group: kaggle-${{ github.repository }}-logos-gpu-training-v3
+      cancel-in-progress: false
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -915,28 +919,81 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          KERNEL_SLUG=$(python3 -c "import json; print(json.load(open('kernel-metadata.json'))['id'])")
+          : > push_output.txt
+
+          wait_for_kernel_idle() {
+            local elapsed=0
+            local max_wait=1800
+            local status_output
+            local status_exit
+
+            while [ "$elapsed" -lt "$max_wait" ]; do
+              if status_output=$(kaggle kernels status "$KERNEL_SLUG" 2>&1); then
+                echo "Kaggle kernel status: $status_output" | tee -a push_output.txt
+                if ! printf '%s' "$status_output" | grep -Eiq 'RUNNING|QUEUED|PENDING'; then
+                  return 0
+                fi
+              else
+                status_exit=$?
+                echo "Kaggle status check failed ($status_exit): $status_output" | tee -a push_output.txt
+                if printf '%s' "$status_output" | grep -Eiq '404|not found|does not exist'; then
+                  return 0
+                fi
+                return "$status_exit"
+              fi
+
+              echo "Kernel abhi active/queued hai; 30 seconds baad status check hoga." | tee -a push_output.txt
+              sleep 30
+              elapsed=$((elapsed + 30))
+            done
+
+            echo "Timed out: Kaggle kernel 30 minutes mein idle nahi hua." | tee -a push_output.txt
+            return 1
+          }
+
           echo "📤 Kaggle pe notebook push ho rahi hai..."
-          kaggle kernels push -p . 2>&1 | tee push_output.txt
-          PUSH_EXIT=${PIPESTATUS[0]}
-
-          echo "Push output:"
-          cat push_output.txt
-
-          if [ $PUSH_EXIT -ne 0 ]; then
-            # Check for common errors
-            if grep -q "404" push_output.txt; then
-              echo "⚠️  Kernel pehli baar push ho rahi hai ya slug mismatch"
-              echo "   kernel-metadata.json mein 'id' check karo:"
-              echo "   Format: 'username/kernel-slug'"
-            elif grep -q "403" push_output.txt; then
-              echo "❌ Auth error — KAGGLE_KEY invalid hai ya expire ho gayi"
-            elif grep -q "401" push_output.txt; then
-              echo "❌ Unauthorized — KAGGLE_USERNAME ya KAGGLE_KEY galat hai"
-            fi
-            exit $PUSH_EXIT
+          if ! wait_for_kernel_idle; then
+            echo "❌ Push se pehle kernel status verify/idle nahi ho saka." | tee -a push_output.txt
+            exit 1
           fi
 
-          echo "✅ Notebook successfully pushed to Kaggle"
+          for attempt in 1 2 3; do
+            echo "Push attempt ${attempt}/3..." | tee -a push_output.txt
+            set +e
+            kaggle kernels push -p . 2>&1 | tee push_attempt.txt
+            PUSH_EXIT=${PIPESTATUS[0]}
+            set -e
+            cat push_attempt.txt >> push_output.txt
+
+            if [ "$PUSH_EXIT" -eq 0 ]; then
+              echo "✅ Notebook successfully pushed to Kaggle" | tee -a push_output.txt
+              exit 0
+            fi
+
+            if ! grep -Eqi '409|conflict' push_attempt.txt; then
+              if grep -q "404" push_attempt.txt; then
+                echo "⚠️  Kernel not found or slug mismatch; verify kernel-metadata.json id." | tee -a push_output.txt
+              elif grep -q "403" push_attempt.txt; then
+                echo "❌ Auth error — KAGGLE_KEY invalid hai ya expire ho gayi." | tee -a push_output.txt
+              elif grep -q "401" push_attempt.txt; then
+                echo "❌ Unauthorized — KAGGLE_USERNAME ya KAGGLE_KEY galat hai." | tee -a push_output.txt
+              fi
+              exit "$PUSH_EXIT"
+            fi
+
+            if [ "$attempt" -eq 3 ]; then
+              echo "❌ Kaggle push 3 attempts ke baad bhi 409 Conflict de raha hai." | tee -a push_output.txt
+              exit "$PUSH_EXIT"
+            fi
+
+            echo "⚠️  Kaggle returned 409 Conflict; waiting for the kernel to become idle before retry." | tee -a push_output.txt
+            if ! wait_for_kernel_idle; then
+              echo "❌ Conflict ke baad kernel idle/status verify nahi ho saka." | tee -a push_output.txt
+              exit 1
+            fi
+            sleep 30
+          done
 
       - name: Check push status (async poll)
         env:
