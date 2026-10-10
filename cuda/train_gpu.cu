@@ -844,11 +844,14 @@ void train_gpu(const std::string& dataset_path) {
     // [v23-AMP] H100 detection
     bool is_h100 = (prop.major == 9 && prop.minor == 0);   // sm_90 = H100
     bool is_a100 = (prop.major == 8 && prop.minor == 0);   // sm_80 = A100
+    bool is_t4   = (prop.major == 7 && prop.minor == 5
+                    && prop.totalGlobalMem < 17ULL*1024*1024*1024); // sm_75 + <17GB = T4
     bool amp_supported = (prop.major >= 7);                  // FP16 Tensor Cores: Volta+
-    printf("  AMP: FP16 Tensor Cores %s | H100: %s | A100: %s\n",
-           amp_supported ? "✅" : "❌",
-           is_h100 ? "✅" : "—",
-           is_a100 ? "✅" : "—");
+    printf("  GPU detected: H100=%s | A100=%s | T4=%s | CC=%d.%d | VRAM=%.1fGB\n",
+           is_h100?"✅":"—", is_a100?"✅":"—", is_t4?"✅":"—",
+           prop.major, prop.minor,
+           (float)prop.totalGlobalMem/1024/1024/1024);
+    printf("  AMP: FP16 Tensor Cores %s\n", amp_supported ? "✅" : "❌");
     if (!amp_supported) {
         printf("  ⚠️  GPU CC < 7.0 — FP16 Tensor Cores not available\n");
         printf("      AMP disabled, falling back to FP32\n");
@@ -1014,9 +1017,10 @@ void train_gpu(const std::string& dataset_path) {
     //   T4:  LOGOS_GRAD_ACCUM=8  (smoother but 2x slower per step)
     //   A100: LOGOS_GRAD_ACCUM=16 → 65K tokens/step
     //   H100: LOGOS_GRAD_ACCUM=32 → 128K tokens/step
-    int grad_accum_default = 4;  // [v32] T4 default: 4 (was 1 → too noisy)
-    if (is_a100) grad_accum_default = 16;
-    if (is_h100) grad_accum_default = 32;
+    int grad_accum_default = 4;  // T4 default
+    if (is_t4)   grad_accum_default = 4;   // T4 (15GB): 4 × 4096 = 16K tokens/step
+    if (is_a100)  grad_accum_default = 16;  // A100 (40GB)
+    if (is_h100)  grad_accum_default = 32;  // H100 (80GB)
     int grad_accum = (int)logos_env_f("LOGOS_GRAD_ACCUM", (float)grad_accum_default);
     grad_accum = std::max(1, std::min(32, grad_accum));  // clamp [1, 32]
     printf("  [v32-BATCH] grad_accum=%d → %d tokens/step (T4=4, A100=16, H100=32 | override: LOGOS_GRAD_ACCUM)\n",
@@ -1342,7 +1346,8 @@ void train_gpu(const std::string& dataset_path) {
         loss_scaler.steps_since_last_overflow = init_window;
         printf("  [v23-AMP] ManualLossScaler: init_scale=%.0f window=%d (restored=%d)\n",
                loss_scaler.scale, LOSS_SCALE_WINDOW, init_window);
-        printf("  [v23-AMP] H100 SXM: FP16 forward (2× TFLOPS) + FP32 master weights\n");
+        const char* gpu_name = is_h100 ? "H100 SXM" : is_a100 ? "A100" : is_t4 ? "T4" : "GPU";
+        printf("  [v23-AMP] %s: FP16 forward (2× TFLOPS) + FP32 master weights\n", gpu_name);
         printf("  [v23-AMP] Precision: forward=FP16 | grads=FP32 | optimizer=FP32\n");
         printf("  [v23-AMP] To resume scale: set LOGOS_AMP_SCALE=<prev_scale> LOGOS_AMP_WINDOW=<prev_window>\n");
     }
@@ -1713,11 +1718,11 @@ void train_gpu(const std::string& dataset_path) {
                 }
                 } // C_proxy freed here (RAII)
 
-            // [v33-FAST] Log frequency: default har 100 steps → LOGOS_LOG_FREQ se override
-            // T4 pe val loop (30 batches) ~8-12s leta hai → har 100 steps = 8-12% overhead!
-            // Default: 500 steps (was 100) = 10× less val overhead.
-            // Override: LOGOS_LOG_FREQ=100  (verbose), LOGOS_LOG_FREQ=1000 (fast)
-            int64_t log_freq = (int64_t)logos_env_f("LOGOS_LOG_FREQ", 500.f);
+            // [v33-FAST] Log frequency: T4 pe 100 steps, A100/H100 pe 500
+            // T4 val loop (10 batches) ~3s → har 100 steps = acceptable overhead
+            // Override: LOGOS_LOG_FREQ=50 (verbose) ya LOGOS_LOG_FREQ=1000 (fast)
+            int64_t log_freq_default = is_t4 ? 100LL : 500LL;
+            int64_t log_freq = (int64_t)logos_env_f("LOGOS_LOG_FREQ", (float)log_freq_default);
             log_freq = std::max((int64_t)10, std::min((int64_t)10000, log_freq));
 
             if (step % log_freq == 0) {
