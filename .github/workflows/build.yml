@@ -1,4 +1,4 @@
-name: LOGOS CI v29-Kaggle409Fix
+name: LOGOS CI v30-Kaggle409Fix2
 
 permissions:
   contents: read
@@ -968,13 +968,26 @@ jobs:
           try:
               with urllib.request.urlopen(req, timeout=30) as r:
                   data = json.loads(r.read())
-                  status = data.get("currentRunningVersion", {}).get("status", "") if isinstance(data.get("currentRunningVersion"), dict) else data.get("status", "")
-                  print(status.lower() if status else "unknown")
+                  # v30 FIX: Kaggle API multiple response shapes handle karo
+                  # Shape 1: top-level "status" string (new API)
+                  # Shape 2: "currentRunningVersion" dict ke andar "status" (old API)
+                  # Shape 3: numeric status codes (0=Running,1=Queued,2=Complete,3=Error,4=Cancelled)
+                  status = ""
+                  if "status" in data and isinstance(data["status"], (str, int)):
+                      status = str(data["status"])
+                  elif isinstance(data.get("currentRunningVersion"), dict):
+                      s = data["currentRunningVersion"].get("status", "")
+                      status = str(s) if s is not None else ""
+                  # Numeric → string mapping
+                  numeric_map = {"0": "running", "1": "queued", "2": "complete",
+                                 "3": "error",   "4": "cancelled", "5": "cancelling"}
+                  normalized = numeric_map.get(status, status.strip().lower() if status else "unknown")
+                  print(normalized)
           except urllib.error.HTTPError as e:
-              # 403/404 = private or not found — treat as unknown, not running
+              # 403/404 = private or not yet created — safe to push
               print(f"http_{e.code}")
           except Exception as e:
-              print(f"error_{str(e)[:30]}")
+              print(f"error_{str(e)[:40]}")
           PYEOF_STATUS
           )
             echo "  API Status: $STATUS_JSON" | tee -a push_output.txt
@@ -991,8 +1004,11 @@ jobs:
                 ;;
               http_403|http_404|unknown|error_*)
                 # Private kernel / not yet created / API unreachable
-                # Safe to push — if kernel doesn't exist yet, first push creates it
-                echo "  ℹ️  Status unknown (${STATUS_JSON}) — proceeding (safe for private/new kernels)" | tee -a push_output.txt
+                # v30 IMPORTANT: http_404 can also mean "kernel running but API
+                # returns 404 for private kernels on first-ever push" — safe to proceed
+                # but add a small courtesy wait to avoid hammering Kaggle
+                echo "  ℹ️  Status unknown (${STATUS_JSON}) — waiting 15s then proceeding (safe for private/new kernels)" | tee -a push_output.txt
+                sleep 15
                 break
                 ;;
               *)
@@ -1170,7 +1186,7 @@ jobs:
           R_KAGGLE: ${{ needs.kaggle-gpu-trigger.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v29-Kaggle409Fix"
+          echo "  LOGOS CI Summary — v30-Kaggle409Fix2"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -1202,7 +1218,18 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
-          echo "  Changes in v29 (Kaggle409Fix — PERMANENT):"
+          echo "  Changes in v30 (Kaggle409Fix2 — STATUS PARSING FIX):"
+          echo "    ✅ ROOT CAUSE: Kaggle API numeric status codes handle kiye"
+          echo "       0=Running, 1=Queued, 2=Complete, 3=Error, 4=Cancelled"
+          echo "    ✅ FIXED: Single-line .get() → robust multi-shape parser"
+          echo "       Shape 1: top-level 'status' string/int"
+          echo "       Shape 2: currentRunningVersion.status dict"
+          echo "       Shape 3: numeric codes → normalized string"
+          echo "    ✅ http_404: 15s courtesy wait added before push"
+          echo "       (private kernel ki first run pe 404 aa sakta hai)"
+          echo "    ✅ error string: 40 chars (was 30) for better diagnostics"
+          echo ""
+          echo "  Changes in v29 (Kaggle409Fix):"
           echo "    ✅ FIXED: 409 Conflict root cause — kaggle CLI status returns 403"
           echo "       Old code 403 ko 'idle' samajhta tha → push → 409"
           echo "    ✅ NEW: Python urllib se direct Kaggle REST API call"
