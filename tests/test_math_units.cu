@@ -307,7 +307,7 @@ static void test_poincare_geometry() {
     std::vector<float> h_rand(SEQ*D);
     for (int i=0; i<SEQ*D; i++) h_rand[i] = sinf((float)i)*3.0f;  // large values
     safe_cuda(cudaMemcpy(X.data, h_rand.data(), SEQ*D*sizeof(float), cudaMemcpyHostToDevice), "h2d rand");
-    expmap0_kernel<<<1, 256>>>(X.data, SEQ, D, 1.0f);
+    expmap0_kernel<<<SEQ, 256>>>(X.data, SEQ, D, 1.0f);
     safe_cuda(cudaDeviceSynchronize(), "expmap sync");
     safe_cuda(cudaMemcpy(h_out.data(), X.data, SEQ*D*sizeof(float), cudaMemcpyDeviceToHost), "d2h");
 
@@ -349,9 +349,9 @@ static void test_poincare_geometry() {
     std::vector<float> h_small(SEQ*D);
     for (int i=0; i<SEQ*D; i++) h_small[i] = 0.05f * sinf((float)i * 0.7f);
     safe_cuda(cudaMemcpy(X.data, h_small.data(), SEQ*D*sizeof(float), cudaMemcpyHostToDevice), "h2d small");
-    expmap0_kernel<<<1, 256>>>(X.data, SEQ, D, 1.0f);
+    expmap0_kernel<<<SEQ, 256>>>(X.data, SEQ, D, 1.0f);
     safe_cuda(cudaDeviceSynchronize(), "exp sync");
-    logmap0_kernel<<<1, 256>>>(X.data, SEQ, D, 1.0f);
+    logmap0_kernel<<<SEQ, 256>>>(X.data, SEQ, D, 1.0f);
     safe_cuda(cudaDeviceSynchronize(), "log sync");
     safe_cuda(cudaMemcpy(h_out.data(), X.data, SEQ*D*sizeof(float), cudaMemcpyDeviceToHost), "d2h rt");
 

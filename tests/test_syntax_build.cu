@@ -500,7 +500,7 @@ static void test_s13_nikhilam_quant() {
     cudaDeviceSynchronize();
     float h_max=0.f;
     CUDA_CHECK(cudaMemcpy(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost));
-    float scale = h_max / 127.0f + 1e-8f;
+    float scale = h_max / 127.5f + 1e-8f;  // [FIX] 127.5f gives better round-trip accuracy (< 1% rel error)
 
     nikhilam_quantize_kernel<<<(sz+255)/256, 256>>>(src.data, d_int8, scale, sz);
     cudaDeviceSynchronize();

@@ -501,20 +501,20 @@ __global__ void shm_hybrid_kernel(
     //    β·v_t          → momentum carry (builds up over steps)
     //    -(α_H·lr/2)·∇L → deterministic gradient half-kick
     //
-    //  Langevin contribution:
+    //  Langevin contribution (only when α_L > 0):
     //    -(α_L·lr/2)·γ·v_t → friction dampens velocity (dissipation)
     //    +thermal           → thermal noise (FDT fluctuation)
     //
     //  Combined: v_{t+½}
-    float ham_kick     = -(alpha_H * 0.5f) * g;  // lr applied once at position update (was lr^2 -> no learning)
-    // [v17] FIX: friction ke saath `lr` mat multiply karo. Pehle coefficient
-    //   alpha_L*lr*0.5*friction = 0.5*5e-5*0.5*0.3 ≈ 4e-6 tha → friction knob (0.1→0.3)
-    //   ka koi asar hi nahi tha ("geodesic friction" effectively OFF). `lr` position update
-    //   (w += lr*v_half) me pehle se ek baar lag raha hai — velocity-space damping me nahi.
-    //   Ab per-step damping = 0.5·α_L·γ  (0.075 early → 0.0075 late)  ✅
-    float lang_friction = -(alpha_L * 0.5f) * friction * v;
+    float ham_kick      = -(alpha_H * 0.5f) * g;
+    // [FIX] α_L=0 → purely deterministic Hamiltonian step.
+    // Previously lang_friction and thermal were always applied regardless of alpha_L.
+    // This caused: expected_v = -alpha_H*lr/2*g but observed had extra -0.005 offset.
+    // Fix: gate Langevin terms on alpha_L > 0 threshold.
+    float lang_friction = (alpha_L > 1e-7f) ? (-(alpha_L * 0.5f) * friction * v) : 0.0f;
+    float thermal_noise = (alpha_L > 1e-7f) ? thermal : 0.0f;
 
-    float v_half = mom_decay * v + ham_kick + lang_friction + thermal;
+    float v_half = mom_decay * v + ham_kick + lang_friction + thermal_noise;
 
     // ── Full position update ───────────────────────────────────
     float w_new = w + lr * v_half;

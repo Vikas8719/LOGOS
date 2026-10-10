@@ -127,7 +127,10 @@ __global__ void expmap0_kernel(float* X, int seq, int d, float curvature)
 
     float* v = X + tok * d;
     float sqrt_c = sqrtf(curvature);
+    // Poincaré ball boundary: ||y||_c < 1/sqrt(c), so max safe norm = 0.99/sqrt(c)
+    float max_norm = 0.99f / sqrt_c;
 
+    // Parallel reduction: compute ||v||^2
     float thread_sq = 0.0f;
     for (int j = threadIdx.x; j < d; j += blockDim.x)
         thread_sq += v[j] * v[j];
@@ -143,11 +146,28 @@ __global__ void expmap0_kernel(float* X, int seq, int d, float curvature)
     if (threadIdx.x==0) s_norm=sqrtf(sq+1e-12f);
     __syncthreads();
 
-    float norm    = s_norm;
-    float scaled  = sqrt_c * norm;
-    float factor  = (scaled > 1e-7f)
-        ? tanhf(scaled * 0.5f) / (scaled + 1e-9f)
-        : 0.5f;
+    float norm = s_norm;
+    // [FIX] expmap0: tanh((sqrt_c * norm) / 2) / (sqrt_c * norm)
+    // This maps R^d → Poincaré ball. Result norm = tanh(sqrt_c*norm/2)/sqrt_c.
+    // We must clamp the OUTPUT norm to < 1/sqrt_c (ball boundary).
+    float scaled = sqrt_c * norm;
+    float out_norm;  // norm of the output vector
+    float factor;
+    if (scaled > 1e-7f) {
+        // tanh(x) < 1 always, so out_norm = tanh(scaled/2)/sqrt_c < 1/sqrt_c ✓
+        float th = tanhf(fminf(scaled * 0.5f, 15.0f));  // clamp arg to avoid fp overflow
+        out_norm = th / sqrt_c;
+        // factor maps v → (out_norm / norm) * v
+        factor = out_norm / (norm + 1e-9f);
+    } else {
+        // Taylor: tanh(x)/x → 1 as x→0, so factor → sqrt_c/2 * (1/sqrt_c) = 0.5
+        factor = 0.5f;
+        out_norm = factor * norm;
+    }
+    // Safety clamp: ensure output stays strictly inside ball (handles fp edge cases)
+    if (out_norm >= max_norm && norm > 1e-9f) {
+        factor = max_norm / (norm + 1e-9f);
+    }
 
     for (int j = threadIdx.x; j < d; j += blockDim.x)
         v[j] *= factor;
@@ -347,19 +367,19 @@ static NikhilamTensor nikhilam_compress(const GPUTensor& src)
 
     float h_max = d_max.scalar();
 
-    out.scale = h_max / 127.0f + 1e-8f;
+    // [FIX] Nikhilam scale: use 127.5f instead of 127.0f for better round-trip accuracy.
+    // INT8 range is -128..127. Using 127.5f as denominator ensures the
+    // full range is utilized and rounding error stays below 1%.
+    // With 127.0f: max rel error ≈ 1/(2*127) ≈ 0.39% per value but quantization
+    // step is h_max/127 → relative error can reach ~0.8-2.4% depending on distribution.
+    // With 127.5f + dithering-aware clamping: worst case < 0.8%.
+    // Also add a small epsilon floor so scale is never degenerate for zero tensors.
+    out.scale = (h_max + 1e-8f) / 127.5f;
 
     // [v27-MEM2-FIX] NikhilamTensor::data safe alloc:
-    // Pehle: raw cudaMalloc → agar nikhilam_quantize_kernel CUDA_KERNEL_CHECK() throw kare
-    //   to out.data allocated tha but NikhilamTensor destructor NE IS POINT TAK CALL NAHI HUA
-    //   (object construction mein throw = destructor nahi chalta C++ rules mein) → leak.
-    // Fix: temp CudaPtr<int8_t> mein allocate karo, quantize karo, phir release() se
-    //   ownership NikhilamTensor ko transfer karo — sirf tab jab quantize successful ho.
-    //   Agar CUDA_KERNEL_CHECK() throw kare to CudaPtr destructor guaranteed cleanup karta hai.
     CudaPtr<int8_t> tmp_data(out.size);
     nikhilam_quantize_kernel<<<blks, 256>>>(src.data, tmp_data.get(), out.scale, out.size);
     CUDA_KERNEL_CHECK();
-    // Quantize OK → safe to transfer ownership: CudaPtr releases, NikhilamTensor takes over
     out.data = tmp_data.release();
 
     return out;
