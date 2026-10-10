@@ -523,19 +523,27 @@ static void test_shm_fdt_condition() {
     // Note: lr is NOT in the velocity half-kick — it's only in w += lr*v_half
     // So expected_v = -(alpha_H * 0.5f) * g = -0.5 * 0.01 = -0.005
     float expected_v = -(1.0f * 0.5f) * 0.01f;  // = -0.005
-    float v_variance = 0.0f;
-    float v_mean_pure = 0.0f;
-    for (float v : h_v) v_mean_pure += v;
-    v_mean_pure /= N;
-    for (float v : h_v) v_variance += (v - v_mean_pure)*(v - v_mean_pure);
-    v_variance /= N;
+    // Check determinism: all elements should be identical (same input → same output)
+    // Use first element as reference, check all others match within float32 epsilon
+    float v_ref = h_v[0];
+    float v_max_dev = 0.0f;
+    float v_min_val = h_v[0], v_max_val = h_v[0];
+    for (int i = 1; i < N; i++) {
+        float dev = fabsf(h_v[i] - v_ref);
+        if (dev > v_max_dev) v_max_dev = dev;
+        if (h_v[i] < v_min_val) v_min_val = h_v[i];
+        if (h_v[i] > v_max_val) v_max_val = h_v[i];
+    }
 
-    printf("  Pure Hamiltonian (α_L=0): expected_v=%.8f | observed=%.8f | var=%.2e\n",
-           expected_v, v_mean_pure, v_variance);
+    printf("  Pure Hamiltonian (α_L=0): expected_v=%.8f | observed[0]=%.8f | max_dev=%.2e\n",
+           expected_v, v_ref, v_max_dev);
+    printf("  Value range: [%.8f, %.8f]\n", v_min_val, v_max_val);
 
-    MATH_ASSERT(fabsf(v_mean_pure - expected_v) < fabsf(expected_v)*0.01f,
+    MATH_ASSERT(fabsf(v_ref - expected_v) < fabsf(expected_v)*0.01f,
         "SHM: α_L=0 → deterministic Hamiltonian step (v = -α_H/2*g)");
-    MATH_ASSERT(v_variance < 1e-12f,
+    // Determinism check: all N elements got same input (zero w, zero v, const g)
+    // so they must all produce the same output — max deviation < float32 ULP tolerance
+    MATH_ASSERT(v_max_dev < 1e-6f,
         "SHM: α_L=0, noise=0 → zero velocity variance (fully deterministic)");
 
     cudaFree(d_w); cudaFree(d_v); cudaFree(d_g);
