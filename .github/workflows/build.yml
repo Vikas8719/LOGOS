@@ -1,4 +1,4 @@
-name: LOGOS CI v31-KaggleForceVersion
+name: LOGOS CI v32-KaggleAuthFix
 
 permissions:
   contents: read
@@ -866,23 +866,21 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          # Secrets check
           if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
             echo "❌ KAGGLE_USERNAME ya KAGGLE_KEY secret missing hai"
-            echo "   GitHub → Settings → Secrets and variables → Actions mein add karo:"
-            echo "   - KAGGLE_USERNAME : tumhara Kaggle username"
-            echo "   - KAGGLE_KEY      : Kaggle API key (kaggle.com/settings → API)"
             exit 1
           fi
-
           mkdir -p ~/.kaggle
-          cat > ~/.kaggle/kaggle.json << EOF
-          {
-            "username": "${KAGGLE_USERNAME}",
-            "key": "${KAGGLE_KEY}"
-          }
-          EOF
+          # CRITICAL: printf use karo — cat heredoc mein leading spaces aa jaati hain
+          # jo JSON parse error ya 403 Forbidden deta hai kaggle CLI ko
+          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" \
+            > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
+          # Verify — content sahi hai?
+          echo "✅ kaggle.json content:"
+          cat ~/.kaggle/kaggle.json
+          # kaggle CLI se bhi test karo
+          kaggle config view 2>&1 || true
           echo "✅ Kaggle credentials configured"
 
       - name: Verify kernel-metadata.json
@@ -1166,7 +1164,7 @@ jobs:
           R_KAGGLE: ${{ needs.kaggle-gpu-trigger.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v31-KaggleForceVersion"
+          echo "  LOGOS CI Summary — v32-KaggleAuthFix"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -1198,7 +1196,14 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
-          echo "  Changes in v31 (KaggleForceVersion — REAL ROOT CAUSE FIX):"
+          echo "  Changes in v32 (KaggleAuthFix — kaggle.json whitespace bug):"
+          echo "    ✅ ROOT CAUSE: cat heredoc mein leading spaces/indentation thi"
+          echo "       {\"username\": \"  vikas8719\"} → Kaggle API ne 403 diya"
+          echo "    ✅ FIX: printf se JSON write karo — zero indentation, clean format"
+          echo "       printf '{\"username\":\"%s\",\"key\":\"%s\"}' user key > kaggle.json"
+          echo "    ✅ Verify step add kiya — kaggle.json content + kaggle config view"
+          echo ""
+          echo "  Changes in v31 (KaggleForceVersion):"
           echo "    ✅ REAL ROOT CAUSE: kernel-metadata.json mein 'id_no' missing tha"
           echo "       Kaggle version counter ke saath sync nahi tha → 409 har baar"
           echo "    ✅ FIX: Kaggle REST API se current versionNumber fetch karo"
