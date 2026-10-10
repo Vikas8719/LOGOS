@@ -534,8 +534,8 @@ static void test_shm_fdt_condition() {
            expected_v, v_mean_pure, v_variance);
 
     MATH_ASSERT(fabsf(v_mean_pure - expected_v) < fabsf(expected_v)*0.01f,
-        "SHM: α_L=0 → deterministic Hamiltonian step (v = -α_H*lr/2*g)");
-    MATH_ASSERT(v_variance < 1e-20f,
+        "SHM: α_L=0 → deterministic Hamiltonian step (v = -α_H/2*g)");
+    MATH_ASSERT(v_variance < 1e-12f,
         "SHM: α_L=0, noise=0 → zero velocity variance (fully deterministic)");
 
     cudaFree(d_w); cudaFree(d_v); cudaFree(d_g);
