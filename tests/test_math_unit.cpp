@@ -3492,6 +3492,35 @@ int main() {
     test_m21_layernorm_mutations();
     if (g_pass == p0) { std::cerr << "[FATAL] test_m21_layernorm_mutations did not run\n"; return 1; }
 
+    // ── NEW: Targeted Mutation-Kill Tests (M22-M28) ──────────
+    p0 = g_pass;
+    test_m22_vedicgemm_tiled_internals();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m22_vedicgemm_tiled_internals did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m23_layernorm_welford_internals();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m23_layernorm_welford_internals did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m24_tensor_riemannian_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m24_tensor_riemannian_mutations did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m25_physicsopt_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m25_physicsopt_mutations did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m26_feedforward_gelu_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m26_feedforward_gelu_mutations did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m27_attention_ns_internals();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m27_attention_ns_internals did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m28_wpi_history_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m28_wpi_history_mutations did not run\n"; return 1; }
+
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << "  PASS: " << g_pass << "  FAIL: " << g_fail << "\n";
     std::cout << "  Total: " << (g_pass + g_fail) << " assertions\n";

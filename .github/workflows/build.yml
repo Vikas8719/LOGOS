@@ -809,11 +809,13 @@ jobs:
               print("   Next CI run mein format clear ho jaayega")
               sys.exit(0)  # non-blocking jab tak format confirm na ho
           elif avg < 60:
-              print(f"❌ Poor: {avg:.1f}%")
+              print(f"❌ Poor: {avg:.1f}% (target ≥ 75%)")
+          elif avg < 75:
+              print(f"⚠️  Improving: {avg:.1f}% (target ≥ 75% — add M22-M28 test calls)")
           elif avg < 80:
-              print(f"⚠️  OK: {avg:.1f}%")
+              print(f"✅ Target met: {avg:.1f}% ≥ 75% (excellent ≥ 80%)")
           else:
-              print(f"✅ Good: {avg:.1f}%")
+              print(f"✅ Excellent: {avg:.1f}%")
           PYEOF
 
       - name: Upload MULL reports
@@ -922,9 +924,68 @@ jobs:
           KERNEL_SLUG=$(python3 -c "import json; print(json.load(open('kernel-metadata.json'))['id'])")
           : > push_output.txt
 
-          echo "📤 Kaggle pe notebook push ho rahi hai..."
-          echo "Kaggle status endpoint ko push se pehle call nahi karenge; us endpoint ka 403 push permissions ka proof nahi hai." | tee -a push_output.txt
+          echo "📤 Kaggle pe notebook push ho rahi hai..." | tee -a push_output.txt
 
+          # ── 409 Conflict root cause aur fix ─────────────────────────────────────
+          # Kaggle 409 tab deta hai jab:
+          #   (a) Kernel abhi bhi RUNNING/QUEUED hai — dusra push allowed nahi
+          #   (b) Kernel version already exist karta hai (slug + version collision)
+          #   (c) API rate limit (same slug, rapid back-to-back push)
+          #
+          # Fix strategy:
+          #   1. Pehle kaggle kernels status check karo — agar RUNNING/QUEUED hai
+          #      toh ruko (60s intervals, max 10 min) jab tak COMPLETE/ERROR na ho
+          #   2. Agar idle hai toh seedha push karo
+          #   3. Agar push ke baad 409 aaye (version collision) — notebook mein
+          #      naya run-id cell inject karo aur dobara push karo
+          #   4. Max 3 attempts with exponential backoff
+          # ────────────────────────────────────────────────────────────────────────
+
+          # Step 1: Check if kernel is currently running — wait if so
+          echo "🔍 Checking kernel status before push..." | tee -a push_output.txt
+          MAX_WAIT_SECS=600   # 10 min max wait
+          POLL_SECS=60
+          ELAPSED=0
+          while [ "$ELAPSED" -lt "$MAX_WAIT_SECS" ]; do
+            STATUS_OUT=$(kaggle kernels status "$KERNEL_SLUG" 2>&1 || true)
+            echo "  Status: $STATUS_OUT" | tee -a push_output.txt
+            # Kaggle status output: "username/slug ... running" etc.
+            if echo "$STATUS_OUT" | grep -Eqi 'running|queued|pending'; then
+              echo "  ⏳ Kernel running/queued — waiting ${POLL_SECS}s (elapsed ${ELAPSED}s / ${MAX_WAIT_SECS}s)..." | tee -a push_output.txt
+              sleep "$POLL_SECS"
+              ELAPSED=$((ELAPSED + POLL_SECS))
+            else
+              echo "  ✅ Kernel idle — proceeding with push" | tee -a push_output.txt
+              break
+            fi
+          done
+          if [ "$ELAPSED" -ge "$MAX_WAIT_SECS" ]; then
+            echo "  ⚠️  Kernel still running after ${MAX_WAIT_SECS}s — pushing anyway" | tee -a push_output.txt
+          fi
+
+          # Step 2: Inject a unique run-id comment into notebook to force new version
+          # This prevents 409 "version already exists" collision
+          RUN_ID="ci-run-$(date -u +%Y%m%dT%H%M%S)-${{ github.sha }}"
+          python3 - "$RUN_ID" << 'PYEOF'
+          import json, sys
+          run_id = sys.argv[1]
+          nb = json.load(open("kaggle_gpu_train.ipynb"))
+          # Update or insert run-id in first markdown cell metadata
+          for cell in nb["cells"]:
+              if cell["cell_type"] == "markdown":
+                  src = cell["source"]
+                  # Replace existing run-id line or append
+                  new_src = [l for l in (src if isinstance(src, list) else src.splitlines(keepends=True))
+                             if not l.strip().startswith("<!-- run-id:")]
+                  new_src.insert(1, f"<!-- run-id: {run_id} -->\n")
+                  cell["source"] = new_src
+                  break
+          json.dump(nb, open("kaggle_gpu_train.ipynb", "w"), indent=1)
+          print(f"  ✅ Injected run-id: {run_id}")
+          PYEOF
+          echo "  Run-id injected: $RUN_ID" | tee -a push_output.txt
+
+          # Step 3: Push with retries — 409 ke baad longer backoff
           for attempt in 1 2 3; do
             echo "Push attempt ${attempt}/3..." | tee -a push_output.txt
             set +e
@@ -938,25 +999,43 @@ jobs:
               exit 0
             fi
 
-            if ! grep -Eqi '409|conflict' push_attempt.txt; then
-              if grep -q "404" push_attempt.txt; then
-                echo "⚠️  Kernel not found or slug mismatch; verify kernel-metadata.json id." | tee -a push_output.txt
-              elif grep -q "403" push_attempt.txt; then
-                echo "❌ Auth error — KAGGLE_KEY invalid hai ya expire ho gayi." | tee -a push_output.txt
-              elif grep -q "401" push_attempt.txt; then
-                echo "❌ Unauthorized — KAGGLE_USERNAME ya KAGGLE_KEY galat hai." | tee -a push_output.txt
+            if grep -Eqi '409|conflict' push_attempt.txt; then
+              if [ "$attempt" -eq 3 ]; then
+                echo "❌ Kaggle push 3 attempts ke baad bhi 409 Conflict de raha hai." | tee -a push_output.txt
+                echo "   Root cause: kernel abhi bhi running hai ya API rate limit." | tee -a push_output.txt
+                echo "   Manual fix: Kaggle pe kernel stop karo, phir dobara CI trigger karo." | tee -a push_output.txt
+                exit "$PUSH_EXIT"
               fi
+              # Re-inject fresh run-id before next attempt
+              NEW_RUN_ID="${RUN_ID}-retry${attempt}"
+              python3 - "$NEW_RUN_ID" << 'PYEOF'
+          import json, sys
+          run_id = sys.argv[1]
+          nb = json.load(open("kaggle_gpu_train.ipynb"))
+          for cell in nb["cells"]:
+              if cell["cell_type"] == "markdown":
+                  src = cell["source"]
+                  new_src = [l for l in (src if isinstance(src, list) else src.splitlines(keepends=True))
+                             if not l.strip().startswith("<!-- run-id:")]
+                  new_src.insert(1, f"<!-- run-id: {run_id} -->\n")
+                  cell["source"] = new_src
+                  break
+          json.dump(nb, open("kaggle_gpu_train.ipynb", "w"), indent=1)
+          print(f"  ✅ Re-injected run-id: {run_id}")
+          PYEOF
+              RETRY_DELAY=$((attempt * 60))
+              echo "⚠️  Kaggle returned 409 Conflict; re-injecting run-id and retrying in ${RETRY_DELAY}s (attempt $((attempt + 1))/3)." | tee -a push_output.txt
+              sleep "$RETRY_DELAY"
+            elif grep -q "404" push_attempt.txt; then
+              echo "⚠️  Kernel not found — kernel-metadata.json ka 'id' field check karo (username/slug)." | tee -a push_output.txt
+              exit "$PUSH_EXIT"
+            elif grep -Eqi '403|401' push_attempt.txt; then
+              echo "❌ Auth error — KAGGLE_KEY ya KAGGLE_USERNAME galat/expire. GitHub Secrets update karo." | tee -a push_output.txt
+              exit "$PUSH_EXIT"
+            else
+              echo "❌ Unexpected error (exit $PUSH_EXIT)" | tee -a push_output.txt
               exit "$PUSH_EXIT"
             fi
-
-            if [ "$attempt" -eq 3 ]; then
-              echo "❌ Kaggle push 3 attempts ke baad bhi 409 Conflict de raha hai." | tee -a push_output.txt
-              exit "$PUSH_EXIT"
-            fi
-
-            RETRY_DELAY=$((attempt * 30))
-            echo "⚠️  Kaggle returned 409 Conflict; retrying push in ${RETRY_DELAY}s (attempt $((attempt + 1))/3)." | tee -a push_output.txt
-            sleep "$RETRY_DELAY"
           done
 
       - name: Check push status (async poll)
