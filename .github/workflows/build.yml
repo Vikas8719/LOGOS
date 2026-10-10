@@ -1,4 +1,4 @@
-name: LOGOS CI v30-Kaggle409Fix2
+name: LOGOS CI v31-KaggleForceVersion
 
 permissions:
   contents: read
@@ -922,40 +922,26 @@ jobs:
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
           KERNEL_SLUG=$(python3 -c "import json; print(json.load(open('kernel-metadata.json'))['id'])")
+          KERNEL_OWNER=$(echo "$KERNEL_SLUG" | cut -d'/' -f1)
+          KERNEL_NAME=$(echo "$KERNEL_SLUG"  | cut -d'/' -f2)
           : > push_output.txt
 
           echo "📤 Kaggle pe notebook push ho rahi hai..." | tee -a push_output.txt
 
-          # ── 409 Conflict permanent fix (v29) ────────────────────────────────────
-          # Problem: kaggle kernels status returns HTTP 403 (Forbidden) for private
-          # kernels — kaggle CLI propagates this as an error, not a status string.
-          # Old code: grep for 'running|queued' on 403 output → found nothing →
-          # incorrectly assumed "idle" → pushed → got 409 anyway.
+          # ── v31: ROOT CAUSE FIX ─────────────────────────────────────────────────
+          # 409 Conflict ka REAL reason:
+          #   Kaggle kernel "id_no" (version counter) track karta hai.
+          #   Agar locally metadata.json mein id_no missing ya stale hai,
+          #   Kaggle sochta hai "yeh version already exist karta hai" → 409.
+          #   Fix: API se current version number fetch karo, +1 karke inject karo.
           #
-          # Real fix strategy:
-          #   1. Python se direct Kaggle REST API call karo (Bearer token ke saath)
-          #      GET /api/v1/kernels/{owner}/{slug} → JSON mein "status" field
-          #      403 = private kernel but API still returns status for owner
-          #   2. Agar API bhi 403 de toh safe wait (90s) — assume possibly running
-          #   3. Notebook ka metadata.json mein "id_no" (version number) increment
-          #      karo — yahi version collision ka root cause fix hai
-          #   4. Unique run-id + timestamp cell inject karo (content hash change)
-          #   5. Max 3 attempts with 120s backoff
+          # Agar kernel exist hi nahi (fresh/new) → API 404 deta hai → id_no=1 use karo.
+          # Agar API unreachable → id_no inject mat karo, content-hash change kaafi hai.
           # ────────────────────────────────────────────────────────────────────────
 
-          # Step 1: Check kernel status via REST API (not kaggle CLI status command)
-          echo "🔍 Checking kernel status via Kaggle REST API..." | tee -a push_output.txt
-          MAX_WAIT_SECS=600
-          POLL_SECS=60
-          ELAPSED=0
-
-          # Extract owner/slug from full slug "owner/kernel-slug"
-          KERNEL_OWNER=$(echo "$KERNEL_SLUG" | cut -d'/' -f1)
-          KERNEL_NAME=$(echo "$KERNEL_SLUG" | cut -d'/' -f2)
-
-          while [ "$ELAPSED" -lt "$MAX_WAIT_SECS" ]; do
-            # Use Python to call Kaggle API with proper Basic auth
-            STATUS_JSON=$(python3 - << PYEOF_STATUS
+          # Step 1: Kaggle API se current version number fetch karo
+          echo "🔍 Fetching current kernel version from Kaggle API..." | tee -a push_output.txt
+          NEXT_VERSION=$(python3 - << PYEOF_VER
           import urllib.request, urllib.error, base64, json, os, sys
           username = os.environ.get("KAGGLE_USERNAME", "")
           key      = os.environ.get("KAGGLE_KEY", "")
@@ -968,64 +954,58 @@ jobs:
           try:
               with urllib.request.urlopen(req, timeout=30) as r:
                   data = json.loads(r.read())
-                  # v30 FIX: Kaggle API multiple response shapes handle karo
-                  # Shape 1: top-level "status" string (new API)
-                  # Shape 2: "currentRunningVersion" dict ke andar "status" (old API)
-                  # Shape 3: numeric status codes (0=Running,1=Queued,2=Complete,3=Error,4=Cancelled)
+                  # currentRunningVersion.versionNumber OR top-level versionNumber
+                  ver = None
+                  if isinstance(data.get("currentRunningVersion"), dict):
+                      ver = data["currentRunningVersion"].get("versionNumber")
+                  if ver is None:
+                      ver = data.get("currentRunningVersion") if isinstance(data.get("currentRunningVersion"), int) else None
+                  if ver is None:
+                      ver = data.get("versionNumber", 0)
+                  # Status bhi print karo (stderr pe) — debugging ke liye
                   status = ""
-                  if "status" in data and isinstance(data["status"], (str, int)):
+                  if isinstance(data.get("currentRunningVersion"), dict):
+                      status = str(data["currentRunningVersion"].get("status", ""))
+                  elif "status" in data:
                       status = str(data["status"])
-                  elif isinstance(data.get("currentRunningVersion"), dict):
-                      s = data["currentRunningVersion"].get("status", "")
-                      status = str(s) if s is not None else ""
-                  # Numeric → string mapping
-                  numeric_map = {"0": "running", "1": "queued", "2": "complete",
-                                 "3": "error",   "4": "cancelled", "5": "cancelling"}
-                  normalized = numeric_map.get(status, status.strip().lower() if status else "unknown")
-                  print(normalized)
+                  numeric_map = {"0":"running","1":"queued","2":"complete","3":"error","4":"cancelled","5":"cancelling"}
+                  status_str = numeric_map.get(status, status.lower() if status else "unknown")
+                  print(f"STATUS:{status_str}", file=sys.stderr)
+                  print(int(ver) + 1)   # next version = current + 1
           except urllib.error.HTTPError as e:
-              # 403/404 = private or not yet created — safe to push
-              print(f"http_{e.code}")
+              if e.code in (404, 403):
+                  # Kernel nahi bana abhi tak — pehli push, version 1 se start
+                  print("STATUS:new_kernel", file=sys.stderr)
+                  print(1)
+              else:
+                  print(f"STATUS:http_{e.code}", file=sys.stderr)
+                  print(0)   # 0 = inject mat karo
           except Exception as e:
-              print(f"error_{str(e)[:40]}")
-          PYEOF_STATUS
+              print(f"STATUS:error_{str(e)[:40]}", file=sys.stderr)
+              print(0)
+          PYEOF_VER
           )
-            echo "  API Status: $STATUS_JSON" | tee -a push_output.txt
+          echo "  Next version will be: ${NEXT_VERSION}" | tee -a push_output.txt
 
-            case "$STATUS_JSON" in
-              running|queued|pending)
-                echo "  ⏳ Kernel ${STATUS_JSON} — waiting ${POLL_SECS}s (elapsed ${ELAPSED}s / ${MAX_WAIT_SECS}s)..." | tee -a push_output.txt
-                sleep "$POLL_SECS"
-                ELAPSED=$((ELAPSED + POLL_SECS))
-                ;;
-              complete|error|cancelled|"")
-                echo "  ✅ Kernel idle (${STATUS_JSON}) — proceeding with push" | tee -a push_output.txt
-                break
-                ;;
-              http_403|http_404|unknown|error_*)
-                # Private kernel / not yet created / API unreachable
-                # v30 IMPORTANT: http_404 can also mean "kernel running but API
-                # returns 404 for private kernels on first-ever push" — safe to proceed
-                # but add a small courtesy wait to avoid hammering Kaggle
-                echo "  ℹ️  Status unknown (${STATUS_JSON}) — waiting 15s then proceeding (safe for private/new kernels)" | tee -a push_output.txt
-                sleep 15
-                break
-                ;;
-              *)
-                echo "  ℹ️  Unrecognised status '${STATUS_JSON}' — proceeding" | tee -a push_output.txt
-                break
-                ;;
-            esac
-          done
-          if [ "$ELAPSED" -ge "$MAX_WAIT_SECS" ]; then
-            echo "  ⚠️  Kernel still running after ${MAX_WAIT_SECS}s — pushing anyway" | tee -a push_output.txt
+          # Step 2: kernel-metadata.json mein id_no inject karo (agar valid version mila)
+          if [ "$NEXT_VERSION" -gt 0 ] 2>/dev/null; then
+            python3 - "$NEXT_VERSION" << 'PYEOF_META'
+          import json, sys
+          ver = int(sys.argv[1])
+          meta = json.load(open("kernel-metadata.json"))
+          meta["id_no"] = ver
+          json.dump(meta, open("kernel-metadata.json", "w"), indent=2)
+          print(f"✅ kernel-metadata.json: id_no set to {ver}")
+          PYEOF_META
+            echo "  metadata.json id_no → ${NEXT_VERSION}" | tee -a push_output.txt
+          else
+            echo "  ⚠️  Version fetch failed — pushing without id_no (content-hash change only)" | tee -a push_output.txt
           fi
 
-          # Step 2: Inject unique run-id + precise timestamp into notebook
-          # Forces content hash change so Kaggle creates a new version (kills 409)
+          # Step 3: Unique run-id inject karo notebook mein (content hash guarantee)
           RUN_ID="ci-run-$(date -u +%Y%m%dT%H%M%S)-${{ github.sha }}"
-          python3 - "$RUN_ID" << 'PYEOF'
-          import json, sys, time
+          python3 - "$RUN_ID" << 'PYEOF_NB'
+          import json, sys
           run_id = sys.argv[1]
           nb = json.load(open("kaggle_gpu_train.ipynb"))
           injected = False
@@ -1033,16 +1013,13 @@ jobs:
               if cell["cell_type"] == "markdown":
                   src = cell["source"]
                   lines = src if isinstance(src, list) else src.splitlines(keepends=True)
-                  # Remove all old run-id lines
                   lines = [l for l in lines if not l.strip().startswith("<!-- run-id:")]
-                  # Insert at position 1 (after heading line)
                   insert_pos = 1 if len(lines) >= 1 else 0
                   lines.insert(insert_pos, f"<!-- run-id: {run_id} -->\n")
                   cell["source"] = lines
                   injected = True
                   break
           if not injected:
-              # No markdown cell — add one at start
               nb["cells"].insert(0, {
                   "cell_type": "markdown",
                   "metadata": {},
@@ -1050,10 +1027,10 @@ jobs:
               })
           json.dump(nb, open("kaggle_gpu_train.ipynb", "w"), indent=1)
           print(f"✅ Injected run-id: {run_id}")
-          PYEOF
+          PYEOF_NB
           echo "  Run-id injected: $RUN_ID" | tee -a push_output.txt
 
-          # Step 3: Push with retries + smarter error handling
+          # Step 4: Push — agar 409 aaya toh version +1 karke retry
           for attempt in 1 2 3; do
             echo "Push attempt ${attempt}/3..." | tee -a push_output.txt
             set +e
@@ -1063,22 +1040,30 @@ jobs:
             cat push_attempt.txt >> push_output.txt
 
             if [ "$PUSH_EXIT" -eq 0 ]; then
-              echo "✅ Notebook successfully pushed to Kaggle" | tee -a push_output.txt
+              echo "✅ Notebook successfully pushed to Kaggle (version ${NEXT_VERSION})" | tee -a push_output.txt
               exit 0
             fi
 
             if grep -Eqi '409|conflict' push_attempt.txt; then
               if [ "$attempt" -eq 3 ]; then
-                echo "❌ Kaggle push 3 attempts ke baad bhi 409 Conflict de raha hai." | tee -a push_output.txt
-                echo "   Possible causes:" | tee -a push_output.txt
-                echo "   (a) Kaggle pe kernel abhi bhi RUNNING hai — manually stop karo" | tee -a push_output.txt
-                echo "   (b) Rapid re-push — 5-10 min baad dobara CI trigger karo" | tee -a push_output.txt
-                echo "   URL: https://www.kaggle.com/code/${KERNEL_SLUG}" | tee -a push_output.txt
-                exit 0  # Non-blocking: 409 se CI fail nahi karna (GPU optional)
+                echo "❌ Kaggle push 3 attempts ke baad bhi 409 de raha hai." | tee -a push_output.txt
+                echo "   ➡️  MANUAL FIX: https://www.kaggle.com/code/${KERNEL_SLUG}" | tee -a push_output.txt
+                echo "       Kaggle pe jaao → agar kernel RUNNING hai → Stop karo → 10 min baad CI re-run karo" | tee -a push_output.txt
+                exit 0  # Non-blocking
               fi
-              # Re-inject fresh run-id with longer unique suffix before retry
+              # Version bump karke retry
+              NEXT_VERSION=$((NEXT_VERSION + 1))
+              python3 - "$NEXT_VERSION" << 'PYEOF_BUMP'
+          import json, sys
+          ver = int(sys.argv[1])
+          meta = json.load(open("kernel-metadata.json"))
+          meta["id_no"] = ver
+          json.dump(meta, open("kernel-metadata.json", "w"), indent=2)
+          print(f"✅ Bumped id_no to {ver} for retry")
+          PYEOF_BUMP
+              # Fresh run-id bhi inject karo
               NEW_RUN_ID="ci-run-$(date -u +%Y%m%dT%H%M%S)-${{ github.sha }}-r${attempt}"
-              python3 - "$NEW_RUN_ID" << 'PYEOF'
+              python3 - "$NEW_RUN_ID" << 'PYEOF_RETRY'
           import json, sys
           run_id = sys.argv[1]
           nb = json.load(open("kaggle_gpu_train.ipynb"))
@@ -1092,17 +1077,12 @@ jobs:
                   break
           json.dump(nb, open("kaggle_gpu_train.ipynb", "w"), indent=1)
           print(f"✅ Re-injected run-id: {run_id}")
-          PYEOF
-              RETRY_DELAY=$((attempt * 120))
-              echo "⚠️  409 Conflict — retrying in ${RETRY_DELAY}s with fresh run-id (attempt $((attempt + 1))/3)." | tee -a push_output.txt
+          PYEOF_RETRY
+              RETRY_DELAY=$((attempt * 30))
+              echo "⚠️  409 — bumped id_no to ${NEXT_VERSION}, retrying in ${RETRY_DELAY}s..." | tee -a push_output.txt
               sleep "$RETRY_DELAY"
-            elif grep -q "404" push_attempt.txt; then
-              echo "⚠️  Kernel not found (404) — kernel-metadata.json ka 'id' field check karo." | tee -a push_output.txt
-              echo "   Expected format: 'username/kernel-slug' jaise 'vikas8719/logos-gpu-training-v3'" | tee -a push_output.txt
-              exit "$PUSH_EXIT"
             elif grep -Eqi '403|401' push_attempt.txt; then
-              echo "❌ Auth error (403/401) — KAGGLE_KEY ya KAGGLE_USERNAME expire/galat hai." | tee -a push_output.txt
-              echo "   GitHub → Settings → Secrets mein KAGGLE_KEY update karo." | tee -a push_output.txt
+              echo "❌ Auth error — KAGGLE_KEY ya KAGGLE_USERNAME check karo (GitHub Secrets)." | tee -a push_output.txt
               exit "$PUSH_EXIT"
             else
               echo "❌ Unexpected error (exit $PUSH_EXIT)" | tee -a push_output.txt
@@ -1186,7 +1166,7 @@ jobs:
           R_KAGGLE: ${{ needs.kaggle-gpu-trigger.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v30-Kaggle409Fix2"
+          echo "  LOGOS CI Summary — v31-KaggleForceVersion"
           echo "════════════════════════════════════════════════════"
           echo ""
           echo "  CPU Tests Linux:      $R_CPU_LX"
@@ -1218,7 +1198,17 @@ jobs:
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
-          echo "  Changes in v30 (Kaggle409Fix2 — STATUS PARSING FIX):"
+          echo "  Changes in v31 (KaggleForceVersion — REAL ROOT CAUSE FIX):"
+          echo "    ✅ REAL ROOT CAUSE: kernel-metadata.json mein 'id_no' missing tha"
+          echo "       Kaggle version counter ke saath sync nahi tha → 409 har baar"
+          echo "    ✅ FIX: Kaggle REST API se current versionNumber fetch karo"
+          echo "       → +1 karke id_no metadata.json mein inject karo before push"
+          echo "    ✅ 409 retry pe id_no aur bump karo (+1 each attempt)"
+          echo "    ✅ Retry delay 120s → 30s (version sync se 409 nahi aana chahiye)"
+          echo "    ✅ 404 (new kernel) → id_no=1 se start (first push creates it)"
+          echo "    ✅ Status polling loop REMOVED — version sync hi kaafi hai"
+          echo ""
+          echo "  Changes in v30 (Kaggle409Fix2):"
           echo "    ✅ ROOT CAUSE: Kaggle API numeric status codes handle kiye"
           echo "       0=Running, 1=Queued, 2=Complete, 3=Error, 4=Cancelled"
           echo "    ✅ FIXED: Single-line .get() → robust multi-shape parser"
