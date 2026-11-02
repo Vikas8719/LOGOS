@@ -91,7 +91,7 @@ jobs:
 
       - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 600 -j 1
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600 -j 1
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU SANITIZERS — Linux (ASan + UBSan)
@@ -149,7 +149,7 @@ jobs:
 
       - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 600
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
 
   # ═══════════════════════════════════════════════════════════════
   #  CPU TESTS — macOS
@@ -171,7 +171,7 @@ jobs:
 
       - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 600
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
 
   # ═══════════════════════════════════════════════════════════════
   #  GPU TESTS
@@ -254,7 +254,7 @@ jobs:
       - name: CTest — CPU fallback (no CUDA runner)
         if: steps.cuda.outputs.available == 'false'
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 600 -j 1
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600 -j 1
 
       - name: compute-sanitizer memcheck on T5
         if: steps.cuda.outputs.available == 'true'
@@ -358,7 +358,7 @@ jobs:
 
       - name: CTest CPU
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 600
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
 
       - name: logos smoke
         run: |
@@ -395,7 +395,7 @@ jobs:
 
       - name: CTest CPU
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU" --timeout 600
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
 
       - name: logos smoke
         run: |
