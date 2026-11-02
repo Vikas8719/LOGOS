@@ -28,9 +28,27 @@ struct FuzzReader {
     FuzzReader(const uint8_t* d, size_t s) : data(d), size(s), pos(0) {}
 
     uint8_t  u8()  { return pos < size ? data[pos++] : 0; }
-    uint16_t u16() { uint16_t v = 0; std::memcpy(&v, data + pos, std::min(size-pos,(size_t)2)); pos+=2; return v; }
-    uint32_t u32() { uint32_t v = 0; std::memcpy(&v, data + pos, std::min(size-pos,(size_t)4)); pos+=4; return v; }
-    float    f32() { float v = 0.f; std::memcpy(&v, data + pos, std::min(size-pos,(size_t)4)); pos+=4; return v; }
+    uint16_t u16() {
+        uint16_t v = 0;
+        size_t count = std::min(pos < size ? size - pos : size_t{0}, sizeof(v));
+        if (count != 0) std::memcpy(&v, data + pos, count);
+        pos += sizeof(v);
+        return v;
+    }
+    uint32_t u32() {
+        uint32_t v = 0;
+        size_t count = std::min(pos < size ? size - pos : size_t{0}, sizeof(v));
+        if (count != 0) std::memcpy(&v, data + pos, count);
+        pos += sizeof(v);
+        return v;
+    }
+    float f32() {
+        float v = 0.f;
+        size_t count = std::min(pos < size ? size - pos : size_t{0}, sizeof(v));
+        if (count != 0) std::memcpy(&v, data + pos, count);
+        pos += sizeof(v);
+        return v;
+    }
 
     int bounded_int(int lo, int hi) {
         if (lo >= hi) return lo;
@@ -425,6 +443,10 @@ int main(int argc, char* argv[]) {
             for (size_t i = 1; i < sizeof(smoke) && i < buf.size(); ++i)
                 buf[i] = smoke[i];
             LLVMFuzzerTestOneInput(buf.data(), buf.size());
+        }
+        for (uint8_t sel = 0; sel < 13; ++sel) {
+            const uint8_t truncated[] = {sel, 0};
+            LLVMFuzzerTestOneInput(truncated, sizeof(truncated));
         }
         std::cout << "[FUZZ-SELFTEST] All 13 fuzz targets smoke-tested OK\n";
         return 0;

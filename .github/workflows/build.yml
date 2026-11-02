@@ -729,13 +729,10 @@ jobs:
 
           # ── MULL-15: GitHub Releases se direct download ─────────
           # Cloudsmith repo (paid) ki zarurat nahi — GitHub Releases free hai
-          MULL_DEB_URL="https://github.com/mull-project/mull/releases/download/0.22.0/Mull-15-0.22.0-Ubuntu-22.04.deb"
-          wget -q "$MULL_DEB_URL" -O /tmp/mull-15.deb || {
-            echo "⚠️  MULL deb download failed — trying fallback version"
-            # fallback: older release
-            wget -q "https://github.com/mull-project/mull/releases/download/0.21.0/Mull-15-0.21.0-Ubuntu-22.04.deb" \
-              -O /tmp/mull-15.deb || true
-          }
+          MULL_DEB_URL="https://github.com/mull-project/mull/releases/download/0.34.2/Mull-15-0.34.2-LLVM-15.0.7-ubuntu-amd64-22.04.deb"
+          wget -q "$MULL_DEB_URL" -O /tmp/mull-15.deb || \
+            wget -q "https://github.com/mull-project/mull/releases/download/0.34.1/Mull-15-0.34.1-LLVM-15.0.7-ubuntu-amd64-22.04.deb" \
+              -O /tmp/mull-15.deb
           if [ -f /tmp/mull-15.deb ] && [ -s /tmp/mull-15.deb ]; then
             sudo dpkg -i /tmp/mull-15.deb || sudo apt-get install -f -y
             echo "✅ MULL installed from GitHub Releases"
