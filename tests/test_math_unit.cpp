@@ -2571,6 +2571,161 @@ static void test_m28_wpi_history_mutations() {
     }
 }
 
+void test_m29_survived_mutant_kills() {
+    {
+        Tensor t({2, 3}, 0.0f);
+        t.data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+        Tensor s({2, 3}, 0.0f);
+        s.data = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+        Tensor r = t + s;
+        TEST("Tensor op+: all 6 elements summed (kills i<total_size -> i<=total_size loop bound)",
+             r.data[0] == 1.1f && r.data[5] > 6.5f && r.total_size == 6);
+        t += s;
+        TEST("Tensor op+=: last element correct (kills i<total_size -> i<=total_size in +=)",
+             std::abs(t.data[5] - 6.6f) < 1e-5f && t.data[0] > 1.0f);
+        Tensor scaled = s * 10.0f;
+        TEST("Tensor op*scalar: last element = 6.0 (kills scalar loop bound mutation)",
+             std::abs(scaled.data[5] - 6.0f) < 1e-5f && std::abs(scaled.data[0] - 1.0f) < 1e-5f);
+    }
+
+    {
+        Tensor a({4, 4});
+        a.fill_random(-1.0f, 1.0f, 7);
+        Tensor b = a.transpose();
+        TEST("Tensor transpose: b[0][3] == a[3][0] (kills inner loop bound mutations)",
+             std::abs(b.at(0,3) - a.at(3,0)) < 1e-6f);
+        TEST("Tensor transpose: b[3][0] == a[0][3] (kills outer loop bound mutations)",
+             std::abs(b.at(3,0) - a.at(0,3)) < 1e-6f);
+        TEST("Tensor transpose: b.rows()==a.cols() && b.cols()==a.rows()",
+             b.rows() == a.cols() && b.cols() == a.rows());
+    }
+
+    {
+        LangevinOptimizer opt(1e-3f, 0.9f, 1.0f, 1e-6f, 100, 0);
+        Tensor W({1, 4}); W.fill(1.0f);
+        Tensor G({1, 4}); G.fill(0.0f);
+        std::vector<Tensor*> ps = {&W};
+        std::vector<Tensor*> gs = {&G};
+        opt.step(ps, gs);
+        TEST("Langevin step: current_step incremented to 1 (kills ++current_step -> noop)",
+             opt.current_step == 1);
+        opt.step(ps, gs);
+        TEST("Langevin step: current_step incremented to 2 (kills step counter mutation)",
+             opt.current_step == 2);
+    }
+
+    {
+        LangevinOptimizer opt(1e-3f, 0.9f, 1.0f, 1e-6f, 100, 0);
+        opt.current_step = 0;
+        opt.anneal();
+        float T_start = opt.temperature;
+        opt.current_step = 100;
+        opt.anneal();
+        float T_end_val = opt.temperature;
+        TEST("Langevin anneal ratio=0 -> T near T_start (kills ratio formula mutation)",
+             T_start > T_end_val);
+        TEST("Langevin anneal ratio=1 -> T near T_end (kills cos_v formula mutation)",
+             T_end_val <= 1e-4f);
+
+        opt.current_step = 50;
+        opt.anneal();
+        float T_mid = opt.temperature;
+        TEST("Langevin anneal midpoint: T_end < T_mid < T_start (kills +/- in cos_v)",
+             T_end_val < T_mid && T_mid < T_start);
+    }
+
+    {
+        HybridSHMOptimizer opt(1e-3f, 0.1f, 0.95f, 1.0f, 1e-6f, 0.7f, 0.99f, 100, 0);
+        opt.current_step = 0;  opt.anneal();
+        float aH_0 = opt.alpha_H;
+        opt.current_step = 100; opt.anneal();
+        float aH_end = opt.alpha_H;
+        TEST("HybridSHM anneal: alpha_H increases from start to end (kills alpha_H schedule mutation)",
+             aH_end > aH_0);
+        TEST("HybridSHM anneal: alpha_L + alpha_H == 1.0 at step 0",
+             std::abs(opt.alpha_H + opt.alpha_L - 1.0f) < 1e-5f);
+    }
+
+    {
+        NaturalGradientOptimizer opt(1e-3f, 0.9f, 1e-8f, 0.0f, 2.0f, 0.5f, 200, 0);
+        opt.current_step = 0;   opt.anneal();
+        float T0 = opt.temperature;
+        opt.current_step = 200; opt.anneal();
+        float T200 = opt.temperature;
+        TEST("NaturalGrad anneal T decreases from step 0 to 200 (kills ratio formula)",
+             T0 > T200);
+        TEST("NaturalGrad anneal T at 200 near temp_end (kills cos_v formula)",
+             T200 <= 0.6f);
+        opt.current_step = 100; opt.anneal();
+        float T100 = opt.temperature;
+        TEST("NaturalGrad anneal midpoint between T0 and T200 (kills +/- in anneal)",
+             T200 < T100 && T100 < T0);
+    }
+
+    {
+        LayerNorm ln(8);
+        Tensor X({4, 8});
+        X.fill_random(-2.0f, 2.0f, 3);
+        Tensor Y = ln.forward(X);
+        for (int i = 0; i < 4; ++i) {
+            float mean = 0.0f;
+            for (int j = 0; j < 8; ++j) mean += Y.at(i, j);
+            mean /= 8.0f;
+            float var = 0.0f;
+            for (int j = 0; j < 8; ++j) var += (Y.at(i,j)-mean)*(Y.at(i,j)-mean);
+            var /= 8.0f;
+            TEST("LayerNorm: row mean ≈ 0 after normalize (kills / vs * in inv_std)",
+                 std::abs(mean) < 1e-4f);
+            TEST("LayerNorm: row var ≈ 1 after normalize (kills var/dim -> var*dim mutation)",
+                 std::abs(var - 1.0f) < 0.05f);
+        }
+    }
+
+    {
+        ReynoldsBatchNorm rbn(6);
+        Tensor X({3, 6});
+        X.fill_random(0.0f, 1.0f, 5);
+        rbn.forward(X, true);
+        std::vector<float> rm0 = rbn.running_mean;
+        rbn.forward(X, true);
+        TEST("RBN running_mean updated by EMA (kills ema_decay*rm + (1-d)*bm direction)",
+             rm0[0] != rbn.running_mean[0] || rm0[1] != rbn.running_mean[1]);
+        TEST("RBN running_var updated (kills running_var EMA mutation)",
+             rbn.running_var[0] > 0.0f);
+
+        Tensor X2({3, 6});
+        X2.fill_random(5.0f, 10.0f, 9);
+        rbn.forward(X2, true);
+        std::vector<float> rm1 = rbn.running_mean;
+        TEST("RBN running_mean moves toward high-value batch mean (kills + vs - in EMA update)",
+             rm1[0] > rm0[0]);
+    }
+
+    {
+        Tensor A({2, 3}); A.fill_random(-1.0f, 1.0f, 1);
+        Tensor W({3, 4}); W.fill_random(-1.0f, 1.0f, 2);
+        Tensor bias({4}, 1.0f);
+        Tensor C = vedic_gemm_bias(A, W, bias);
+        TEST("VedicGEMM bias: result shape {2,4} (basic sanity)",
+             C.rows() == 2 && C.cols() == 4);
+
+        Tensor bias_2d_row({1, 4}, 1.0f);
+        Tensor C2 = vedic_gemm_bias(A, W, bias_2d_row);
+        TEST("VedicGEMM bias: 2D row bias accepted (kills ndim()==1 -> ndim()!=1 guard)",
+             C2.rows() == 2 && C2.cols() == 4);
+
+        bool threw = false;
+        try {
+            Tensor bad_bias({2, 2}, 0.5f);
+            vedic_gemm_bias(A, W, bad_bias);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TEST("VedicGEMM bias: 2x2 bias throws invalid_argument (kills == to != in ndim check)",
+             threw);
+    }
+}
+
 int main() {
     std::cout << "╔══════════════════════════════════════════════════╗\n";
     std::cout << "║  LOGOS Test 2: Mathematical Unit Tests (v10)     ║\n";
@@ -2688,6 +2843,10 @@ int main() {
     p0 = g_pass;
     test_m28_wpi_history_mutations();
     if (g_pass == p0) { std::cerr << "[FATAL] test_m28_wpi_history_mutations did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m29_survived_mutant_kills();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m29_survived_mutant_kills did not run\n"; return 1; }
 
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << "  PASS: " << g_pass << "  FAIL: " << g_fail << "\n";

@@ -563,9 +563,8 @@ add_test(NAME "T8_Bench_Smoke" COMMAND logos_bench)
 set_tests_properties("T8_Bench_Smoke" PROPERTIES
     TIMEOUT 300
     LABELS "BENCH"
-    PASS_REGULAR_EXPRESSION "ALL.*PASS|0 above threshold"
-    FAIL_REGULAR_EXPRESSION "FAIL"
-    DISABLED TRUE)
+    PASS_REGULAR_EXPRESSION "Above threshold \\(FAIL\\): 0"
+    FAIL_REGULAR_EXPRESSION "Above threshold \\(FAIL\\): [1-9]")
 
 message(STATUS "✅ Benchmark target: logos_bench  (T8_Bench_Smoke)")
 message(STATUS "   Run:   cmake --build build --target logos_bench && ./build/logos_bench")

@@ -343,30 +343,88 @@ int main() {
         };
         constexpr uint32_t magic = 0x4F505431u;
         write_header(0, 1, 1, 1);
+        loaded.velocities.clear();
+        loaded.step_count = 0;
         if (load_optimizer_state(loaded, opt_base, 11)) {
             std::remove(opt_file.c_str());
             std::cerr << "bad optimizer magic was accepted\n";
             return 1;
         }
+        if (!loaded.velocities.empty()) {
+            std::remove(opt_file.c_str());
+            std::cerr << "velocities populated despite bad magic rejection\n";
+            return 1;
+        }
+
+        write_header(magic ^ 1u, 1, 1, 1);
+        loaded.velocities.clear();
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "near-magic value was accepted (kills != -> == mutation)\n";
+            return 1;
+        }
+        if (!loaded.velocities.empty()) {
+            std::remove(opt_file.c_str());
+            std::cerr << "velocities populated despite near-magic rejection\n";
+            return 1;
+        }
+
         write_header(magic, 2, 1, 1);
+        loaded.velocities.clear();
         if (load_optimizer_state(loaded, opt_base, 11)) {
             std::remove(opt_file.c_str());
             std::cerr << "bad optimizer version was accepted\n";
             return 1;
         }
+        if (!loaded.velocities.empty()) {
+            std::remove(opt_file.c_str());
+            std::cerr << "velocities populated despite version rejection\n";
+            return 1;
+        }
+
+        write_header(magic, 0, 1, 1);
+        loaded.velocities.clear();
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "version 0 was accepted (kills != -> == version check)\n";
+            return 1;
+        }
+        if (!loaded.velocities.empty()) {
+            std::remove(opt_file.c_str());
+            std::cerr << "velocities populated despite version-0 rejection\n";
+            return 1;
+        }
+
         write_header(magic, 1, 0, 1);
+        loaded.velocities.clear();
         if (load_optimizer_state(loaded, opt_base, 11)) {
             std::remove(opt_file.c_str());
             std::cerr << "empty optimizer state was accepted\n";
             return 1;
         }
+        if (!loaded.velocities.empty()) {
+            std::remove(opt_file.c_str());
+            std::cerr << "velocities populated despite n_params=0 rejection\n";
+            return 1;
+        }
+
+        write_header(magic, 1, static_cast<int64_t>(-1), 1);
+        loaded.velocities.clear();
+        if (load_optimizer_state(loaded, opt_base, 11)) {
+            std::remove(opt_file.c_str());
+            std::cerr << "negative n_params was accepted (kills <= -> >= mutation)\n";
+            return 1;
+        }
+
         write_header(magic, 1, 1, 0);
+        loaded.velocities.clear();
         if (load_optimizer_state(loaded, opt_base, 11)) {
             std::remove(opt_file.c_str());
             std::cerr << "empty optimizer velocity was accepted\n";
             return 1;
         }
-        write_header(magic, 1, 1, 2); // size claims two floats; file has none
+        write_header(magic, 1, 1, 2);
+        loaded.velocities.clear();
         if (load_optimizer_state(loaded, opt_base, 11)) {
             std::remove(opt_file.c_str());
             std::cerr << "truncated optimizer velocity was accepted\n";
