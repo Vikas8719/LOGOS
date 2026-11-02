@@ -54,7 +54,7 @@ static std::string safe_arg(const char* raw, const std::string& fallback) {
     return s;
 }
 
-/
+
 static float free_energy_loss_cpu(
     const Tensor&              logits,       
     const std::vector<int>&    targets,      
@@ -617,7 +617,7 @@ int main(int argc, char* argv[]) {
     else if (mode == "--forward")   run_forward_test();
     else if (mode == "--benchmark") run_benchmark();
     else if (mode == "--tokenizer-info") {
-        TokenizerManager::print_info();
+        TokenizerManager::print_status();
     }
     else if (mode == "--train") {
         std::string ds = safe_arg(argc > 2 ? argv[2] : nullptr, "dataset.txt");

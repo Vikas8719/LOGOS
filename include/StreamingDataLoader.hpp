@@ -460,6 +460,8 @@ inline std::vector<DataShard> shards_from_dir(
 
 #include "DataLoader.hpp"
 
+#include "DataLoader.hpp"
+
 class UnifiedDataLoader {
 public:
     int current_pos = 0;   // exposed for epoch-reset compat with main.cpp

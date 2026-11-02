@@ -99,7 +99,7 @@ private:
             tail.assign(chunk_tokens.end() - (seq_len + 1), chunk_tokens.end());
         }
 
-        std::string chunk_text(buf, static_cast<size_t>(got));
+        std::string chunk_text(buf.data(), static_cast<size_t>(got));
         auto new_toks = tokenizer_ref->encode(chunk_text, static_cast<int>(got) * 4);
 
         chunk_tokens = std::move(tail);
