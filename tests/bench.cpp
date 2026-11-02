@@ -109,7 +109,9 @@ static BenchResult& add(BenchResult r) {
 }
 
 static void section(const std::string& title) {
-    std::cout << "\n── " << title << " " << std::string(60 - title.size() - 4, '─') << "\n";
+    int fill = static_cast<int>(60 - title.size() - 4);
+    if (fill < 0) fill = 0;
+    std::cout << "\n-- " << title << " " << std::string(fill, '-') << "\n";
 }
 
 static void threshold_check(BenchResult& r,

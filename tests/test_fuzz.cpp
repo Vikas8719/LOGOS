@@ -126,9 +126,7 @@ static void fuzz_layer_norm(FuzzReader& r) {
     int dim = r.bounded_int(1, 256);
     int seq = r.bounded_int(1, 64);
 
-    float eps = r.bounded_float(1e-8f, 1e-4f);
-
-    LayerNorm ln(dim, eps);
+    LayerNorm ln(dim);  // LayerNorm sirf 1 argument leta hai (d_model); eps member variable hai
 
     Tensor X({seq, dim}); X.fill_random(-5.f, 5.f, r.u32());
 
@@ -340,7 +338,7 @@ static void fuzz_model_forward(FuzzReader& r) {
             id = r.bounded_int(0, cfg.vocab_size);
 
         auto logits = model.forward(inp, false);
-        if (static_cast<int>(logits.size()) != cfg.vocab_size)
+        if (static_cast<int>(logits.total_size) != cfg.vocab_size)
             __builtin_trap();
     } catch (const std::exception&) {}
 }
@@ -362,7 +360,7 @@ static void fuzz_checkpoint_roundtrip(FuzzReader& r) {
 
         const std::string path = base + "_step" + std::to_string(step) + ".bin";
         LOGOSModel model2(cfg);
-        bool loaded = load_checkpoint(model2, base, step);
+        bool loaded = load_checkpoint(model2, base + "_step" + std::to_string(step) + ".bin");
         (void)loaded;
 
         std::remove(path.c_str());
