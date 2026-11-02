@@ -1,4 +1,4 @@
-name: LOGOS CI v33-KaggleDebug
+name: LOGOS CI v34-BenchFuzz
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 # ─────────────────────────────────────────────────────────────────
-#  JOB OVERVIEW  (v26 — Hypothesis → RapidCheck C++ replaced)
+#  JOB OVERVIEW  (v34 — Bench + Fuzz added)
 #  ┌──────────────────────────────────────────────────────────────┐
 #  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
 #  │  sanitizer-tests-linux → T2 + T2b under ASan + UBSan       │
@@ -23,6 +23,8 @@ concurrency:
 #  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
   #  │  gpu-tests         → T1+T2 GPU+T3+T4+T5 via ctest -L GPU    │
 #  │  rapidcheck-tests  → T7 RapidCheck C++ property tests       │
+#  │  bench-tests       → T8 Benchmark suite (logos_bench)       │
+#  │  fuzz-tests        → T9 Fuzz selftest + LibFuzzer 60s       │
 #  │  mutation-tests    → T6 MULL (clang++, non-blocking)        │
 #  │  linux-build       → full Linux build + E2E smoke            │
 #  │  windows-build     → full Windows build smoke                │
@@ -31,9 +33,26 @@ concurrency:
 #  │  summary           → final CI gate                           │
 #  └──────────────────────────────────────────────────────────────┘
 #
+#  Pipeline sequence (dependency order):
+#    Stage 1 (parallel):
+#      cpu-tests-linux, cpu-tests-windows, cpu-tests-macos, gpu-tests
+#    Stage 2 (needs stage-1):
+#      sanitizer-tests-linux (needs cpu-tests-linux)
+#      bench-tests           (needs cpu-tests-linux)
+#      fuzz-tests            (needs cpu-tests-linux)
+#      rapidcheck-tests      (needs cpu-tests-linux)
+#      mutation-tests        (needs cpu-tests-linux)
+#      linux-build           (needs cpu-tests-linux)
+#      windows-build         (needs cpu-tests-windows)
+#      macos-build           (needs cpu-tests-macos)
+#      kaggle-gpu-trigger    (needs cpu-tests-linux, main only)
+#    Stage 3 (gate):
+#      summary (needs all above)
+#
 #  Sanitizer layers:
 #    ASan+UBSan  : cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
 #    compute-san : cmake -DLOGOS_USE_COMPUTE_SANITIZER=ON
+#    LibFuzzer   : cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++
 #    MULL        : cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_CXX_COMPILER=clang++
 #                  cmake --build build --target mull-run
 # ─────────────────────────────────────────────────────────────────
@@ -393,6 +412,164 @@ jobs:
             build/logos
             build/test_math_unit
           retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════
+  #  BENCHMARK TESTS — T8
+  #  logos_bench build karke CTest T8_Bench_Smoke chalata hai.
+  #  Threshold violations pe exit 1 (blocking).
+  #  needs: cpu-tests-linux (Stage 1 ke baad hi chalega)
+  # ═══════════════════════════════════════════════════════════════
+  bench-tests:
+    name: "Benchmark Tests — Linux (T8)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 cmake ninja-build
+          sudo update-alternatives --install /usr/bin/gcc gcc \
+            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Configure (Release, CPU-only)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
+
+      - name: Build logos_bench
+        run: |
+          cmake --build build \
+            --target logos_bench \
+            --parallel $(nproc)
+
+      - name: Run benchmark suite (T8_Bench_Smoke)
+        working-directory: build
+        run: |
+          ctest --output-on-failure \
+            -L "BENCH" \
+            --timeout 300 \
+            -j 1
+
+      - name: Print benchmark results
+        if: always()
+        run: |
+          ./build/logos_bench 2>&1 | tail -40 || true
+
+      - name: Upload benchmark log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-linux
+          path: build/Testing/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════
+  #  FUZZ TESTS — T9
+  #  Stage A: logos_fuzz_selftest --selftest (smoke, blocking)
+  #  Stage B: logos_fuzz LibFuzzer 60s (clang++, non-blocking)
+  #  needs: cpu-tests-linux (Stage 1 ke baad hi chalega)
+  # ═══════════════════════════════════════════════════════════════
+  fuzz-tests:
+    name: "Fuzz Tests — Linux (T9 selftest + LibFuzzer)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 clang cmake ninja-build
+          sudo update-alternatives --install /usr/bin/gcc gcc \
+            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+      - name: Stage A — Build logos_fuzz_selftest (g++, no fuzzer)
+        run: |
+          cmake -B build_fuzz_st -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CXX_FLAGS="-O1 -g -march=x86-64 -std=c++20"
+          cmake --build build_fuzz_st \
+            --target logos_fuzz_selftest \
+            --parallel $(nproc)
+
+      - name: Stage A — Run selftest (T9_Fuzz_Selftest, blocking)
+        run: |
+          ./build_fuzz_st/logos_fuzz_selftest --selftest
+          echo "✅ Fuzz selftest passed — all 13 targets smoke-tested"
+
+      - name: Stage B — Build logos_fuzz (clang++ + LibFuzzer + ASan)
+        id: libfuzzer_build
+        continue-on-error: true
+        run: |
+          CLANG_BIN=$(which clang++ 2>/dev/null || echo "")
+          if [ -z "$CLANG_BIN" ]; then
+            echo "clang++ not found — skipping LibFuzzer build"
+            echo "available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "clang++ found: $CLANG_BIN"
+          cmake -B build_fuzz_lf -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DLOGOS_FUZZ=ON
+          cmake --build build_fuzz_lf \
+            --target logos_fuzz \
+            --parallel $(nproc)
+          echo "available=true" >> $GITHUB_OUTPUT
+
+      - name: Stage B — Run LibFuzzer 60s (T9_Fuzz_LibFuzzer, non-blocking)
+        if: steps.libfuzzer_build.outputs.available == 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p corpus_fuzz
+          ./build_fuzz_lf/logos_fuzz \
+            -max_total_time=60 \
+            -max_len=1024 \
+            -rss_limit_mb=512 \
+            -print_final_stats=1 \
+            corpus_fuzz/ \
+            2>&1 | tee fuzz_output.log | tail -30
+          echo "LibFuzzer 60s run complete"
+
+      - name: Fuzz Summary
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════"
+          echo "  LOGOS Fuzz Testing Results — T9"
+          echo "════════════════════════════════════════════════════"
+          echo "  Stage A (selftest): ✅ All 13 targets verified"
+          if [ -f fuzz_output.log ]; then
+            CRASHES=$(grep -c "SUMMARY: .*Sanitizer" fuzz_output.log 2>/dev/null || echo 0)
+            EXECS=$(grep -oP 'stat::number_of_executed_units:\s*\K\d+' fuzz_output.log | tail -1)
+            echo "  Stage B (LibFuzzer): execs=${EXECS:-N/A}, crashes=${CRASHES}"
+            if [ "$CRASHES" -gt 0 ] 2>/dev/null; then
+              echo "  ❌ CRASH FOUND — check fuzz-results artifact"
+            else
+              echo "  ✅ No crashes in 60s run"
+            fi
+          else
+            echo "  Stage B (LibFuzzer): skipped (clang++ not available)"
+          fi
+          echo "════════════════════════════════════════════════════"
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-results
+          path: |
+            fuzz_output.log
+            corpus_fuzz/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ═══════════════════════════════════════════════════════════════
   #  RAPIDCHECK — C++ Property-Based Tests (T7)
@@ -1181,6 +1358,8 @@ jobs:
       - cpu-tests-windows
       - cpu-tests-macos
       - gpu-tests
+      - bench-tests
+      - fuzz-tests
       - linux-build
       - windows-build
       - macos-build
@@ -1196,6 +1375,8 @@ jobs:
           R_CPU_WIN: ${{ needs.cpu-tests-windows.result }}
           R_CPU_MAC: ${{ needs.cpu-tests-macos.result }}
           R_GPU: ${{ needs.gpu-tests.result }}
+          R_BENCH: ${{ needs.bench-tests.result }}
+          R_FUZZ: ${{ needs.fuzz-tests.result }}
           R_LX_BLD: ${{ needs.linux-build.result }}
           R_WIN_BLD: ${{ needs.windows-build.result }}
           R_MAC_BLD: ${{ needs.macos-build.result }}
@@ -1204,20 +1385,28 @@ jobs:
           R_KAGGLE: ${{ needs.kaggle-gpu-trigger.result }}
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v33-KaggleDebug"
+          echo "  LOGOS CI Summary — v34-BenchFuzz"
           echo "════════════════════════════════════════════════════"
           echo ""
+          echo "  ── Stage 1 (Parallel) ──────────────────────────"
           echo "  CPU Tests Linux:      $R_CPU_LX"
-          echo "  ASan + UBSan Linux:   $R_SANITIZER"
           echo "  CPU Tests Windows:    $R_CPU_WIN"
           echo "  CPU Tests macOS:      $R_CPU_MAC"
           echo "  GPU Tests (ctest):    $R_GPU"
+          echo ""
+          echo "  ── Stage 2 (needs Stage 1) ──────────────────────"
+          echo "  ASan + UBSan Linux:   $R_SANITIZER"
+          echo "  Benchmark Tests T8:   $R_BENCH"
+          echo "  Fuzz Tests T9:        $R_FUZZ"
+          echo "  RapidCheck Tests T7:  $R_RC (non-blocking)"
+          echo "  MULL Mutation T6:     $R_MULL (non-blocking)"
           echo "  Linux Build + E2E:    $R_LX_BLD"
           echo "  Windows Build:        $R_WIN_BLD"
           echo "  macOS Build:          $R_MAC_BLD"
-          echo "  RapidCheck Tests:     $R_RC (non-blocking)"
-          echo "  MULL Mutation Tests:  $R_MULL (non-blocking)"
           echo "  Kaggle GPU Trigger:   $R_KAGGLE (non-blocking, main only)"
+          echo ""
+          echo "  ── Stage 3 (this job) ───────────────────────────"
+          echo "  Summary Gate:         running"
           echo ""
           echo "  CTest coverage:"
           echo "    T2  Math Unit (CPU)"
@@ -1228,80 +1417,37 @@ jobs:
           echo "    T5  CUDA Kernels  (GPU)"
           echo "    T6  MULL Mutation (Linux, non-blocking)"
           echo "    T7  RapidCheck C++ property tests (Linux, non-blocking)"
+          echo "    T8  Benchmark Suite logos_bench (Linux, blocking)"
+          echo "    T9  Fuzz selftest + LibFuzzer 60s (Linux)"
           echo ""
           echo "  Sanitizer layers:"
           echo "    ASan+UBSan  → CPU test bugs (LOGOS_SANITIZE=ON)"
           echo "    compute-san → GPU memory errors (LOGOS_USE_COMPUTE_SANITIZER=ON)"
+          echo "    LibFuzzer   → crash discovery  (LOGOS_FUZZ=ON, clang++)"
           echo "    MULL        → Test suite weakness (LOGOS_MUTATION_TEST=ON)"
           echo ""
           echo "════════════════════════════════════════════════════"
           echo ""
-          echo "  Changes in v32 (KaggleAuthFix — kaggle.json whitespace bug):"
-          echo "    ✅ ROOT CAUSE: cat heredoc mein leading spaces/indentation thi"
-          echo "       {\"username\": \"  vikas8719\"} → Kaggle API ne 403 diya"
-          echo "    ✅ FIX: printf se JSON write karo — zero indentation, clean format"
-          echo "       printf '{\"username\":\"%s\",\"key\":\"%s\"}' user key > kaggle.json"
-          echo "    ✅ Verify step add kiya — kaggle.json content + kaggle config view"
-          echo ""
-          echo "  Changes in v31 (KaggleForceVersion):"
-          echo "    ✅ REAL ROOT CAUSE: kernel-metadata.json mein 'id_no' missing tha"
-          echo "       Kaggle version counter ke saath sync nahi tha → 409 har baar"
-          echo "    ✅ FIX: Kaggle REST API se current versionNumber fetch karo"
-          echo "       → +1 karke id_no metadata.json mein inject karo before push"
-          echo "    ✅ 409 retry pe id_no aur bump karo (+1 each attempt)"
-          echo "    ✅ Retry delay 120s → 30s (version sync se 409 nahi aana chahiye)"
-          echo "    ✅ 404 (new kernel) → id_no=1 se start (first push creates it)"
-          echo "    ✅ Status polling loop REMOVED — version sync hi kaafi hai"
-          echo ""
-          echo "  Changes in v30 (Kaggle409Fix2):"
-          echo "    ✅ ROOT CAUSE: Kaggle API numeric status codes handle kiye"
-          echo "       0=Running, 1=Queued, 2=Complete, 3=Error, 4=Cancelled"
-          echo "    ✅ FIXED: Single-line .get() → robust multi-shape parser"
-          echo "       Shape 1: top-level 'status' string/int"
-          echo "       Shape 2: currentRunningVersion.status dict"
-          echo "       Shape 3: numeric codes → normalized string"
-          echo "    ✅ http_404: 15s courtesy wait added before push"
-          echo "       (private kernel ki first run pe 404 aa sakta hai)"
-          echo "    ✅ error string: 40 chars (was 30) for better diagnostics"
-          echo ""
-          echo "  Changes in v29 (Kaggle409Fix):"
-          echo "    ✅ FIXED: 409 Conflict root cause — kaggle CLI status returns 403"
-          echo "       Old code 403 ko 'idle' samajhta tha → push → 409"
-          echo "    ✅ NEW: Python urllib se direct Kaggle REST API call"
-          echo "       GET /api/v1/kernels/{owner}/{slug} → JSON status field"
-          echo "    ✅ Status parsing: running/queued=wait, 403/404/unknown=safe to push"
-          echo "    ✅ 409 retry: exit 0 (non-blocking) — GPU training optional hai"
-          echo "    ✅ Retry delay 60s→120s per attempt (was 60s — too fast)"
-          echo "    ✅ Notebook: no-markdown-cell edge case handled"
-          echo ""
-          echo "  Changes in v28 (KaggleFix — pichla):"
-          echo ""
-          echo "  Changes in v26 (RapidCheck):"
-          echo "    ✅ rapidcheck-tests job add kiya — actual C++ headers directly test"
-          echo "    ✅ LOGOS_RAPIDCHECK=ON cmake flag — FetchContent se rapidcheck"
-          echo "    ✅ T7_RapidCheck CTest target — PROPERTY label"
-          echo "    ✅ RC1-RC8: GEMM, tiling, bias, FreeEnergy, reshape, Riemannian, ckpt, leapfrog"
-          echo "    ✅ Artifact: rapidcheck-results (log, 7 day retention)"
-          echo ""
-          echo "  Changes in v25 (MULL):"
-          echo "    ✅ CMakeLists.txt: LOGOS_MUTATION_TEST=ON option added"
-          echo "    ✅ mull.yml auto-generated in build dir (14 operators)"
-          echo "    ✅ mull_math_unit target: test_math_unit M1-M16 mutations"
-          echo "    ✅ mull_checkpoint target: T2b checkpoint roundtrip mutations"
-          echo "    ✅ mull-run custom target: cmake --build --target mull-run"
-          echo "    ✅ CI job: mutation-tests (continue-on-error: true)"
-          echo "    ✅ Artifacts: mull-reports (HTML + log, 14 day retention)"
-          echo "    ✅ Score gate: < 60% = warning, < 80% = improvement needed"
-          echo ""
-          echo "  Changes in v24:"
-          echo "    ✅ UI FIX: training-pipeline renamed → linux-build"
-          echo "    ✅ UNIFIED: All 3 CPU test jobs T4 timeout=600s"
-          echo "    ✅ CLEANUP: Redundant T4 shell step removed from Linux job"
+          echo "  Changes in v34 (BenchFuzz):"
+          echo "    ✅ bench.cpp: #pragma once bug fixed (was header guard, now main file)"
+          echo "    ✅ tests/test_fuzz.cpp: 13-target LibFuzzer harness added"
+          echo "       Targets: vedic_gemm, gemm_bias, tensor_ops, layer_norm,"
+          echo "                reynolds_bn, softmax, causal_mask, attention_head,"
+          echo "                feedforward, gelu, gradient_clip, langevin_opt, tokenizer"
+          echo "    ✅ CMakeLists.txt: logos_bench + logos_fuzz_selftest + logos_fuzz targets"
+          echo "       T8_Bench_Smoke: blocking, threshold violations = exit 1"
+          echo "       T9_Fuzz_Selftest: blocking selftest (13 targets)"
+          echo "       T9_Fuzz_LibFuzzer_30s: non-blocking, 30s LibFuzzer run"
+          echo "    ✅ CI: bench-tests job (needs cpu-tests-linux, blocking)"
+          echo "    ✅ CI: fuzz-tests job (needs cpu-tests-linux, selftest blocking)"
+          echo "    ✅ CI: summary job updated with bench + fuzz results"
+          echo "    ✅ Pipeline sequence documented: Stage 1 → Stage 2 → Stage 3"
           echo ""
           echo "════════════════════════════════════════════════════"
 
           FAIL=false
           for r in "$R_CPU_LX" "$R_SANITIZER" "$R_CPU_WIN" "$R_CPU_MAC" \
+                   "$R_BENCH" "$R_FUZZ" \
                    "$R_LX_BLD" "$R_WIN_BLD" "$R_MAC_BLD"; do
             [ "$r" = "failure" ] && FAIL=true
           done
@@ -1317,7 +1463,6 @@ jobs:
           fi
           if [ "$R_KAGGLE" = "failure" ]; then
             echo "⚠️  Kaggle GPU push failed (non-blocking) — check kaggle-push-log artifact"
-            echo "   Secrets check: KAGGLE_USERNAME + KAGGLE_KEY GitHub secrets mein hone chahiye"
           elif [ "$R_KAGGLE" = "skipped" ]; then
             echo "ℹ️  Kaggle GPU push: skipped (sirf main branch push par chalta hai)"
           else

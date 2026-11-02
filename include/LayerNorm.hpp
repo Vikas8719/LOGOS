@@ -1,9 +1,4 @@
 #pragma once
-//  IMPROVEMENT (from LayerNorm.cpp — now live here):
-//    Welford's online algorithm for mean + variance in one pass
-//    Pehle .hpp: 2 separate loops (mean, then variance)
-//    Ab .hpp:    single pass → same correctness, less work
-// ============================================================
 #include "Tensor.hpp"
 #include <cmath>
 #include <vector>
@@ -18,20 +13,12 @@ struct LayerNorm {
         beta ({1, d_model_}, 0.0f)    // Init to 0 (shift)
     {}
 
-    // X: (seq_len, d_model) → (seq_len, d_model)
     Tensor forward(const Tensor& X) const {
         int seq = X.rows(), dim = X.cols();
+        if (seq == 0 || dim == 0) return Tensor(X.shape, 0.0f);
         Tensor Y(X.shape);
 
         for (int i = 0; i < seq; ++i) {
-            // BUG 7 FIX: Welford's online algorithm (from dead LayerNorm.cpp)
-            // Now live in the actual used .hpp.
-            // Pehle .hpp mein:
-            //   loop 1: mean = sum(x)/dim
-            //   loop 2: var  = sum((x-mean)²)/dim
-            //   → 2×dim operations per row
-            // Ab: single pass, numerically stable
-            //   mean aur M2 (sum of squared deviations) saath update hote hain
             float mean = 0.0f, M2 = 0.0f;
             for (int j = 0; j < dim; ++j) {
                 float delta = X.at(i, j) - mean;
@@ -41,7 +28,6 @@ struct LayerNorm {
             float var     = M2 / dim;
             float inv_std = 1.0f / std::sqrt(var + eps);
 
-            // Normalize + scale (γ) + shift (β)
             for (int j = 0; j < dim; ++j)
                 Y.at(i, j) = gamma[j] * (X.at(i, j) - mean) * inv_std + beta[j];
         }
@@ -59,7 +45,6 @@ struct ReynoldsBatchNorm {
     float  Re_crit  = 1.0f;   // Reynolds criticality threshold (annealed externally)
     float  k_slope  = 5.0f;   // sigmoid steepness for laminar→turbulent transition
 
-    // Running statistics for BN path (EMA, no batch needed)
     std::vector<float> running_mean;
     std::vector<float> running_var;
     float              ema_decay = 0.99f;
@@ -73,21 +58,15 @@ struct ReynoldsBatchNorm {
           running_var (d_model_, 1.0f)
     {}
 
-    // Compute effective Reynolds number for one token sequence
-    // Re_eff = RMS(x) / (mean_std + ε)
-    // RMS(x): energy of the activation
-    // mean_std: average standard deviation across features (noise floor)
     float reynolds_number(const Tensor& X) const {
         int seq = X.rows(), dim = X.cols();
         float rms_sum = 0.0f, std_sum = 0.0f;
 
         for (int i = 0; i < seq; ++i) {
-            // RMS of this token
             float sq = 0.0f;
             for (int j = 0; j < dim; ++j) sq += X.at(i,j) * X.at(i,j);
             rms_sum += std::sqrt(sq / (dim + 1e-8f));
 
-            // Standard deviation (Welford)
             float mean = 0.0f, M2 = 0.0f;
             for (int j = 0; j < dim; ++j) {
                 float delta = X.at(i,j) - mean;
@@ -102,11 +81,8 @@ struct ReynoldsBatchNorm {
         return rms / (std_ + eps);
     }
 
-    // Smooth sigmoid blend weight for LN regime
-    // Returns ≈1 when Re << Re_crit (laminar), ≈0 when Re >> Re_crit (turbulent)
     float laminar_weight(float Re) const {
         float x = -k_slope * (Re - Re_crit);
-        // Numerically stable sigmoid
         if (x >= 0) {
             float e = std::exp(-x);
             return 1.0f / (1.0f + e);
@@ -116,19 +92,15 @@ struct ReynoldsBatchNorm {
         }
     }
 
-    // Main forward: Reynolds-adaptive blend of LayerNorm and running BN
-    // X: (seq, d_model) → Y: (seq, d_model)
-    // is_training: if true, update running stats (EMA)
     Tensor forward(const Tensor& X, bool is_training = true) {
         int seq = X.rows(), dim = X.cols();
+        if (seq == 0 || dim == 0) return Tensor(X.shape, 0.0f);
         Tensor Y(X.shape);
 
-        // ── Compute Reynolds number ───────────────────────────
         float Re = reynolds_number(X);
         float w_LN = laminar_weight(Re);      // laminar weight
         float w_BN = 1.0f - w_LN;            // turbulent weight
 
-        // ── Path A: Layer Norm (per-token) ────────────────────
         Tensor LN_out(X.shape);
         for (int i = 0; i < seq; ++i) {
             float mean = 0.0f, M2 = 0.0f;
@@ -142,8 +114,6 @@ struct ReynoldsBatchNorm {
                 LN_out.at(i,j) = (X.at(i,j) - mean) * inv_std;
         }
 
-        // ── Path B: Broadcast Norm (per-feature, running stats) ─
-        // Compute per-feature mean and variance from this batch
         std::vector<float> batch_mean(dim, 0.0f), batch_var(dim, 0.0f);
         for (int j = 0; j < dim; ++j) {
             float m = 0.0f, v = 0.0f;
@@ -155,7 +125,6 @@ struct ReynoldsBatchNorm {
             batch_var[j]  = v;
         }
 
-        // EMA update of running stats (only in training)
         if (is_training) {
             for (int j = 0; j < dim; ++j) {
                 running_mean[j] = ema_decay * running_mean[j] + (1.0f-ema_decay) * batch_mean[j];
@@ -164,7 +133,6 @@ struct ReynoldsBatchNorm {
             initialized = true;
         }
 
-        // Use running stats if available, else batch stats
         const auto& use_mean = (initialized && !is_training) ? running_mean : batch_mean;
         const auto& use_var  = (initialized && !is_training) ? running_var  : batch_var;
 
@@ -174,8 +142,6 @@ struct ReynoldsBatchNorm {
                 BN_out.at(i,j) = (X.at(i,j) - use_mean[j])
                                 / std::sqrt(use_var[j] + eps);
 
-        // ── Reynolds blend + affine transform ─────────────────
-        // Y = (w_LN * LN_out + w_BN * BN_out) * γ + β
         for (int i = 0; i < seq; ++i)
             for (int j = 0; j < dim; ++j)
                 Y.at(i,j) = gamma[j] * (w_LN * LN_out.at(i,j)
@@ -185,9 +151,6 @@ struct ReynoldsBatchNorm {
         return Y;
     }
 
-    // Anneal Re_crit over training (call from optimizer loop)
-    // Early: high Re_crit = more laminar = more stable
-    // Late:  low Re_crit  = allow turbulence = more exploration
     void anneal_reynolds(int current_step, int total_steps,
                          float Re_start = 2.0f, float Re_end = 0.5f) {
         float ratio = std::min(1.0f, (float)current_step / (float)total_steps);

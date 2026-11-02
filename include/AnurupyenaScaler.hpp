@@ -1,5 +1,4 @@
 #pragma once
-// ============================================================
 #include "Tensor.hpp"
 #include <cmath>
 #include <vector>
@@ -8,19 +7,19 @@
 
 class AnurupyenaScaler {
 public:
-    float target_rms;   // FIX-2: was 1.0 → now 0.01
+    float target_rms;   
     float epsilon;
     float min_scale;
-    float max_scale;    // FIX-2: was 100.0 → now 10.0
+    float max_scale;    
     bool  enabled;
     float ema_beta;
     std::vector<float> rms_ema;
     bool  ema_init = false;
 
-    AnurupyenaScaler(float target  = 0.01f,   // FIX-2: realistic default
+    AnurupyenaScaler(float target  = 0.01f,   
                      float eps     = 1e-8f,
                      float min_s   = 0.01f,
-                     float max_s   = 10.0f,   // FIX-2: tighter clamp
+                     float max_s   = 10.0f,   
                      float ema_b   = 0.99f,
                      bool  on      = true)
         : target_rms(target), epsilon(eps),
@@ -49,12 +48,10 @@ public:
 
             rms_ema[gi] = ema_beta * rms_ema[gi] + (1.0f-ema_beta) * rms;
 
-            // Skip near-zero tensors to avoid div-by-zero boost
+            
             if (rms < epsilon * 10.0f) continue;
 
-            // FIX-2: scale = target / rms, clamped to [min_s, max_s=10]
-            // With target=0.01 and typical rms=0.003: scale=3.3x (safe)
-            // With target=0.01 and large rms=0.1:    scale=0.1x (shrinks, safe)
+            
             float scale = target_rms / rms;
             scale = std::max(min_scale, std::min(max_scale, scale));
 

@@ -1,4 +1,3 @@
-// ============================================================
 #ifndef LOGOS_CHECKPOINT_CPP
 #define LOGOS_CHECKPOINT_CPP
 
@@ -11,9 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 
-// Keep the legacy positional-embedding block in the binary layout so existing
-// checkpoints remain readable. RoPE has no learned position tensor, so newly
-// saved checkpoints write zeros here and loaders discard the block.
+
 static void write_legacy_position_slot(std::ofstream& f, const ModelConfig& cfg) {
     constexpr size_t CHUNK_BYTES = 64 * 1024;
     const std::vector<char> zeros(CHUNK_BYTES, 0);
@@ -49,7 +46,6 @@ static bool discard_legacy_position_slot(std::ifstream& f,
     return true;
 }
 
-// ── Internal: validate cfg fields from file ──────────────────
 static bool validate_checkpoint_cfg(const ModelConfig& cfg, const std::string& path) {
     auto chk = [&](const char* name, int val, int lo, int hi) -> bool {
         if (val < lo || val > hi) {
@@ -133,9 +129,6 @@ static bool read_tensor_clamped(std::ifstream& f, Tensor& t, const std::string& 
     return true;
 }
 
-// ============================================================
-//  save_checkpoint
-// ============================================================
 bool save_checkpoint(const LOGOSModel& model,
                      const std::string& path,
                      int step)
@@ -185,9 +178,6 @@ bool save_checkpoint(const LOGOSModel& model,
     return true;
 }
 
-// ============================================================
-//  load_checkpoint — STRICT
-// ============================================================
 bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -264,9 +254,6 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     return true;
 }
 
-// ============================================================
-//  load_checkpoint_force — PERMISSIVE
-// ============================================================
 bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -324,11 +311,7 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     return true;
 }
 
-// ============================================================
-//  save_optimizer_state  (v21-OPTSTATE)
-//  Saves GPUSHMOpt velocity buffers + WeightPathIntegral EMA
-//  File: {base_path}_step{step}.optstate
-// ============================================================
+
 static constexpr uint32_t OPTSTATE_MAGIC   = 0x4F505431u;  // "OPT1"
 static constexpr uint32_t OPTSTATE_VERSION = 1u;
 
@@ -344,7 +327,6 @@ bool save_optimizer_state(const OptimizerState& state,
         return false;
     }
 
-    // Header
     uint32_t magic   = OPTSTATE_MAGIC;
     uint32_t version = OPTSTATE_VERSION;
     int64_t  n_params = static_cast<int64_t>(state.velocities.size());
@@ -352,7 +334,6 @@ bool save_optimizer_state(const OptimizerState& state,
     f.write(reinterpret_cast<const char*>(&version),  sizeof(version));
     f.write(reinterpret_cast<const char*>(&n_params), sizeof(n_params));
 
-    // Per-parameter velocity vectors
     for (const auto& vel : state.velocities) {
         uint32_t sz = static_cast<uint32_t>(vel.size());
         f.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
@@ -360,7 +341,6 @@ bool save_optimizer_state(const OptimizerState& state,
                 static_cast<std::streamsize>(sz * sizeof(float)));
     }
 
-    // Footer: WeightPathIntegral EMA state
     f.write(reinterpret_cast<const char*>(&state.ema_action),    sizeof(float));
     f.write(reinterpret_cast<const char*>(&state.log_amplitude), sizeof(float));
     f.write(reinterpret_cast<const char*>(&state.step_count),    sizeof(int64_t));
@@ -374,10 +354,7 @@ bool save_optimizer_state(const OptimizerState& state,
     return true;
 }
 
-// ============================================================
-//  load_optimizer_state  (v21-OPTSTATE)
-//  Returns false gracefully if file missing (older checkpoint compat)
-// ============================================================
+
 bool load_optimizer_state(OptimizerState& state,
                           const std::string& base_path,
                           int step)
@@ -385,13 +362,13 @@ bool load_optimizer_state(OptimizerState& state,
     std::string path = base_path + "_step" + std::to_string(step) + ".optstate";
     std::ifstream f(path, std::ios::binary);
     if (!f) {
-        // Older checkpoint — no optstate file, cold optimizer start
+        
         std::cout << "  ℹ️  No optimizer state found (" << path
                   << ") — optimizer starts cold (normal for step 60000 checkpoint)\n";
         return false;
     }
 
-    // Read + validate header
+   
     uint32_t magic = 0, version = 0;
     int64_t  n_params = 0;
     f.read(reinterpret_cast<char*>(&magic),    sizeof(magic));
@@ -412,7 +389,6 @@ bool load_optimizer_state(OptimizerState& state,
         return false;
     }
 
-    // Per-parameter velocity vectors
     state.velocities.resize(static_cast<size_t>(n_params));
     for (auto& vel : state.velocities) {
         uint32_t sz = 0;
@@ -430,13 +406,11 @@ bool load_optimizer_state(OptimizerState& state,
         }
     }
 
-    // Footer: WeightPathIntegral EMA
     f.read(reinterpret_cast<char*>(&state.ema_action),    sizeof(float));
     f.read(reinterpret_cast<char*>(&state.log_amplitude), sizeof(float));
     f.read(reinterpret_cast<char*>(&state.step_count),    sizeof(int64_t));
 
     if (!f) {
-        // Footer missing (very old optstate) — weights loaded, EMA cold
         std::cerr << "⚠️  Optimizer EMA footer missing — velocities loaded, EMA cold\n";
         state.ema_action = 0.0f; state.log_amplitude = 0.0f; state.step_count = 0;
     }

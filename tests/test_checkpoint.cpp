@@ -23,7 +23,6 @@ int main() {
     const std::string file = base + "_step7.bin";
     std::remove(file.c_str());
 
-    // Verify file does NOT exist before save (pre-condition)
     if (std::filesystem::exists(file)) {
         std::cerr << "file should not exist before save\n";
         return 1;
@@ -34,50 +33,28 @@ int main() {
         return 1;
     }
 
-    // Verify file DOES exist after save (void call side-effect check)
     if (!std::filesystem::exists(file)) {
         std::cerr << "save_checkpoint did not create file (void call side-effect missing)\n";
         return 1;
     }
-    // File size must be > 0
     if (std::filesystem::file_size(file) == 0) {
         std::cerr << "save_checkpoint wrote empty file\n";
         return 1;
     }
 
-    // expected_bytes must match save_checkpoint layout exactly:
-    //   [ModelConfig]
-    //   [embedding floats]
-    //   [legacy position block: max_seq_len * d_model floats]
-    //   [lm_head floats]
-    //   per layer:
-    //     [per-head W_Q, W_K, W_V, W_O]
-    //     [W_proj]
-    //     [ffn.W1, ffn.b1, ffn.W2, ffn.b2]
-    //     [ln1.gamma, ln1.beta]
-    //     [ln2.gamma, ln2.beta]
-    //     [ln1.running_mean, ln1.running_var]   ← ReynoldsBatchNorm stats
-    //     [ln2.running_mean, ln2.running_var]   ← ReynoldsBatchNorm stats
     size_t expected_bytes = sizeof(ModelConfig) +
         static_cast<size_t>(cfg.max_seq_len) * cfg.d_model * sizeof(float);
     for (const Tensor* parameter : source.parameters())
         expected_bytes += static_cast<size_t>(parameter->total_size) * sizeof(float);
-    // Add ReynoldsBatchNorm running_mean + running_var for each layer (ln1 + ln2)
-    // Each running stat vector has d_model floats
     expected_bytes += static_cast<size_t>(cfg.num_layers) * 4 *
                       static_cast<size_t>(cfg.d_model) * sizeof(float);
 
-    // ── Exact arithmetic verification of formula components ──────────────
-    // Each component individually checked to kill operator-mutation mutants.
 
-    // 1. sizeof(ModelConfig) must be exactly what it is (> 0)
     if (sizeof(ModelConfig) == 0) {
         std::cerr << "sizeof(ModelConfig) must be > 0\n";
         return 1;
     }
 
-    // 2. Legacy pos block = max_seq_len * d_model * sizeof(float)
-    //    cfg: max_seq_len=3, d_model=4 → 3*4*4 = 48 bytes
     size_t pos_block_bytes = static_cast<size_t>(cfg.max_seq_len) *
                              static_cast<size_t>(cfg.d_model) * sizeof(float);
     if (pos_block_bytes != 3 * 4 * sizeof(float)) {
@@ -85,8 +62,6 @@ int main() {
         return 1;
     }
 
-    // 3. RBN extra = num_layers * 4 * d_model * sizeof(float)
-    //    cfg: num_layers=1, d_model=4 → 1*4*4*4 = 64 bytes
     size_t rbn_extra_bytes = static_cast<size_t>(cfg.num_layers) * 4 *
                              static_cast<size_t>(cfg.d_model) * sizeof(float);
     if (rbn_extra_bytes != 1 * 4 * 4 * sizeof(float)) {
@@ -94,13 +69,11 @@ int main() {
         return 1;
     }
 
-    // 4. expected_bytes must be > just sizeof(ModelConfig) (has param data too)
     if (expected_bytes <= sizeof(ModelConfig)) {
         std::cerr << "expected_bytes too small (arithmetic wrong): " << expected_bytes << "\n";
         return 1;
     }
 
-    // 5. expected_bytes must include at least the pos block exactly
     if (expected_bytes < sizeof(ModelConfig) + pos_block_bytes) {
         std::cerr << "expected_bytes misses pos block\n";
         return 1;
@@ -114,8 +87,6 @@ int main() {
         return 1;
     }
 
-    // Simulate legacy learned-position weights; loaders must discard them and
-    // continue reading lm_head and layer weights from their original offsets.
     {
         std::fstream legacy(file, std::ios::binary | std::ios::in | std::ios::out);
         const auto position_offset = static_cast<std::streamoff>(sizeof(ModelConfig)) +
@@ -142,21 +113,18 @@ int main() {
     const auto expected = source.parameters();
     const auto actual = restored.parameters();
 
-    // Parameter count must match exactly (catches loop bound mutations)
     if (expected.size() != actual.size()) {
         std::remove(file.c_str());
         std::cerr << "parameter count mismatch: src=" << expected.size()
                   << " restored=" << actual.size() << "\n";
         return 1;
     }
-    // Must have at least 2 parameters (embedding + lm_head)
     if (expected.size() < 2) {
         std::remove(file.c_str());
         std::cerr << "too few parameters: " << expected.size() << "\n";
         return 1;
     }
 
-    // Verify embedding (first param) total_size = vocab_size * d_model
     if (expected[0]->total_size != cfg.vocab_size * cfg.d_model) {
         std::remove(file.c_str());
         std::cerr << "embedding total_size wrong: " << expected[0]->total_size
@@ -164,7 +132,6 @@ int main() {
         return 1;
     }
 
-    // Verify lm_head (second param) total_size = d_model * vocab_size
     if (expected[1]->total_size != cfg.d_model * cfg.vocab_size) {
         std::remove(file.c_str());
         std::cerr << "lm_head total_size wrong: " << expected[1]->total_size
@@ -185,9 +152,6 @@ int main() {
 
     std::cout << "checkpoint round-trip passed\n";
 
-    // ── T2b-extra: Expected bytes formula verification ─────────────────────
-    // Verify each component of the expected_bytes formula independently
-    // to catch arithmetic mutations (+ vs -, * vs /)
     {
         ModelConfig cfg2;
         cfg2.vocab_size  = 16;
@@ -206,7 +170,6 @@ int main() {
             return 1;
         }
 
-        // Recompute expected_bytes the same way
         size_t expected2 = sizeof(ModelConfig) +
             static_cast<size_t>(cfg2.max_seq_len) * cfg2.d_model * sizeof(float);
         for (const Tensor* p : m2.parameters())
@@ -223,20 +186,17 @@ int main() {
             return 1;
         }
 
-        // Verify sizeof(ModelConfig) > 0 (not zero)
         if (sizeof(ModelConfig) == 0) {
             std::cerr << "sizeof(ModelConfig) must be > 0\n";
             return 1;
         }
 
-        // Verify legacy pos block size: max_seq_len * d_model * sizeof(float)
         size_t pos_block = static_cast<size_t>(cfg2.max_seq_len) * cfg2.d_model * sizeof(float);
         if (pos_block != 4 * 8 * sizeof(float)) {
             std::cerr << "legacy pos block size wrong: " << pos_block << "\n";
             return 1;
         }
 
-        // Verify ReynoldsBatchNorm extra bytes: num_layers * 4 * d_model * sizeof(float)
         size_t rbn_bytes = static_cast<size_t>(cfg2.num_layers) * 4 *
                            static_cast<size_t>(cfg2.d_model) * sizeof(float);
         if (rbn_bytes != 2 * 4 * 8 * sizeof(float)) {
@@ -248,8 +208,6 @@ int main() {
                   << " actual=" << actual2 << "\n";
     }
 
-    // ── T2b-roundtrip2: Round-trip with non-trivial weights ────────────────
-    // Fill source with known values, save, load, verify exact match
     {
         ModelConfig cfg3;
         cfg3.vocab_size  = 8;
@@ -259,7 +217,6 @@ int main() {
         cfg3.max_seq_len = 3;
 
         LOGOSModel src3(cfg3);
-        // Fill all parameters with recognisable pattern: p[i] = (i+1)*0.01
         {
             int idx = 0;
             for (Tensor* p : src3.parameters())
@@ -295,9 +252,6 @@ int main() {
         std::cout << "nontrivial round-trip passed\n";
     }
 
-    // ── T2b-offsets: Verify file offset arithmetic ─────────────────────────
-    // The position block offset = sizeof(ModelConfig) + embedding_floats * sizeof(float)
-    // Verify this is computed correctly (catches + vs -, * vs / mutations)
     {
         ModelConfig cfg4;
         cfg4.vocab_size  = 4;
@@ -316,7 +270,6 @@ int main() {
             return 1;
         }
 
-        // Read ModelConfig from file and verify values match
         {
             std::ifstream f(file4, std::ios::binary);
             ModelConfig read_cfg;
@@ -331,7 +284,6 @@ int main() {
                 return 1;
             }
 
-            // Verify embedding block: vocab_size * d_model floats
             size_t emb_floats = static_cast<size_t>(cfg4.vocab_size) * cfg4.d_model;
             std::vector<float> emb(emb_floats);
             f.read(reinterpret_cast<char*>(emb.data()),
@@ -341,7 +293,6 @@ int main() {
                 std::cerr << "offset test: could not read embedding block\n";
                 return 1;
             }
-            // Embedding must equal source embedding exactly
             bool emb_match = true;
             for (size_t i = 0; i < emb_floats; ++i)
                 if (emb[i] != src4.embedding.data[i]) emb_match = false;
@@ -355,8 +306,6 @@ int main() {
         std::cout << "offset arithmetic test passed\n";
     }
 
-    // Optimizer state is part of checkpoint recovery too: cover its complete
-    // round trip and reject malformed headers and truncated velocity data.
     {
         const std::string opt_base = "logos_ckpt_optstate_test";
         const std::string opt_file = opt_base + "_step11.optstate";
@@ -383,7 +332,6 @@ int main() {
             return 1;
         }
 
-        // Invalid magic, version, parameter count, and vector sizes must fail.
         const auto write_header = [&](uint32_t magic, uint32_t version,
                                       int64_t count, uint32_t vector_size) {
             std::ofstream f(opt_file, std::ios::binary | std::ios::trunc);
@@ -425,8 +373,6 @@ int main() {
             return 1;
         }
 
-        // A legacy file without the EMA footer still restores velocity data
-        // and resets the EMA values to their cold-start defaults.
         {
             std::ofstream f(opt_file, std::ios::binary | std::ios::trunc);
             const uint32_t version = 1, size = 1;
@@ -452,8 +398,6 @@ int main() {
         std::remove(opt_file.c_str());
     }
 
-    // Reject a short config header and invalid config values before trying to
-    // read model tensors. These malformed files must never be partially loaded.
     {
         const std::string bad_file = "logos_ckpt_invalid_config.bin";
         LOGOSModel target(cfg);
@@ -515,7 +459,6 @@ int main() {
         std::remove(bad_file.c_str());
     }
 
-    // Every serialized architecture field participates in strict matching.
     {
         const std::string mismatch_base = "logos_ckpt_mismatch";
         const std::string mismatch_file = mismatch_base + "_step2.bin";
@@ -542,8 +485,6 @@ int main() {
         std::remove(mismatch_file.c_str());
     }
 
-    // Strict loading supports older checkpoints that end before BN statistics.
-    // Seed the target stats with non-zero values so zero-initialisation is visible.
     {
         const std::string legacy_base = "logos_ckpt_legacy_stats";
         const std::string legacy_file = legacy_base + "_step4.bin";
@@ -585,7 +526,6 @@ int main() {
         std::remove(legacy_file.c_str());
     }
 
-    // Force-load handles both exact-size reads and partial tensor reads safely.
     {
         const std::string force_base = "logos_ckpt_force_read";
         const std::string force_file = force_base + "_step6.bin";
@@ -616,8 +556,6 @@ int main() {
             }
         }
 
-        // Stop one byte into lm_head: complete floats must be kept and the
-        // partial float plus remaining elements must be zero-filled.
         const size_t position = sizeof(ModelConfig) +
             static_cast<size_t>(source.embedding.total_size) * sizeof(float) +
             static_cast<size_t>(cfg.max_seq_len) * cfg.d_model * sizeof(float);

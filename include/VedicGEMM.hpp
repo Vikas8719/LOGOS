@@ -1,9 +1,4 @@
 #pragma once
-// ============================================================
-//  LOGOS — VedicGEMM.hpp
-//  Urdhva Tiryagbhyam tiled GEMM — header-only
-//  #pragma once ensures no multiple-definition errors
-// ============================================================
 #include "Tensor.hpp"
 #include <stdexcept>
 #include <string>
@@ -56,8 +51,13 @@ inline Tensor vedic_gemm(const Tensor& A, const Tensor& B) {
 inline Tensor vedic_gemm_bias(const Tensor& A, const Tensor& W, const Tensor& bias) {
     Tensor C = vedic_gemm(A, W);
     int M = C.rows(), N = C.cols();
-    if (bias.total_size != N)
-        throw std::invalid_argument("Bias size mismatch");
+    if (bias.ndim() != 1 && !(bias.ndim() == 2 && (bias.rows() == 1 || bias.cols() == 1)))
+        throw std::invalid_argument("vedic_gemm_bias: bias must be 1-D or row/col vector");
+    int bias_n = (bias.ndim() == 1) ? (int)bias.total_size
+                                     : (bias.rows() == 1 ? bias.cols() : bias.rows());
+    if (bias_n != N)
+        throw std::invalid_argument("Bias size mismatch: bias=" + std::to_string(bias_n)
+                                    + " vs output cols=" + std::to_string(N));
     for (int i = 0; i < M; ++i)
         for (int j = 0; j < N; ++j)
             C.at(i,j) += bias[j];

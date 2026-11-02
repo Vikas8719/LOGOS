@@ -539,6 +539,116 @@ if(CMAKE_CUDA_COMPILER)
 endif()
 
 # ═══════════════════════════════════════════════════════════════
+# T8 — BENCHMARK SUITE (bench.cpp)
+# cmake --build build --target logos_bench
+# ./build/logos_bench          : all benchmarks
+# ./build/logos_bench --all    : include slow benchmarks
+# ═══════════════════════════════════════════════════════════════
+add_executable(logos_bench
+    tests/bench.cpp
+    src/VedicGEMM.cpp
+    src/Checkpoint.cpp
+)
+target_include_directories(logos_bench PRIVATE include tests)
+if(APPLE)
+    target_compile_options(logos_bench PRIVATE -O3 -std=c++20)
+elseif(MSVC)
+    target_compile_options(logos_bench PRIVATE $<$<CONFIG:Release>:/O2>)
+else()
+    target_compile_options(logos_bench PRIVATE -O3 -march=x86-64 -std=c++20)
+endif()
+
+enable_testing()
+add_test(NAME "T8_Bench_Smoke" COMMAND logos_bench)
+set_tests_properties("T8_Bench_Smoke" PROPERTIES
+    TIMEOUT 300
+    LABELS "BENCH"
+    PASS_REGULAR_EXPRESSION "ALL.*PASS|0 above threshold"
+    FAIL_REGULAR_EXPRESSION "FAIL")
+
+message(STATUS "✅ Benchmark target: logos_bench  (T8_Bench_Smoke)")
+message(STATUS "   Run:   cmake --build build --target logos_bench && ./build/logos_bench")
+message(STATUS "   CTest: ctest -L BENCH --output-on-failure")
+
+# ═══════════════════════════════════════════════════════════════
+# T9 — FUZZ TEST (test_fuzz.cpp)
+# Mode A: LibFuzzer (clang++ -fsanitize=fuzzer)
+#   cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ ..
+#   cmake --build build --target logos_fuzz
+#   ./build/logos_fuzz -max_total_time=60 corpus/
+#
+# Mode B: Selftest (any compiler, no LibFuzzer)
+#   cmake --build build --target logos_fuzz_selftest
+#   ./build/logos_fuzz_selftest --selftest
+# ═══════════════════════════════════════════════════════════════
+option(LOGOS_FUZZ "Build fuzz target with -fsanitize=fuzzer (requires clang++)" OFF)
+
+add_executable(logos_fuzz_selftest
+    tests/test_fuzz.cpp
+    src/VedicGEMM.cpp
+    src/Checkpoint.cpp
+)
+target_include_directories(logos_fuzz_selftest PRIVATE include tests)
+if(APPLE)
+    target_compile_options(logos_fuzz_selftest PRIVATE -O1 -g -std=c++20)
+elseif(MSVC)
+    target_compile_options(logos_fuzz_selftest PRIVATE /Od /Zi)
+else()
+    target_compile_options(logos_fuzz_selftest PRIVATE -O1 -g -march=x86-64 -std=c++20)
+endif()
+
+enable_testing()
+add_test(NAME "T9_Fuzz_Selftest" COMMAND logos_fuzz_selftest --selftest)
+set_tests_properties("T9_Fuzz_Selftest" PROPERTIES
+    TIMEOUT 120
+    LABELS "FUZZ"
+    PASS_REGULAR_EXPRESSION "All 13 fuzz targets smoke-tested OK")
+
+if(LOGOS_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "[FUZZ] LibFuzzer ke liye clang++ chahiye.\n"
+            "       cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ ..")
+    endif()
+
+    add_executable(logos_fuzz
+        tests/test_fuzz.cpp
+        src/VedicGEMM.cpp
+        src/Checkpoint.cpp
+    )
+    target_include_directories(logos_fuzz PRIVATE include tests)
+    target_compile_definitions(logos_fuzz PRIVATE LOGOS_LIBFUZZER_ONLY=1)
+    target_compile_options(logos_fuzz PRIVATE
+        -O1 -g -std=c++20
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(logos_fuzz PRIVATE
+        -fsanitize=fuzzer,address,undefined
+    )
+
+    add_test(NAME "T9_Fuzz_LibFuzzer_30s"
+        COMMAND logos_fuzz
+            -max_total_time=30
+            -max_len=1024
+            -rss_limit_mb=512
+    )
+    set_tests_properties("T9_Fuzz_LibFuzzer_30s" PROPERTIES
+        TIMEOUT 60
+        LABELS "FUZZ;LIBFUZZER")
+
+    message(STATUS "✅ LibFuzzer target: logos_fuzz  (LOGOS_FUZZ=ON)")
+    message(STATUS "   Build: cmake --build build --target logos_fuzz")
+    message(STATUS "   Run:   ./build/logos_fuzz -max_total_time=300 corpus/")
+else()
+    message(STATUS "ℹ️  Fuzz selftest only (LOGOS_FUZZ=OFF)")
+    message(STATUS "   Full fuzzer: cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ ..")
+endif()
+
+message(STATUS "✅ Fuzz selftest target: logos_fuzz_selftest  (T9_Fuzz_Selftest)")
+message(STATUS "   CTest: ctest -L FUZZ --output-on-failure")
+
+# ═══════════════════════════════════════════════════════════════
 # MULL — Mutation Testing
 # ═══════════════════════════════════════════════════════════════
 #

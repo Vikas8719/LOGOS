@@ -1,12 +1,7 @@
 
-//
-//  BACKWARD NOTE:
-//    K_int8/V_int8 are NOT used in backward — float32 K/V cached separately.
-//    So: dV, dK backward kernels unchanged. Zero regression.
-// ============================================================
 #include "ModelGPU.cuh"
 #include "VedicGEMM.cuh"
-#include "MixedPrecision.cuh"   // [BUG-FIX] cast_fp32_to_fp16_kernel ModelGPU.cu line 772,792 mein use hota hai
+#include "MixedPrecision.cuh"   
 
 #if defined(__has_include)
   #if __has_include(<cuda_runtime.h>)
@@ -33,10 +28,9 @@
 #endif
 #include <stdexcept>
 #include <climits>
+#include <chrono>
 
-// ============================================================
-//  EXISTING KERNELS (v6 — unchanged)
-// ============================================================
+
 
 __global__ void embedding_kernel(
     const int* __restrict__ token_ids,
@@ -115,10 +109,7 @@ __global__ void langevin_step_kernel(
     velocity[idx]=v; W[idx]+=v;
 }
 
-// ============================================================
-//  [P2-A] HYPERBOLIC EMBEDDING KERNELS
-//  Poincaré Ball Model with curvature c
-// ============================================================
+
 
 __global__ void expmap0_kernel(float* X, int seq, int d, float curvature)
 {
@@ -127,10 +118,9 @@ __global__ void expmap0_kernel(float* X, int seq, int d, float curvature)
 
     float* v = X + tok * d;
     float sqrt_c = sqrtf(curvature);
-    // Poincaré ball boundary: ||y||_c < 1/sqrt(c), so max safe norm = 0.99/sqrt(c)
+   
     float max_norm = 0.99f / sqrt_c;
 
-    // Parallel reduction: compute ||v||^2
     float thread_sq = 0.0f;
     for (int j = threadIdx.x; j < d; j += blockDim.x)
         thread_sq += v[j] * v[j];
@@ -147,24 +137,21 @@ __global__ void expmap0_kernel(float* X, int seq, int d, float curvature)
     __syncthreads();
 
     float norm = s_norm;
-    // [FIX] expmap0: tanh((sqrt_c * norm) / 2) / (sqrt_c * norm)
-    // This maps R^d → Poincaré ball. Result norm = tanh(sqrt_c*norm/2)/sqrt_c.
-    // We must clamp the OUTPUT norm to < 1/sqrt_c (ball boundary).
     float scaled = sqrt_c * norm;
     float out_norm;  // norm of the output vector
     float factor;
     if (scaled > 1e-7f) {
-        // tanh(x) < 1 always, so out_norm = tanh(scaled/2)/sqrt_c < 1/sqrt_c ✓
+        
         float th = tanhf(fminf(scaled * 0.5f, 15.0f));  // clamp arg to avoid fp overflow
         out_norm = th / sqrt_c;
-        // factor maps v → (out_norm / norm) * v
+        
         factor = out_norm / (norm + 1e-9f);
     } else {
-        // Taylor: tanh(x)/x → 1 as x→0, so factor → sqrt_c/2 * (1/sqrt_c) = 0.5
+       
         factor = 0.5f;
         out_norm = factor * norm;
     }
-    // Safety clamp: ensure output stays strictly inside ball (handles fp edge cases)
+    
     if (out_norm >= max_norm && norm > 1e-9f) {
         factor = max_norm / (norm + 1e-9f);
     }
@@ -271,30 +258,8 @@ __global__ void expmap0_bwd_kernel(
         dv[j] = alpha * dY[j] + beta * s_dot * v[j];
 }
 
-// ============================================================
-//  [P2-B] NIKHILAM QUANTIZATION KERNELS
-// ============================================================
 
-// ── absmax: find max(|data|) via parallel reduction ──────────
-// [v27-BUG7-FIX] atomicMax(float*) UB fix:
-//   Pehla code: atomicMax((int*)out, __float_as_int(smax[0]))
-//   Bug: IEEE754 bit trick sirf POSITIVE floats ke liye work karta hai.
-//        Negative float mein sign bit=1 hota hai, jo int representation
-//        mein negative integer jaisa dikhta hai → atomicMax negative floats
-//        ko less than zero samajh leta hai → absmax WRONG value return karta.
-//        Nikhilam KV scale galat ho jaata → INT8 clamp galat → quantization noise.
-//   Fix: shared memory mein pehle fmaxf karo (correct float comparison),
-//        phir ek hi atomicAdd use karo result propagate karne ke liye —
-//        ya iska bhi better: CAS-loop se float atomicMax implement karo.
-//   Note: fabsf(data[idx]) se sab values pehle se >= 0 hain is kernel mein,
-//         isliye positive-only trick technically kaam karta tha YE KERNEL mein —
-//         lekin pattern unsafe hai (future code mein raw values aa sakti hain).
-//         Isliye proper float CAS atomicMax use karo.
 __device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
-    // Correct float atomicMax via CAS loop.
-    // Works for any float value including negatives.
-    // For positive values only (our case: fabsf), this is equivalent to
-    // the __float_as_int trick but is always correct.
     unsigned int* addr_as_uint = (unsigned int*)addr;
     unsigned int old = *addr_as_uint, assumed;
     do {
@@ -309,7 +274,7 @@ __global__ void absmax_kernel(const float* data, float* out, int size)
 {
     __shared__ float smax[256];
     int idx=blockIdx.x*blockDim.x+threadIdx.x;
-    // fabsf ensures all values are non-negative before reduction
+    
     float val=(idx<size)?fabsf(data[idx]):0.f;
     smax[threadIdx.x]=val;
     __syncthreads();
@@ -317,15 +282,10 @@ __global__ void absmax_kernel(const float* data, float* out, int size)
         if (threadIdx.x<s) smax[threadIdx.x]=fmaxf(smax[threadIdx.x],smax[threadIdx.x+s]);
         __syncthreads();
     }
-    // [v27-BUG7-FIX] Use proper CAS-based float atomicMax.
-    // Previously: atomicMax((int*)out, __float_as_int(smax[0]))
-    // This worked ONLY because fabsf makes values >= 0 (IEEE754 positive floats
-    // sort correctly as uint32). But pattern is fragile and UB for negative inputs.
-    // Now: atomicMaxFloat uses CAS loop — correct for ALL float values.
+   
     if (threadIdx.x==0) atomicMaxFloat(out, smax[0]);
 }
 
-// ── nikhilam_quantize: float32 → int8 ────────────────────────
 __global__ void nikhilam_quantize_kernel(
     const float* __restrict__ src,
     int8_t*      __restrict__ dst,
@@ -339,7 +299,6 @@ __global__ void nikhilam_quantize_kernel(
     dst[idx]=(int8_t)__float2int_rn(q);
 }
 
-// ── nikhilam_dequantize: int8 → float32 ─────────────────────
 __global__ void nikhilam_dequantize_kernel(
     const int8_t* __restrict__ src,
     float*        __restrict__ dst,
@@ -350,16 +309,14 @@ __global__ void nikhilam_dequantize_kernel(
     dst[idx]=(float)src[idx]*scale;
 }
 
-// ============================================================
-//  HOST-SIDE NIKHILAM HELPERS
-// ============================================================
+
 
 static NikhilamTensor nikhilam_compress(const GPUTensor& src)
 {
     NikhilamTensor out;
     out.size = src.size;
 
-    // [v26-LEAK-FIX] CudaPtr<float>: d_max auto-freed on exception or return
+    
     CudaPtr<float> d_max(1);  // 1 float, zero-init
     int blks = (src.size + 255) / 256;
     absmax_kernel<<<blks, 256>>>(src.data, d_max.get(), src.size);
@@ -367,16 +324,9 @@ static NikhilamTensor nikhilam_compress(const GPUTensor& src)
 
     float h_max = d_max.scalar();
 
-    // [FIX] Nikhilam scale: use 127.5f instead of 127.0f for better round-trip accuracy.
-    // INT8 range is -128..127. Using 127.5f as denominator ensures the
-    // full range is utilized and rounding error stays below 1%.
-    // With 127.0f: max rel error ≈ 1/(2*127) ≈ 0.39% per value but quantization
-    // step is h_max/127 → relative error can reach ~0.8-2.4% depending on distribution.
-    // With 127.5f + dithering-aware clamping: worst case < 0.8%.
-    // Also add a small epsilon floor so scale is never degenerate for zero tensors.
+    
     out.scale = (h_max + 1e-8f) / 127.5f;
 
-    // [v27-MEM2-FIX] NikhilamTensor::data safe alloc:
     CudaPtr<int8_t> tmp_data(out.size);
     nikhilam_quantize_kernel<<<blks, 256>>>(src.data, tmp_data.get(), out.scale, out.size);
     CUDA_KERNEL_CHECK();
@@ -394,13 +344,6 @@ GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols)
     return out;
 }
 
-// ============================================================
-//  CONFIG VALIDATION (v6 — unchanged, ODR: only in VedicGEMM.cu)
-// ============================================================
-
-// ============================================================
-//  ModelGPU IMPLEMENTATION
-// ============================================================
 
 __device__ __forceinline__ float block_sum256(float v)
 {
@@ -541,16 +484,22 @@ __global__ void reynolds_bwd_kernel(const float* X, const float* gamma, const fl
 __global__ void run_stats_update_kernel(const float* X, float* rmean, float* rvar,
                                         int seq, int d, float decay)
 {
-    int j=blockIdx.x*blockDim.x+threadIdx.x;
-    if (j>=d) return;
-    float m=0.f;
-    for (int i=0;i<seq;++i) m+=X[i*d+j];
-    m/=(float)seq;
-    float v=0.f;
-    for (int i=0;i<seq;++i) { float t=X[i*d+j]-m; v+=t*t; }
-    v/=(float)seq;
-    rmean[j]=decay*rmean[j]+(1.0f-decay)*m;
-    rvar[j] =decay*rvar[j] +(1.0f-decay)*v;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= d) return;
+
+    float m = 0.f;
+    for (int i = 0; i < seq; ++i) m += X[i * d + j];
+    m /= (float)seq;
+
+    float v = 0.f;
+    for (int i = 0; i < seq; ++i) {
+        float t = X[i * d + j] - m;
+        v += t * t;
+    }
+    v /= (float)seq;
+
+    rmean[j] = decay * rmean[j] + (1.f - decay) * m;
+    rvar[j]  = decay * rvar[j]  + (1.f - decay) * v;
 }
 
 __global__ void feynman_dropout_kernel(float* A, float* mask, int n, float p, float hbar, unsigned seed)
@@ -623,20 +572,14 @@ ModelGPU::ModelGPU(const ModelConfig& cfg_, const HyperConfig& hcfg)
     }
     CUDA_CHECK(cudaMalloc(&d_token_ids, cfg.max_seq_len*sizeof(int)));
 
-    // [v27-BUG15-FIX] dropout_seed initialized to fixed value (12345u) in header.
-    // But same seed every run = same dropout pattern every fresh session.
-    // Fix: XOR with time to get session-unique seed.
-    // Note: reproducibility ke liye LOGOS_DROPOUT_SEED env var set karo.
     {
         const char* seed_env = std::getenv("LOGOS_DROPOUT_SEED");
         if (seed_env && *seed_env) {
             dropout_seed = (unsigned)std::strtoul(seed_env, nullptr, 10);
             printf("  [v27] dropout_seed from LOGOS_DROPOUT_SEED: %u\n", dropout_seed);
         } else {
-            // Time-based seed for session uniqueness
             auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
             dropout_seed = (unsigned)(now_ns ^ (now_ns >> 32) ^ 0xDEADBEEFu);
-            // Don't print (called every resume too)
         }
     }
 
@@ -747,16 +690,10 @@ void ModelGPU::sync_to_cpu(LOGOSModel& cpu_model) const {
     }
 }
 
-// ============================================================
-//  FORWARD PASS
-// ============================================================
-// [v27-BUG16-NOTE] #if 0 block below is intentionally kept as historical reference.
-// It documents the OLD forward pass before physics wiring.
-// Do NOT remove — it shows the progression from v6 (no physics) to v8 (full wiring).
-// If you want to test physics-free baseline, you can compile with -DLOGOS_LEGACY_FORWARD.
-#if 0  // legacy forward (no physics wiring) — replaced by the forward below
-// ... (legacy code preserved for reference)
-#endif  // legacy forward end
+
+#if 0  
+
+#endif  
 
 void ModelGPU::apply_norm(const GPUTensor& X, const GPUTensor& gamma, const GPUTensor& beta,
                           GPUTensor& Y, GPUTensor& W, int slot, int seq)
@@ -787,7 +724,6 @@ void ModelGPU::update_norm_stats()
     CUDA_KERNEL_CHECK();
 }
 
-// ── Forward: all Vedic+physics tools wired in ────────────────
 GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
 {
     int seq=static_cast<int>(token_ids.size());
@@ -795,9 +731,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
     if (seq<=0||seq>cfg.max_seq_len)
         throw std::invalid_argument("Invalid seq: "+std::to_string(seq));
 
-    // [v31-FLASH] Flash Attention active — no seq×seq tensor allocated
-    // VRAM for attention: 16 heads × seq×DH×4B × 3(Q,K,V,out) ≈ 192MB vs old 8.2GB
-    static bool flash_logged = false;
+    
     if (!flash_logged) {
         long long old_attn_mb = (long long)seq * seq * 4 * 2 * cfg.num_heads / 1024 / 1024;
         long long new_attn_mb = (long long)seq * (D/cfg.num_heads) * 4 * cfg.num_heads / 1024 / 1024;
@@ -918,43 +852,13 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
                 CUDA_CHECK(cudaMemcpy(hc.V_s.data,  hc.V.data,seq*DH*sizeof(float),cudaMemcpyDeviceToDevice));
             }
 
-            // [v31-FLASH] Flash Attention — replaces scores[seq×seq] + softmax + gemm
-            // OLD (OOM cause): K_T[DH×seq] + scores[seq×seq] + attn_probs[seq×seq]
-            //   = DH×seq×4B + 2×seq²×4B per head
-            //   = 64×8192×4 + 2×8192²×4 = 2MB + 512MB = 514 MB per head
-            //   × 16 heads = 8.2 GB just for attention intermediates → T4 OOM
-            //
-            // NEW (Flash): only out[seq×DH] allocated = 8192×64×4 = 2MB per head
-            //   × 16 heads = 32MB total — 256× reduction ✓
-            //
-            // attn_probs saved only if phys.training (needed for backward dQ,dK,dV)
-            // If not training (inference/val): attn_ptr=nullptr → saves 512MB/head more
+           
+            /
 
             hc.head_out = gpu_alloc(seq, DH);
 
             float* attn_save_ptr = nullptr;
-            // [v32-T4-OOM-FIX] attn_probs allocation (seq×seq per head) hata diya:
-            //
-            //   PEHLE (OOM cause):
-            //     if (phys.training) hc.attn_probs = gpu_alloc(seq, seq);
-            //     → 16 heads × 8192² × 4B = 4.29 GB → T4 OOM (crashes at VedicGEMM.cu:597)
-            //
-            //   PROBLEM: Flash Attention ka backward pass attn_probs pe depend karta tha.
-            //   Lekin T4 pe seq=8192 ke saath yeh physically fit hi nahi hota.
-            //
-            //   FIX: attn_probs kabhi allocate mat karo (attn_save_ptr = nullptr hamesha).
-            //   Flash attention kernel already causal+shunyam mask apply karta hai forward mein.
-            //   Backward ke liye: checkpointed recomputation use karo (backward mein Q,K,V
-            //   se attention dobara compute — memory O(seq·DH) vs O(seq²)).
-            //
-            //   VRAM saved: 16 × 8192² × 4B = 4.29 GB → model fit ho jaata T4 pe.
-            //   Trade-off: backward mein ~15% extra compute (recompute attn) — acceptable.
-            //
-            //   NOTE: Agar future mein T4 se zyada VRAM wala GPU use ho (A100/H100) aur
-            //   seq <= 4096 ho, toh yeh flag se re-enable kar sakte hain:
-            //     LOGOS_SAVE_ATTN_PROBS=1 (env var)
-            //   Abhi: always nullptr — backward recomputes.
-            // attn_probs stays default-constructed (nullptr) — no alloc, always
+            
 
             cuda_flash_attention_fwd(
                 hc.Q_adv.data, hc.K.data, hc.V_s.data,
@@ -968,9 +872,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             );
             CUDA_KERNEL_CHECK();
 
-            // [v31-RAWPTR] head_proj: temporary, freed immediately after residual add
-            // Use CudaPtr (raw pointer) instead of GPUTensor to avoid RAII overhead
-            // and make the short lifetime explicit. Freed at end of this scope.
+       
             {
                 CudaPtr<float> head_proj_raw(seq * D);
                 GPUTensor head_proj_view;
@@ -983,8 +885,8 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
                 residual_add_kernel<<<(sz+th-1)/th,th>>>(concat.data, head_proj_view.data, sz);
                 CUDA_KERNEL_CHECK();
 
-                head_proj_view.data = nullptr; // prevent double-free (CudaPtr owns memory)
-            } // head_proj_raw freed here — saves seq×D×4B = 8192×1024×4 = 32MB per head
+                head_proj_view.data = nullptr;
+            }
         }
 
         int pWproj = layer_base_pi + H*4 + 0;
@@ -994,7 +896,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
         cache.concat=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.concat.data,concat.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
 
-        // [v31-RAWPTR] mha_out: temp projection, freed after cache save + residual
+        
         cache.attn_out=gpu_alloc(seq,D);
         {
             CudaPtr<float> mha_raw(seq * D);
@@ -1004,15 +906,14 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
 
             amp_gemm(concat, blk.W_proj, pWproj, mha_view);
 
-            // Save for backward (cache.attn_out = W_proj output before residual)
             CUDA_CHECK(cudaMemcpy(cache.attn_out.data, mha_view.data,
                                   seq*D*sizeof(float), cudaMemcpyDeviceToDevice));
             int sz=seq*D, th=256;
             residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data, mha_view.data, sz);
             CUDA_KERNEL_CHECK();
 
-            mha_view.data = nullptr; // prevent double-free
-        } // mha_raw freed here
+            mha_view.data = nullptr;
+        }
 
         cache.post_attn=gpu_alloc(seq,D);
         CUDA_CHECK(cudaMemcpy(cache.post_attn.data,X.data,seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
@@ -1032,11 +933,12 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             cache.ffn_mask=gpu_alloc(seq,4*D);
             feynman_dropout_kernel<<<(n+255)/256,256>>>(cache.ffn_A.data,cache.ffn_mask.data,
                 n,phys.drop_p,phys.drop_hbar,dropout_seed);
+            CUDA_CHECK(cudaStreamSynchronize(0));
             CUDA_KERNEL_CHECK();
             dropout_seed=dropout_seed*1664525u+1013904223u+(unsigned)l;
         }
 
-        // [v31-RAWPTR] ffn_out: temporary, used only for residual add
+       
         {
             CudaPtr<float> ffn_out_raw(seq * D);
             GPUTensor ffn_out_view;
@@ -1049,8 +951,8 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             residual_add_kernel<<<(sz+th-1)/th,th>>>(X.data, ffn_out_view.data, sz);
             CUDA_KERNEL_CHECK();
 
-            ffn_out_view.data = nullptr; // prevent double-free
-        } // ffn_out_raw freed here — saves 32MB per layer × 16 layers = 512MB
+            ffn_out_view.data = nullptr;
+        }
     }
 
     last_hidden=std::move(X);

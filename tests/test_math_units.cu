@@ -1,55 +1,3 @@
-// ============================================================
-//  LOGOS — tests/test_math_units.cu
-//  TEST 2: Mathematical Unit Tests — Vedic vs Modern Math
-//
-//  Har formula ke liye:
-//    (a) Modern math se expected result compute karo (reference)
-//    (b) Vedic/LOGOS formula se result compute karo (GPU kernel)
-//    (c) Compare karo — tolerance ke andar hona chahiye
-//
-//  Formulas tested:
-//    [M1] Gunitasamuchayah — sum(A×B) = dot(rowsums(A), colsums(B))
-//         Vedic sutram: Product of sums = Sum of products
-//         Modern ref:  direct summation of C = A @ B
-//
-//    [M2] Free Energy F = CE - T·S
-//         Vedic ref:   Pranavah principle (balance of energy and entropy)
-//         Modern ref:  Helmholtz free energy (thermodynamics textbook)
-//         Check:       GPU result == CPU reference computation
-//
-//    [M3] Leapfrog Langevin (Störmer-Verlet)
-//         Vedic:  Chaturanga (4-part integration: pos, vel, force, noise)
-//         Modern: 2nd-order symplectic integration error = O(h³)
-//         Check:  Energy conservation better than Euler (error ratio)
-//
-//    [M4] Poincaré Ball expmap0
-//         Vedic:  Mandala geometry (circular/hyperbolic space)
-//         Modern: Riemannian geometry expmap at origin
-//         Check:  ||expmap(v)||_P < 1 (inside ball)
-//                 expmap→logmap round-trip error < 1e-5
-//
-//    [M5] Nikhilam complement encoding accuracy
-//         Vedic:  Nikhilam Navatascharamam — complement-from-base
-//                 "all from 9, last from 10" → complement arithmetic
-//         Modern: INT8 quantization with absmax scaling
-//         Check:  Complement property: v + complement(v) ≈ base
-//                 Signal-to-Noise Ratio >= 40 dB (standard INT8 spec)
-//
-//    [M6] SHM hybrid update — energy balance
-//         Vedic:  Samkhya dualism (Purusha=Hamiltonian, Prakriti=Langevin)
-//         Modern: Underdamped Langevin + heavy-ball (SGLD-HMC hybrid)
-//         Check:  With zero noise: v update = pure Nesterov momentum
-//                 FDT condition: variance(noise) = 2·γ·kT·lr
-//
-//    [M7] Boltzmann softmax temperature scaling
-//         Vedic:  Agni principle (fire/temperature modulates transformation)
-//         Modern: Gibbs distribution p(x) ∝ exp(-E(x)/T)
-//         Check:  T→0: argmax → 1.0, T→∞: uniform distribution
-//
-//    [M8] Gunitasamuchayah for non-square matrices
-//         Verify the Vedic identity holds for M≠K≠N shapes
-//         which are common in Transformer FFN layers (d → 4d → d)
-// ============================================================
 
 #include "VedicGEMM.cuh"
 #include "ModelGPU.cuh"
@@ -61,7 +9,6 @@
 #include <algorithm>
 #include <stdexcept>
 
-// ── Test framework ────────────────────────────────────────────
 static int  g_pass = 0, g_fail = 0;
 static bool g_any_fail = false;
 
@@ -99,7 +46,6 @@ static bool safe_cuda(cudaError_t e, const char* msg) {
     return true;
 }
 
-// ── CPU reference: naive matrix multiply ─────────────────────
 static std::vector<float> cpu_matmul(const std::vector<float>& A,
                                       const std::vector<float>& B,
                                       int M, int K, int N) {
@@ -111,10 +57,6 @@ static std::vector<float> cpu_matmul(const std::vector<float>& A,
     return C;
 }
 
-// ── CPU reference: Gunitasamuchayah checksum (CORRECT formula) ──
-// sum(C) where C=A(M×K)×B(K×N) = dot(col_sums_A[K], row_sums_B[K])
-// col_sums_A[k] = Σ_m A[m,k]
-// row_sums_B[k] = Σ_n B[k,n]
 static float cpu_vedic_checksum(const std::vector<float>& A,
                                  const std::vector<float>& B,
                                  int M, int K, int N) {
@@ -130,7 +72,6 @@ static float cpu_vedic_checksum(const std::vector<float>& A,
     return dot;
 }
 
-// ── CPU reference: Free Energy ────────────────────────────────
 static float cpu_free_energy(const std::vector<float>& logits,
                                int target, float T) {
     int V = (int)logits.size();
@@ -145,24 +86,18 @@ static float cpu_free_energy(const std::vector<float>& logits,
     return CE - T*S;
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M1] Gunitasamuchayah — sum(C) = vedic_checksum(A,B)
-// ─────────────────────────────────────────────────────────────
 static void test_gunitasamuchayah_identity() {
     TEST_SECTION("M1: Gunitasamuchayah Identity (Vedic GEMM Checksum)");
 
-    // Test case: random-like values (deterministic)
     const int M=16, K=32, N=16;
     std::vector<float> h_A(M*K), h_B(K*N);
     for (int i=0; i<M*K; i++) h_A[i] = sinf((float)i * 0.3f);
     for (int i=0; i<K*N; i++) h_B[i] = cosf((float)i * 0.2f);
 
-    // CPU reference: actual sum(C)
     auto h_C = cpu_matmul(h_A, h_B, M, K, N);
     float sum_C = 0.0f;
     for (float v : h_C) sum_C += v;
 
-    // Vedic checksum (CPU formula)
     float vedic_cpu = cpu_vedic_checksum(h_A, h_B, M, K, N);
     printf("  sum(C)=%.6f | vedic_cpu=%.6f | err=%.6f\n",
            sum_C, vedic_cpu, fabsf(sum_C - vedic_cpu));
@@ -171,7 +106,6 @@ static void test_gunitasamuchayah_identity() {
     MATH_ASSERT(rel_err_cpu < 0.15f,
         "Gunitasamuchayah CPU: sum(C) ≈ rowsums(A)·colsums(B)/K (within 15%)");
 
-    // GPU verification via cuda_vedic_verify
     GPUTensor gA = gpu_alloc(M,K), gB = gpu_alloc(K,N), gC = gpu_alloc(M,N);
     safe_cuda(cudaMemcpy(gA.data, h_A.data(), M*K*sizeof(float), cudaMemcpyHostToDevice), "h2d A");
     safe_cuda(cudaMemcpy(gB.data, h_B.data(), K*N*sizeof(float), cudaMemcpyHostToDevice), "h2d B");
@@ -190,25 +124,19 @@ static void test_gunitasamuchayah_identity() {
         "Gunitasamuchayah GPU: checksum_vedic is finite");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M2] Free Energy F = CE - T·S (GPU vs CPU reference)
-// ─────────────────────────────────────────────────────────────
 static void test_free_energy_math() {
     TEST_SECTION("M2: Free Energy F = CE - T·S (GPU vs CPU reference)");
 
     const int SEQ=1, VOCAB=16;
     float T = 0.05f;
 
-    // Known logits: sawtooth
     std::vector<float> h_logits(VOCAB);
     for (int i=0; i<VOCAB; i++) h_logits[i] = (float)(i%5) * 0.3f;
     int target = 3;
 
-    // CPU reference
     float F_cpu = cpu_free_energy(h_logits, target, T);
     printf("  CPU reference: F=%.6f (CE-T*S)\n", F_cpu);
 
-    // GPU
     GPUTensor logits_g = gpu_alloc(SEQ, VOCAB);
     float *d_loss, *d_grad;
     int   *d_targets;
@@ -239,23 +167,14 @@ static void test_free_energy_math() {
     cudaFree(d_loss); cudaFree(d_grad); cudaFree(d_targets);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M3] Leapfrog vs Euler — energy conservation comparison
-// ─────────────────────────────────────────────────────────────
 static void test_leapfrog_energy_conservation() {
     TEST_SECTION("M3: Leapfrog Störmer-Verlet vs Euler Energy Conservation");
 
-    // Simulate a simple 1D harmonic oscillator on CPU
-    // H = 0.5*v^2 + 0.5*w^2  (spring: gradient = w)
-    // Exact: energy conserved, period = 2*pi
-    // Euler:    E(t) grows linearly — unstable
-    // Leapfrog: E(t) oscillates, bounded — stable
 
     const int STEPS = 200;
     const float lr = 0.05f;    // step size
     const float friction = 0.0f;  // pure Hamiltonian (no noise for this test)
 
-    // Euler-Maruyama integration (CPU)
     float w_euler=1.0f, v_euler=0.0f;
     float E_euler_init = 0.5f*w_euler*w_euler + 0.5f*v_euler*v_euler;
     for (int i=0; i<STEPS; i++) {
@@ -265,7 +184,6 @@ static void test_leapfrog_energy_conservation() {
     }
     float E_euler_final = 0.5f*w_euler*w_euler + 0.5f*v_euler*v_euler;
 
-    // Störmer-Verlet (Leapfrog) integration (CPU)
     float w_lf=1.0f, v_lf=0.0f;
     float E_lf_init = 0.5f*w_lf*w_lf + 0.5f*v_lf*v_lf;
     for (int i=0; i<STEPS; i++) {
@@ -291,16 +209,12 @@ static void test_leapfrog_energy_conservation() {
         "Störmer-Verlet: energy drift < 5% over 200 steps (bounded)");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M4] Poincaré expmap0 geometry — Riemannian properties
-// ─────────────────────────────────────────────────────────────
 static void test_poincare_geometry() {
     TEST_SECTION("M4: Poincaré Ball Geometry (expmap0 / logmap0)");
 
     const int SEQ=4, D=32;
     GPUTensor X = gpu_alloc(SEQ, D);
 
-    // Property 1: expmap(0) = 0 (origin maps to origin)
     std::vector<float> h_zero(SEQ*D, 0.0f);
     safe_cuda(cudaMemcpy(X.data, h_zero.data(), SEQ*D*sizeof(float), cudaMemcpyHostToDevice), "h2d zero");
     expmap0_kernel<<<1, 256>>>(X.data, SEQ, D, 1.0f);
@@ -311,7 +225,6 @@ static void test_poincare_geometry() {
     for (float v : h_out) if (fabsf(v) > 1e-6f) { zero_maps_to_zero = false; break; }
     MATH_ASSERT(zero_maps_to_zero, "expmap0: zero vector maps to zero (origin identity)");
 
-    // Property 2: ||expmap(v)|| < 1 for all v (Poincaré ball constraint)
     std::vector<float> h_rand(SEQ*D);
     for (int i=0; i<SEQ*D; i++) h_rand[i] = sinf((float)i)*3.0f;  // large values
     safe_cuda(cudaMemcpy(X.data, h_rand.data(), SEQ*D*sizeof(float), cudaMemcpyHostToDevice), "h2d rand");
@@ -331,7 +244,6 @@ static void test_poincare_geometry() {
     printf("  max ||expmap(v)||_2 = %.8f (must be < 1.0)\n", max_norm);
     MATH_ASSERT(in_ball, "expmap0: ||output|| < 1 for all inputs (Poincaré constraint)");
 
-    // Property 3: curvature c=2 gives tighter ball
     std::vector<float> h_v(SEQ*D, 0.5f);
     safe_cuda(cudaMemcpy(X.data, h_v.data(), SEQ*D*sizeof(float), cudaMemcpyHostToDevice), "h2d v");
     expmap0_kernel<<<1, 256>>>(X.data, SEQ, D, /*curvature=*/2.0f);
@@ -353,7 +265,6 @@ static void test_poincare_geometry() {
     MATH_ASSERT(norm_c2 < norm_c1,
         "expmap0: higher curvature c=2 maps closer to origin (tighter ball)");
 
-    // Property 4: round-trip accuracy
     std::vector<float> h_small(SEQ*D);
     for (int i=0; i<SEQ*D; i++) h_small[i] = 0.05f * sinf((float)i * 0.7f);
     safe_cuda(cudaMemcpy(X.data, h_small.data(), SEQ*D*sizeof(float), cudaMemcpyHostToDevice), "h2d small");
@@ -371,9 +282,6 @@ static void test_poincare_geometry() {
         "expmap0→logmap0: round-trip error < 1e-4 (inverse functions)");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M5] Nikhilam complement property + SNR >= 40dB
-// ─────────────────────────────────────────────────────────────
 static void test_nikhilam_complement() {
     TEST_SECTION("M5: Nikhilam Complement Encoding (INT8 Quantization)");
 
@@ -386,19 +294,16 @@ static void test_nikhilam_complement() {
     safe_cuda(cudaMalloc(&d_absmax, sizeof(float)),    "malloc absmax");
     safe_cuda(cudaMemset(d_absmax, 0, sizeof(float)),  "memset absmax");
 
-    // Signal: sine wave with known amplitude
     std::vector<float> h_src(N);
     float amplitude = 7.5f;
     for (int i=0; i<N; i++) h_src[i] = amplitude * sinf(2.0f * 3.14159f * i / 64.0f);
     safe_cuda(cudaMemcpy(d_src, h_src.data(), N*sizeof(float), cudaMemcpyHostToDevice), "h2d src");
 
-    // Compute scale
     absmax_kernel<<<(N+255)/256, 256>>>(d_src, d_absmax, N);
     safe_cuda(cudaDeviceSynchronize(), "absmax");
     float h_absmax; safe_cuda(cudaMemcpy(&h_absmax, d_absmax, sizeof(float), cudaMemcpyDeviceToHost), "d2h absmax");
     float scale = h_absmax / 127.0f;
 
-    // Quantize + dequantize
     nikhilam_quantize_kernel<<<(N+255)/256, 256>>>(d_src, d_int8, scale, N);
     safe_cuda(cudaDeviceSynchronize(), "quant");
     nikhilam_dequantize_kernel<<<(N+255)/256, 256>>>(d_int8, d_dst, scale, N);
@@ -409,12 +314,6 @@ static void test_nikhilam_complement() {
     safe_cuda(cudaMemcpy(h_dst.data(),  d_dst,  N*sizeof(float),  cudaMemcpyDeviceToHost), "d2h dst");
     safe_cuda(cudaMemcpy(h_int8.data(), d_int8, N*sizeof(int8_t), cudaMemcpyDeviceToHost), "d2h int8");
 
-    // Nikhilam complement property (corrected for signed INT8):
-    // Vedic "Nikhilam from base": complement(v) = -v (additive inverse)
-    // v + complement(v) = 0 for all integers — this is the true
-    // Nikhilam identity in signed arithmetic (twos-complement).
-    // The unsigned base-127 version only works for positive values.
-    // For a sine wave with negative values, use the signed identity.
     bool complement_ok = true;
     for (int i=0; i<N; i++) {
         int8_t v    = h_int8[i];
@@ -425,7 +324,6 @@ static void test_nikhilam_complement() {
     MATH_ASSERT(complement_ok,
         "Nikhilam: v + complement(v) = 127 (base complement property holds)");
 
-    // SNR calculation
     float signal_power = 0.0f, noise_power = 0.0f;
     for (int i=0; i<N; i++) {
         signal_power += h_src[i] * h_src[i];
@@ -445,23 +343,14 @@ static void test_nikhilam_complement() {
     cudaFree(d_src); cudaFree(d_dst); cudaFree(d_int8); cudaFree(d_absmax);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M6] SHM hybrid — FDT condition + zero-noise momentum check
-// ─────────────────────────────────────────────────────────────
 static void test_shm_fdt_condition() {
     TEST_SECTION("M6: SHM Hybrid — FDT Condition & Momentum Analysis");
 
-    // FDT: variance(noise) should equal 2·γ·kT·lr·α_L
-    // In our kernel: noise = noise_scale * η (η ~ uniform[-√3, √3])
-    // noise_scale = √(γ·kT·lr·α_L), so Var(noise) = γ·kT·lr·α_L
-    // FDT says: D = γ·kT/m → diffusion coefficient
-    // We verify the noise variance matches the theoretical prediction
 
     float gamma = 0.1f, kT = 0.05f, lr = 2e-4f, alpha_L = 0.7f;
     float expected_var = gamma * kT * lr * alpha_L;    // theoretical noise variance
     float noise_scale  = sqrtf(expected_var);
 
-    // Simulate many noise samples from the kernel
     const int N = 65536;  // large N for accurate variance estimate
     float *d_w, *d_v, *d_g;
     safe_cuda(cudaMalloc(&d_w, N*sizeof(float)), "malloc W");
@@ -471,10 +360,6 @@ static void test_shm_fdt_condition() {
     safe_cuda(cudaMemset(d_v, 0, N*sizeof(float)), "memset V");
     safe_cuda(cudaMemset(d_g, 0, N*sizeof(float)), "memset G (zero grad)");
 
-    // With zero gradient and zero velocity, only noise contributes to v_half:
-    //   v_half = mom_decay*0 - (lr*α_H/2)*0 - (lr*α_L/2)*γ*0 + noise
-    //          = noise
-    // So h_v_out = noise samples
     shm_hybrid_kernel<<<(N+255)/256, 256>>>(
         d_w, d_v, d_g,
         lr, /*mom_decay=*/0.9f, gamma,
@@ -498,12 +383,10 @@ static void test_shm_fdt_condition() {
     MATH_ASSERT(fabsf(mean) < noise_scale * 0.05f,
         "SHM FDT: noise mean ≈ 0 (zero-mean Langevin noise)");
 
-    // Variance ratio should be close to 1.0 (within 10%)
     float ratio = var / (expected_var + 1e-15f);
     MATH_ASSERT(ratio > 0.8f && ratio < 1.5f,
         "SHM FDT: observed noise variance ≈ theoretical (within 20%)");
 
-    // Zero-noise test: α_L=0 → pure Hamiltonian (deterministic)
     safe_cuda(cudaMemset(d_v, 0, N*sizeof(float)), "reset V");
     safe_cuda(cudaMemset(d_w, 0, N*sizeof(float)), "reset W");  // reset W too — fresh state
     std::vector<float> h_g(N, 0.01f);  // constant gradient
@@ -517,14 +400,7 @@ static void test_shm_fdt_condition() {
 
     safe_cuda(cudaMemcpy(h_v.data(), d_v, N*sizeof(float), cudaMemcpyDeviceToHost), "d2h v pure");
 
-    // With α_L=0, noise_scale=0, v_init=0, mom_decay=0.9:
-    // v_half = mom_decay*0 + (-(alpha_H*0.5)*g) + 0 + 0
-    //        = -(1.0 * 0.5) * 0.01 = -0.005
-    // Note: lr is NOT in the velocity half-kick — it's only in w += lr*v_half
-    // So expected_v = -(alpha_H * 0.5f) * g = -0.5 * 0.01 = -0.005
     float expected_v = -(1.0f * 0.5f) * 0.01f;  // = -0.005
-    // Check determinism: all elements should be identical (same input → same output)
-    // Use first element as reference, check all others match within float32 epsilon
     float v_ref = h_v[0];
     float v_max_dev = 0.0f;
     float v_min_val = h_v[0], v_max_val = h_v[0];
@@ -541,22 +417,16 @@ static void test_shm_fdt_condition() {
 
     MATH_ASSERT(fabsf(v_ref - expected_v) < fabsf(expected_v)*0.01f,
         "SHM: α_L=0 → deterministic Hamiltonian step (v = -α_H/2*g)");
-    // Determinism check: all N elements got same input (zero w, zero v, const g)
-    // so they must all produce the same output — max deviation < float32 ULP tolerance
     MATH_ASSERT(v_max_dev < 1e-6f,
         "SHM: α_L=0, noise=0 → zero velocity variance (fully deterministic)");
 
     cudaFree(d_w); cudaFree(d_v); cudaFree(d_g);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M7] Boltzmann softmax temperature scaling
-// ─────────────────────────────────────────────────────────────
 static void test_boltzmann_temperature() {
     TEST_SECTION("M7: Boltzmann Softmax Temperature Scaling");
 
     const int SEQ=1, V=8;
-    // logits: [4, 1, 1, 1, 1, 1, 1, 1] — clear winner at index 0
     std::vector<float> h_logits = {4.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 
     auto run_softmax = [&](float T) -> std::vector<float> {
@@ -570,26 +440,22 @@ static void test_boltzmann_temperature() {
         return out;
     };
 
-    // Low T: sharp (near argmax)
     auto p_low = run_softmax(0.01f);
     printf("  T=0.01: p[0]=%.6f (should be ≈ 1.0)\n", p_low[0]);
     MATH_ASSERT(p_low[0] > 0.99f, "Boltzmann: T→0 → argmax (p[0]≈1.0)");
 
-    // High T: uniform
     auto p_high = run_softmax(100.0f);
     float expected_uniform = 1.0f / V;
     printf("  T=100: p[0]=%.6f (should be ≈ %.4f)\n", p_high[0], expected_uniform);
     MATH_ASSERT(fabsf(p_high[0] - expected_uniform) < 0.01f,
         "Boltzmann: T→∞ → uniform distribution (p[i]=1/V)");
 
-    // Sum = 1 at any T
     float sum_low = 0.0f, sum_high = 0.0f;
     for (float v : p_low)  sum_low  += v;
     for (float v : p_high) sum_high += v;
     MATH_ASSERT_NEAR(sum_low,  1.0f, 1e-5f, "Boltzmann: probabilities sum to 1.0 (T=0.01)");
     MATH_ASSERT_NEAR(sum_high, 1.0f, 1e-5f, "Boltzmann: probabilities sum to 1.0 (T=100)");
 
-    // Medium T: entropy increases with T
     auto p_mid1 = run_softmax(1.0f);
     auto p_mid5 = run_softmax(5.0f);
     auto entropy = [](const std::vector<float>& p) {
@@ -602,14 +468,9 @@ static void test_boltzmann_temperature() {
     MATH_ASSERT(S5 > S1, "Boltzmann: entropy increases with temperature");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  [M8] Gunitasamuchayah for FFN shapes (d → 4d → d)
-// ─────────────────────────────────────────────────────────────
 static void test_gunitasamuchayah_ffn_shapes() {
     TEST_SECTION("M8: Gunitasamuchayah for Transformer FFN Shapes");
 
-    // Typical FFN: W1 is (D × 4D), W2 is (4D × D)
-    // Test: (seq × D) @ (D × 4D) — wide expansion
     const int SEQ=16, D=32, D4=128;
 
     std::vector<float> h_A(SEQ*D), h_B(D*D4);
@@ -628,7 +489,6 @@ static void test_gunitasamuchayah_ffn_shapes() {
     MATH_ASSERT(rel < 0.20f,
         "Gunitasamuchayah: holds for FFN W1 shape (seq×D)@(D×4D) within 20%");
 
-    // And W2: (seq × 4D) @ (4D × D) — wide contraction
     std::vector<float> h_A2(SEQ*D4), h_B2(D4*D);
     for (int i=0; i<SEQ*D4; i++) h_A2[i] = sinf((float)i*0.11f);
     for (int i=0; i<D4*D;   i++) h_B2[i] = cosf((float)i*0.09f);
@@ -643,7 +503,6 @@ static void test_gunitasamuchayah_ffn_shapes() {
     MATH_ASSERT(rel2 < 0.20f,
         "Gunitasamuchayah: holds for FFN W2 shape (seq×4D)@(4D×D) within 20%");
 
-    // GPU path for W1 shape
     GPUTensor gA = gpu_alloc(SEQ,D), gB = gpu_alloc(D,D4), gC = gpu_alloc(SEQ,D4);
     safe_cuda(cudaMemcpy(gA.data, h_A.data(),  SEQ*D*sizeof(float),  cudaMemcpyHostToDevice), "h2d A");
     safe_cuda(cudaMemcpy(gB.data, h_B.data(),  D*D4*sizeof(float),   cudaMemcpyHostToDevice), "h2d B");
@@ -655,9 +514,6 @@ static void test_gunitasamuchayah_ffn_shapes() {
         "Gunitasamuchayah GPU: FFN W1 shape PASS (tolerance 20%)");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  MAIN
-// ─────────────────────────────────────────────────────────────
 int main() {
     printf("╔═══════════════════════════════════════════════════╗\n");
     printf("║  LOGOS Test 2: Mathematical Unit Tests           ║\n");

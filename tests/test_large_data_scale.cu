@@ -1,31 +1,3 @@
-// ============================================================
-//  LOGOS — tests/test_large_data_scale.cu
-//  Test 4: Large Data Scale & Production Readiness Test
-//
-//  PURPOSE:
-//    CI/CD mein verify karo ki LOGOS 1TB tak ka data handle kar
-//    sakta hai bina crash kiye. Real 1TB data nahi diya jaata —
-//    instead hum:
-//      1. StreamingDataLoader ki logic simulate karte hain
-//      2. int64_t indexing test karte hain (int overflow nahi)
-//      3. Chunk-by-chunk pipeline stress karte hain
-//      4. GPU memory management 1TB-scale tensor counts par test
-//      5. Checkpoint resume simulate karte hain mid-training
-//
-//  TESTS:
-//  [LDS1] int64_t counter overflow — 1TB / seq_len steps simulate
-//  [LDS2] Chunked pipeline: 1000x 4MB chunks process karo (= 4GB sim)
-//  [LDS3] StreamingDataLoader state save/restore at large offset
-//  [LDS4] decide_vocab_size() at 1TB input
-//  [LDS5] decide_model_config() at 1TB input
-//  [LDS6] GPU: VRAM stable over 1000 forward passes (no leak)
-//  [LDS7] Gradient accumulation: 32 micro-batches no OOM
-//  [LDS8] Checkpoint round-trip at step 1,000,000 (large step number)
-//  [LDS9] UnifiedDataLoader: auto-switch at 64MB threshold test
-//  [LDS10] Large vocab (65536) forward pass — no OOM on 16GB+ GPU
-//  [LDS11] Multi-shard: 100 shards, DataShard struct correctness
-//  [LDS12] Production pipeline smoke test: vocab→model→train→ckpt
-// ============================================================
 
 #include "../include/StreamingDataLoader.hpp"
 #include "../include/Tokenizer.hpp"
@@ -57,7 +29,6 @@
 #include <random>
 #include <climits>
 
-// ── Test framework ─────────────────────────────────────────────
 static int g_pass = 0, g_fail = 0;
 
 #define TEST(name, expr) do { \
@@ -78,10 +49,7 @@ static int g_pass = 0, g_fail = 0;
 } while(0)
 
 static std::string tmp_file(const std::string& name) {
-    // CI/CD safe temp path — cross-platform
 #ifdef _WIN32
-    // On Windows, use TEMP env var (e.g. C:\Users\RUNNER~1\AppData\Local\Temp)
-    // Fall back to current directory if TEMP is not set
     const char* tmp_dir = std::getenv("TEMP");
     if (!tmp_dir) tmp_dir = std::getenv("TMP");
     if (!tmp_dir) tmp_dir = ".";
@@ -91,7 +59,6 @@ static std::string tmp_file(const std::string& name) {
 #endif
 }
 
-// ── Generate synthetic text file of given size ─────────────────
 static std::string make_tmp_text(const std::string& fname, int64_t size_bytes) {
     std::string path = tmp_file(fname);
     std::ofstream f(path, std::ios::binary);
@@ -99,7 +66,6 @@ static std::string make_tmp_text(const std::string& fname, int64_t size_bytes) {
         std::cerr << "  Cannot create: " << path << "\n";
         return "";
     }
-    // Word-level text so BPE tokenizer can process it
     const char* words[] = {
         "the ", "cat ", "sat ", "on ", "mat ", "a ", "dog ", "ran ",
         "fast ", "slow ", "big ", "small ", "red ", "blue ", "sun ",
@@ -119,7 +85,6 @@ static std::string make_tmp_text(const std::string& fname, int64_t size_bytes) {
         f.write(w, to_write);
         written += to_write;
         ++wi;
-        // Add newline every ~80 chars
         if (wi % 16 == 0 && written < size_bytes) {
             f.write("\n", 1);
             written += 1;
@@ -128,17 +93,9 @@ static std::string make_tmp_text(const std::string& fname, int64_t size_bytes) {
     return path;
 }
 
-// ============================================================
-//  [LDS1] int64_t counter overflow check
-//  Simulates 1TB / 128-token sequences = ~8 billion steps
-//  int (32-bit) would overflow at ~2.1B. int64_t handles it.
-// ============================================================
 static void test_lds1_int64_counters() {
     std::cout << "\n[LDS1] int64_t Counter — 1TB Scale Simulation\n";
 
-    // 1TB = 1,099,511,627,776 bytes
-    // avg BPE tokens = 0.65 per byte → ~7.1 × 10^11 tokens
-    // seq_len = 128 → ~5.5 × 10^9 batches
     const int64_t TB_BYTES = 1LL * 1024 * 1024 * 1024 * 1024;
     const int     SEQ      = 128;
     const double  TPB      = 0.65;   // tokens per byte estimate
@@ -146,25 +103,19 @@ static void test_lds1_int64_counters() {
     int64_t est_tokens  = (int64_t)((double)TB_BYTES * TPB);
     int64_t est_batches = est_tokens / SEQ;
 
-    // int overflow check: use volatile to prevent compiler from optimizing away UB
-    // Standard C++ says signed overflow is UB, so we cast via memcpy/union trick
     volatile int64_t tmp = est_batches;
     int int_overflow = (int)(tmp & 0xFFFFFFFFLL);  // low 32 bits — safe cast
 
     std::cout << "    1TB tokens (est): " << est_tokens / 1000000000LL << "B\n";
     std::cout << "    1TB batches (est): " << est_batches / 1000000000LL << "B\n";
-    // int_overflow will be non-zero but may not be negative on all platforms;
-    // what matters is that int64 holds the value correctly
     std::cout << "    int32 truncated low-32: " << int_overflow << "\n";
     std::cout << "    int64 safe: " << (est_batches > 0 ? "YES" : "no") << "\n";
 
     TEST("int64_t: 1TB step count > 0 (no overflow)",     est_batches > 0);
     TEST("int64_t: 1TB step count > INT_MAX",              est_batches > (int64_t)INT_MAX);
-    // Test that int32 CANNOT hold this value (truncation changes it)
     TEST("int32:   1TB step count overflows (expected)",   (int64_t)(int)est_batches != est_batches);
     TEST("total_tokens_seen: int64_t holds 1TB tokens",    est_tokens > 0);
 
-    // Simulate a counter running to 1B steps without overflow
     int64_t counter = 0;
     for (int64_t i = 0; i < 1000000000LL; i += 999999) {
         counter = i;
@@ -172,14 +123,9 @@ static void test_lds1_int64_counters() {
     TEST("int64_t counter: 1B iteration no crash",  counter > 0);
 }
 
-// ============================================================
-//  [LDS2] Chunked pipeline: process 1000 chunks of 4MB each
-//  Simulates streaming 4GB without loading full dataset in RAM
-// ============================================================
 static void test_lds2_chunked_pipeline() {
     std::cout << "\n[LDS2] Chunked Pipeline — 1000×4MB Simulation\n";
 
-    // Create a 4MB synthetic file (real 4MB, not simulated)
     const int64_t CHUNK_SIZE = 4LL * 1024 * 1024;  // 4MB
     std::cout << "    Creating 4MB synthetic file...\n";
     std::string path = make_tmp_text("chunk_test.txt", CHUNK_SIZE);
@@ -188,7 +134,6 @@ static void test_lds2_chunked_pipeline() {
         return;
     }
 
-    // Build tokenizer from a small sample
     Tokenizer tok;
     {
         std::ifstream f(path);
@@ -198,8 +143,6 @@ static void test_lds2_chunked_pipeline() {
         tok.build(sample, 256);
     }
 
-    // Simulate processing 1000 chunks by reading the same file repeatedly
-    // (In production, each chunk = different 4MB block of a large file)
     int64_t total_tokens  = 0;
     int64_t total_batches = 0;
     int     chunks_ok     = 0;
@@ -209,7 +152,6 @@ static void test_lds2_chunked_pipeline() {
     auto t_start = std::chrono::high_resolution_clock::now();
 
     for (int c = 0; c < N_CHUNKS; ++c) {
-        // Read 64KB per iteration (simulate one chunk's worth of tokenization)
         std::ifstream f(path, std::ios::binary);
         int64_t pos = (c * 65536) % CHUNK_SIZE;
         f.seekg(pos);
@@ -219,7 +161,6 @@ static void test_lds2_chunked_pipeline() {
 
         auto ids = tok.encode(text, (int)text.size() * 4);
         if ((int)ids.size() >= SEQ + 1) {
-            // Simulate batch extraction
             for (int i = 0; i + SEQ < (int)ids.size(); i += SEQ) {
                 total_tokens  += SEQ;
                 ++total_batches;
@@ -239,21 +180,14 @@ static void test_lds2_chunked_pipeline() {
     TEST("Chunked pipeline: all chunks processed",    chunks_ok == N_CHUNKS);
     TEST("Chunked pipeline: tokens extracted > 0",   total_tokens > 0);
     TEST("Chunked pipeline: batches > 0",            total_batches > 0);
-    // NOTE: This test is intentionally always-true — it guards against panics/crashes
-    // that would unwind the stack. If the loop above completes without throwing,
-    // the binary itself did not crash. The meaningful assertions are the three above.
     TEST("Chunked pipeline: no crash in 100 chunks", true);
 
     std::filesystem::remove(path);
 }
 
-// ============================================================
-//  [LDS3] StreamingDataLoader state: save/restore at large offset
-// ============================================================
 static void test_lds3_loader_state_large_offset() {
     std::cout << "\n[LDS3] StreamingDataLoader State — Large Offset Resume\n";
 
-    // Create a 2MB file (CI-friendly, representative of large file behavior)
     const int64_t FILE_SIZE = 2LL * 1024 * 1024;
     std::string path = make_tmp_text("state_test.txt", FILE_SIZE);
     if (path.empty()) {
@@ -274,14 +208,12 @@ static void test_lds3_loader_state_large_offset() {
     try {
         StreamingDataLoader loader(path, tok, 64, 1, 256 * 1024);  // 256KB chunks
 
-        // Consume some batches
         std::vector<int> inp, tgt;
         int batches_read = 0;
         while (batches_read < 20 && loader.next_batch(inp, tgt)) {
             ++batches_read;
         }
 
-        // Save state
         auto state = loader.get_state();
         int64_t saved_tokens = state.total_tokens_seen;
 
@@ -289,8 +221,6 @@ static void test_lds3_loader_state_large_offset() {
         std::cout << "    Tokens seen at save:      " << saved_tokens << "\n";
         std::cout << "    Shard position:           " << state.byte_pos << " bytes\n";
 
-        // Simulate restoring at a large "fake" offset (1TB scenario)
-        // The struct holds int64_t so it won't overflow
         StreamingDataLoader::LoaderState large_state;
         large_state.current_shard     = 0;
         large_state.byte_pos          = FILE_SIZE / 2;  // mid-file
@@ -298,19 +228,14 @@ static void test_lds3_loader_state_large_offset() {
         large_state.total_steps_done  = 4294967296LL;    // 4B steps
         large_state.current_epoch     = 5;
 
-        // Restore to large offset
         loader.restore_state(large_state);
 
-        // Should be able to read after restore
         int batches_after = 0;
         while (batches_after < 5 && loader.next_batch(inp, tgt)) {
             ++batches_after;
         }
 
         std::cout << "    Batches after large-offset restore: " << batches_after << "\n";
-        // ok requires: (1) actually consumed some batches before save → saved_tokens > 0
-        //              (2) large int64_t value stored correctly (> INT_MAX)
-        //              (3) restore_state didn't crash (batches_after >= 0 always)
         ok = (batches_read > 0) &&        // we actually consumed data before save
              (saved_tokens > 0) &&        // tokens were counted
              (large_state.total_tokens_seen > (int64_t)INT_MAX);  // int64_t holds large value
@@ -319,16 +244,12 @@ static void test_lds3_loader_state_large_offset() {
     }
 
     TEST("Loader state: int64_t token count holds 1TB scale", ok);
-    // Verify the struct field itself holds > INT_MAX at runtime (not just the literal)
     TEST("Loader state: total_steps_done > INT_MAX works",
          ok);  // already checked inside ok: large_state.total_tokens_seen > INT_MAX
 
     std::filesystem::remove(path);
 }
 
-// ============================================================
-//  [LDS4] decide_vocab_size at 1TB
-// ============================================================
 static void test_lds4_vocab_at_1tb() {
     std::cout << "\n[LDS4] decide_vocab_size() at 1TB scale\n";
 
@@ -348,9 +269,6 @@ static void test_lds4_vocab_at_1tb() {
     std::cout << "    10MB+  → vocab=" << v_10mb << "\n";
     std::cout << "    Small  → vocab=" << v_small << "\n";
 
-    // [v25-BUG2-FIX] v22-SCALE ne decide_vocab_size() ko FIXED 8192 kar diya
-    // (dataset size se independent). Purane tests 4096/2048/1024 expect karte the →
-    // CI fail karta tha. Ab sab 8192 expect karo — consistent with 219M model embedding.
     TEST("decide_vocab_size: 1TB → 8192",     v_1tb  == 8192);
     TEST("decide_vocab_size: 200GB → 8192",   v_200gb == 8192);
     TEST("decide_vocab_size: 200MB → 8192",   v_200mb == 8192);
@@ -359,9 +277,6 @@ static void test_lds4_vocab_at_1tb() {
     TEST("decide_vocab_size: small → 8192",   v_small == 8192);
 }
 
-// ============================================================
-//  [LDS5] decide_model_config at 1TB
-// ============================================================
 static void test_lds5_model_config_at_1tb() {
     std::cout << "\n[LDS5] decide_model_config() at 1TB scale\n";
 
@@ -383,26 +298,18 @@ static void test_lds5_model_config_at_1tb() {
               << " L=" << cfg_tiny.num_layers
               << " seq=" << cfg_tiny.max_seq_len << "\n";
 
-    // [v25-BUG2-FIX] v22-SCALE ne decide_model_config() ko FIXED 219M config kar diya
-    // (1024/16/16/8192) — dataset size se independent. Sab configs same honge.
-    // Pehle: 1TB > 200M model expect karta tha → ab sab fixed = same values.
     TEST("1TB config: d_model % num_heads == 0",  cfg_1tb.d_model  % cfg_1tb.num_heads  == 0);
     TEST("200M config: d_model % num_heads == 0", cfg_200m.d_model % cfg_200m.num_heads == 0);
     TEST("50M config: d_model % num_heads == 0",  cfg_50m.d_model  % cfg_50m.num_heads  == 0);
     TEST("10M config: d_model % num_heads == 0",  cfg_10m.d_model  % cfg_10m.num_heads  == 0);
     TEST("tiny config: d_model % num_heads == 0", cfg_tiny.d_model % cfg_tiny.num_heads == 0);
 
-    // All configs now return same fixed 219M architecture (d=1024, L=16, H=16, seq=8192)
     TEST("All configs: d_model == 1024 (fixed 219M)",  cfg_1tb.d_model  == 1024 && cfg_tiny.d_model  == 1024);
     TEST("All configs: num_layers == 16 (fixed 219M)", cfg_1tb.num_layers == 16 && cfg_tiny.num_layers == 16);
     TEST("All configs: max_seq_len > 0",
          cfg_1tb.max_seq_len > 0 && cfg_tiny.max_seq_len > 0);
 }
 
-// ============================================================
-//  [LDS6] CPU: model forward/backward stable over 200 iterations
-//  (GPU version tested in separate GPU section below)
-// ============================================================
 static void test_lds6_forward_stability_cpu() {
     std::cout << "\n[LDS6] CPU Forward Stability — 200 Iterations\n";
 
@@ -430,14 +337,9 @@ static void test_lds6_forward_stability_cpu() {
 
     std::cout << "    200 forward passes: " << (any_nan ? "NaN at step " + std::to_string(nan_at) : "all finite") << "\n";
     TEST("CPU 200 iterations: no NaN",    !any_nan);
-    // "no crash" is verified by reaching this line after the loop
-    // Add a meaningful check: all 200 iterations completed (nan_at == -1)
     TEST("CPU 200 iterations: all 200 completed (not cut short by NaN)", nan_at == -1);
 }
 
-// ============================================================
-//  [LDS7] Gradient accumulation: 32 micro-batches
-// ============================================================
 static void test_lds7_grad_accum_32() {
     std::cout << "\n[LDS7] Gradient Accumulation — 32 Micro-batches\n";
 
@@ -455,12 +357,10 @@ static void test_lds7_grad_accum_32() {
     LOGOSModel model(cfg);
     auto params = model.parameters();
 
-    // Accumulated gradients
     std::vector<Tensor> accum_grads;
     for (auto* p : params)
         accum_grads.emplace_back(p->shape, 0.0f);
 
-    // Run 32 micro-batches
     bool any_nan = false;
     float total_loss = 0.f;
     std::mt19937 rng(42);
@@ -475,7 +375,6 @@ static void test_lds7_grad_accum_32() {
         auto [logits, hidden] = model.forward_with_hidden(inp, true);
         if (logits.has_nan()) { any_nan = true; break; }
 
-        // Compute loss
         float loss = 0.f;
         Tensor dL(logits.shape, 0.0f);
         for (int i = 0; i < SEQ && i < (int)tgt.size(); ++i) {
@@ -492,7 +391,6 @@ static void test_lds7_grad_accum_32() {
         loss /= SEQ;
         total_loss += loss;
 
-        // Accumulate gradient (scale by 1/GRAD_ACCUM)
         float scale = 1.0f / (float)GRAD_ACCUM;
         for (int gi = 0; gi < (int)accum_grads.size(); ++gi) {
             for (int k = 0; k < accum_grads[gi].total_size; ++k) {
@@ -501,7 +399,6 @@ static void test_lds7_grad_accum_32() {
         }
     }
 
-    // Check accumulated grads are finite
     bool grads_finite = true;
     for (auto& g : accum_grads) {
         if (g.has_nan()) { grads_finite = false; break; }
@@ -516,9 +413,6 @@ static void test_lds7_grad_accum_32() {
     TEST("Grad accum 32: loss > 0",                total_loss > 0);
 }
 
-// ============================================================
-//  [LDS8] Checkpoint round-trip at step 1,000,000
-// ============================================================
 static void test_lds8_checkpoint_large_step() {
     std::cout << "\n[LDS8] Checkpoint Round-trip — Large Step Number\n";
 
@@ -530,7 +424,6 @@ static void test_lds8_checkpoint_large_step() {
     cfg.max_seq_len = 16;
 
     LOGOSModel model(cfg);
-    // Set some non-trivial weights
     for (auto* p : model.parameters()) {
         for (int i = 0; i < p->total_size; ++i)
             p->data[i] = (float)i * 0.001f;
@@ -547,12 +440,10 @@ static void test_lds8_checkpoint_large_step() {
         save_ok = save_checkpoint(model, ckpt_base, large_step);
 
         LOGOSModel model2(cfg);
-        // Load — filename should contain the large step number
         std::string ckpt_path = ckpt_base + "_step" + std::to_string(large_step) + ".bin";
         load_ok = load_checkpoint(model2, ckpt_path);
 
         if (load_ok) {
-            // Compare first parameter
             auto p1 = model.parameters();
             auto p2 = model2.parameters();
             float max_diff = 0.f;
@@ -561,7 +452,6 @@ static void test_lds8_checkpoint_large_step() {
             weights_match = (max_diff < 1e-4f);
         }
 
-        // Cleanup
         std::string ck = ckpt_base + "_step" + std::to_string(large_step) + ".bin";
         std::filesystem::remove(ck);
     } catch (const std::exception& e) {
@@ -578,20 +468,12 @@ static void test_lds8_checkpoint_large_step() {
     TEST("Checkpoint large step: weights restored",  weights_match);
 }
 
-// ============================================================
-//  [LDS9] UnifiedDataLoader: auto-switch at 64MB threshold
-// ============================================================
 static void test_lds9_unified_loader_threshold() {
     std::cout << "\n[LDS9] UnifiedDataLoader — 64MB Threshold Verification\n";
 
-    // Small file (< 64MB) → DataLoader
     const int64_t SMALL = 512 * 1024;  // 512KB
     std::string small_path = make_tmp_text("small.txt", SMALL);
 
-    // Medium file (> 64MB) → StreamingDataLoader
-    // CI: macOS/Windows runner mein /tmp limited hai — 2MB file use karo
-    // lekin UnifiedDataLoader threshold ko temporarily 1MB set karke test karo
-    // Isse Bus error aur slow I/O dono avoid hote hain macOS pe
     const int64_t MEDIUM = 2LL * 1024 * 1024;   // 2MB (threshold test ke liye kaafi hai)
     std::string medium_path = make_tmp_text("medium.txt", MEDIUM);
 
@@ -616,7 +498,6 @@ static void test_lds9_unified_loader_threshold() {
     bool small_batches_ok  = false;
     bool medium_batches_ok = false;
 
-    // ── Small file test ──────────────────────────────────────
     try {
         std::cout << "    Testing small (" << SMALL/1024 << "KB) → DataLoader...\n";
         UnifiedDataLoader loader_s(small_path, tok, 32, 1);
@@ -631,11 +512,8 @@ static void test_lds9_unified_loader_threshold() {
         std::cerr << "    Small loader exception: " << e.what() << "\n";
     }
 
-    // ── Medium file test ─────────────────────────────────────
     try {
         std::cout << "    Testing medium (" << MEDIUM/1024/1024 << "MB) → StreamingDataLoader...\n";
-        // 2MB file directly StreamingDataLoader se test karo (threshold bypass)
-        // UnifiedDataLoader 64MB threshold use karta hai — directly SDL use karo
         StreamingDataLoader loader_m(medium_path, tok, 64, 1, 256*1024);  // 256KB chunk
         std::vector<int> inp2, tgt2;
         int got2 = 0;
@@ -651,7 +529,6 @@ static void test_lds9_unified_loader_threshold() {
     TEST("UnifiedDataLoader: medium file → StreamingLoader (no crash)", medium_ok);
     TEST("UnifiedDataLoader: small batches extracted",                  small_batches_ok);
     TEST("UnifiedDataLoader: medium batches extracted",                 medium_batches_ok);
-    // Verify BOTH loaders actually produced data — not just "no crash"
     TEST("UnifiedDataLoader: both loaders produced batches",
          small_batches_ok && medium_batches_ok);
 
@@ -659,13 +536,9 @@ static void test_lds9_unified_loader_threshold() {
     std::filesystem::remove(medium_path);
 }
 
-// ============================================================
-//  [LDS10] Multi-shard: 100 virtual shards, DataShard struct
-// ============================================================
 static void test_lds10_multishard() {
     std::cout << "\n[LDS10] Multi-Shard — 100 Shards Correctness\n";
 
-    // Create one real file and simulate 100 shards pointing to it
     const int64_t FILE_SIZE = 512LL * 1024;  // 512KB
     std::string path = make_tmp_text("shard_test.txt", FILE_SIZE);
     if (path.empty()) {
@@ -673,9 +546,6 @@ static void test_lds10_multishard() {
         return;
     }
 
-    // Build 100 DataShard objects
-    // Use equal-split so bytes sum exactly to FILE_SIZE:
-    //   first (FILE_SIZE % N_SHARDS) shards get one extra byte each.
     const int N_SHARDS = 100;
     std::vector<DataShard> shards;
     shards.reserve(N_SHARDS);
@@ -692,8 +562,6 @@ static void test_lds10_multishard() {
         current_offset += s.byte_length;
     }
 
-    // Verify struct fields — recompute expected offsets using the same
-    // remainder-aware split logic used during construction.
     bool offsets_ok = true;
     {
         int64_t expected_offset = 0;
@@ -705,12 +573,9 @@ static void test_lds10_multishard() {
         }
     }
 
-    // Verify total size sums correctly
     int64_t total_shard_bytes = 0;
     for (auto& s : shards) total_shard_bytes += s.byte_length;
 
-    // int32_t would overflow at 2^31 = 2GB with 100 shards × 20MB each
-    // int64_t safely holds TB-scale
     int64_t simulated_1tb_shard_size = 10LL * 1024 * 1024 * 1024;  // 10GB per shard
     int64_t simulated_total = (int64_t)N_SHARDS * simulated_1tb_shard_size;
 
@@ -723,19 +588,12 @@ static void test_lds10_multishard() {
     TEST("Multi-shard: offsets are int64_t, correct",  offsets_ok);
     TEST("Multi-shard: total_shard_bytes correct",     total_shard_bytes == FILE_SIZE);
     TEST("Multi-shard: simulated 1TB fits in int64_t", simulated_total > 0);
-    // int32 cannot represent values > INT32_MAX (2,147,483,647).
-    // 100 × 10 GB = 1,073,741,824,000 >> INT32_MAX — safely check via cast comparison.
-    // Using signed-overflow UB is avoided: we compare via int64_t arithmetic.
     TEST("Multi-shard: int32 overflow confirmed for 1TB",
          simulated_total > (int64_t)INT_MAX);   // 1TB total exceeds int32 range
 
     std::filesystem::remove(path);
 }
 
-// ============================================================
-//  [LDS11] Production pipeline smoke test
-//  vocab → model → 5 training steps → checkpoint → reload
-// ============================================================
 static void test_lds11_production_smoke() {
     std::cout << "\n[LDS11] Production Pipeline Smoke Test\n";
 
@@ -754,7 +612,6 @@ static void test_lds11_production_smoke() {
     float initial_loss = -1.f, final_loss = -1.f;
 
     try {
-        // ── Build tokenizer ──────────────────────────────────
         Tokenizer tok;
         {
             std::ifstream f(path);
@@ -765,7 +622,6 @@ static void test_lds11_production_smoke() {
         tokenizer_ok = (tok.vocab_size >= 2);
         std::cout << "    Tokenizer vocab: " << tok.vocab_size << "\n";
 
-        // ── Build model ──────────────────────────────────────
         ModelConfig cfg;
         cfg.vocab_size  = tok.vocab_size;
         cfg.d_model     = 32;
@@ -775,7 +631,6 @@ static void test_lds11_production_smoke() {
         LOGOSModel model(cfg);
         model_ok = true;
 
-        // ── Training loop: 5 steps ───────────────────────────
         UnifiedDataLoader loader(path, tok, 16, 1);
         auto params = model.parameters();
         HybridSHMOptimizer opt(1e-3f, 0.1f, 0.9f, 0.05f, 1e-6f, 0.3f, 0.9f, 100);
@@ -816,11 +671,9 @@ static void test_lds11_production_smoke() {
         }
         train_ok = (initial_loss > 0.f);
 
-        // ── Checkpoint ───────────────────────────────────────
         std::string ckpt = tmp_file("smoke_ckpt");
         ckpt_ok = save_checkpoint(model, ckpt, 5);
 
-        // ── Reload ───────────────────────────────────────────
         LOGOSModel model2(cfg);
         std::string ckpt_path = ckpt + "_step5.bin";
         reload_ok = load_checkpoint(model2, ckpt_path);
@@ -843,9 +696,6 @@ static void test_lds11_production_smoke() {
     std::filesystem::remove(path);
 }
 
-// ============================================================
-//  [LDS12] Large vocab CPU forward pass
-// ============================================================
 static void test_lds12_large_vocab_cpu() {
     std::cout << "\n[LDS12] Large Vocab CPU Forward — vocab=8192\n";
 
@@ -872,9 +722,6 @@ static void test_lds12_large_vocab_cpu() {
     TEST("Large vocab CPU: 8192-vocab forward pass", ok);
 }
 
-// ============================================================
-//  GPU-specific tests (compiled only when nvcc available)
-// ============================================================
 #if HAS_CUDA
 static void test_lds_gpu_stability() {
     std::cout << "\n[LDS-GPU] GPU Forward Stability — 200 Passes\n";
@@ -904,7 +751,6 @@ static void test_lds_gpu_stability() {
         for (int i = 0; i < 200; ++i) {
             auto logits = model.forward(tokens);
             cudaDeviceSynchronize();
-            // Spot-check every 50 passes
             if (i % 50 == 0) {
                 std::vector<float> h(logits.size);
                 cudaMemcpy(h.data(), logits.data, h.size() * sizeof(float),
@@ -927,10 +773,6 @@ static void test_lds_gpu_stability() {
         std::cout << "    VRAM drift: " << vram_drift / 1024 << " KB\n";
 
         TEST("GPU 200 passes: no NaN",                  !any_nan);
-        // [FIX] VRAM drift threshold: CUDA driver internal state (stream buffers,
-        // kernel JIT cache, cuBLAS workspace) can accumulate ~10MB over 200 passes
-        // on T4. This is not a real leak — it stabilizes after warmup.
-        // Previous threshold 8MB was too tight; 16MB accommodates driver overhead.
         TEST("GPU 200 passes: VRAM drift < 16MB",       std::abs(vram_drift) < 16*1024*1024LL);
         ok = !any_nan;
     } catch (const std::exception& e) {
@@ -982,9 +824,6 @@ static void test_lds_gpu_large_vocab() {
 }
 #endif  // HAS_CUDA
 
-// ============================================================
-//  MAIN
-// ============================================================
 int main() {
     std::cout << "╔══════════════════════════════════════════════════╗\n";
     std::cout << "║  LOGOS Test 4: Large Data Scale & Production     ║\n";
@@ -1005,7 +844,6 @@ int main() {
 #endif
 
     try {
-        // ── CPU tests (always run) ────────────────────────────
         test_lds1_int64_counters();
         test_lds2_chunked_pipeline();
         test_lds3_loader_state_large_offset();
@@ -1020,7 +858,6 @@ int main() {
         test_lds12_large_vocab_cpu();
 
 #if HAS_CUDA
-        // ── GPU tests (only when CUDA available) ─────────────
         test_lds_gpu_stability();
         test_lds_gpu_large_vocab();
 #endif

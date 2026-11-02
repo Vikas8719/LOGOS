@@ -1,12 +1,21 @@
-# Build output
+# ── Build output ─────────────────────────────────────────────
 build/
+build-sanitize/
+build_rc/
+build_fuzz_st/
+build_fuzz_lf/
 out/
 *.o
 *.obj
+*.a
+*.so
+*.dylib
+*.dll
 *.exe
 logos
+logos_gpu
 
-# CMake
+# ── CMake ────────────────────────────────────────────────────
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -15,33 +24,88 @@ CTestTestfile.cmake
 _CPack_Packages/
 *.cmake
 !CMakeLists.txt
+install_manifest.txt
 
-# Compiler artifacts
+# ── Compiler artifacts ────────────────────────────────────────
 *.d
 *.pch
 *.gch
+*.ii
+*.i
+*.s
 
-# Trained model files (large — don't push to git)
+# ── CUDA ─────────────────────────────────────────────────────
+*.cubin
+*.fatbin
+*.ptx
+*.gpu
+*.nvvm
+*.compute_*
+
+# ── Trained model / checkpoint files (large) ─────────────────
 *.bin
 !vocab.bin
+*.ckpt
+*.pt
+*.safetensors
+dataset.txt
+dataset_raw.txt
 
-# IDE
+# ── Fuzz artifacts ────────────────────────────────────────────
+corpus_fuzz/
+crash-*
+leak-*
+timeout-*
+oom-*
+fuzz_output.log
+slow-unit-*
+
+# ── MULL mutation testing ─────────────────────────────────────
+mull-report/
+mull-reports/
+*.profraw
+*.profdata
+rc_output.log
+push_output.txt
+
+# ── Sanitizer / CTest output ──────────────────────────────────
+Testing/
+*.log
+sanitizer_*.log
+
+# ── Coverage ──────────────────────────────────────────────────
+*.gcda
+*.gcno
+gmon.out
+callgrind.out.*
+lcov.info
+coverage/
+htmlcov/
+
+# ── Python / Kaggle ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.kaggle/
+kaggle.json
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# ── IDE ───────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.user
 *.suo
 *.sdf
 *.opensdf
+*.swp
+*.swo
+*~
 
-# Profiler output
-*.gcda
-*.gcno
-gmon.out
-callgrind.out.*
-
-# OS
+# ── OS ────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# AI progress (local only)
+# ── AI progress (local only) ──────────────────────────────────
 _ai_progress.json

@@ -1,55 +1,4 @@
-// ============================================================
-//  LOGOS — main.cpp  (v10 — Full Backprop + FreeEnergy CPU + Āṇurūpyeṇa)
-//
-//  NEW in v10:
-//  ──────────────────────────────────────────────────────────
-//  [v10-1] FULL ATTENTION BACKPROP (CPU path)
-//    Previously:  layer grads = dX_rms * 0.1 proxy signal (BUG 3 partial fix)
-//    Now:         model_backward() from Backprop.hpp — full analytical
-//                 gradients through every layer, every attention head,
-//                 Q/K/V/W_O, FFN W1/W2, LayerNorm gamma/beta.
-//    Impact:      All parameters now receive true gradients. Layers no
-//                 longer rely on Langevin noise alone — they learn via
-//                 proper gradient signal + Langevin exploration on top.
-//
-//  [v10-2] FREE ENERGY LOSS ON CPU PATH
-//    Previously:  GPU uses FreeEnergy F = CE - T*S; CPU uses plain CE.
-//    Now:         FreeEnergyLoss::compute() (PhysicsOpt.hpp) is called on
-//                 CPU path too. dLogits includes entropy regularization term.
-//    Impact:      CPU and GPU training now use IDENTICAL physics-motivated
-//                 loss function. Entropy regularization prevents over-
-//                 confidence; temperature annealing guides exploration.
-//
-//  [v10-3] ĀṆURŪPYEṆA PROPORTIONAL GRADIENT SCALING (Vedic Sutra)
-//    Sanskrit: अणुरूप्येण = "In proportion to / by suitable proportion"
-//    Previously:  not implemented
-//    Now:         AnurupyenaScaler (include/AnurupyenaScaler.hpp) applied
-//                 AFTER clip + BEFORE optimizer. Scales each param tensor's
-//                 gradient so its RMS equals target_rms. Different layers
-//                 (embedding, attention, FFN, LN) that naturally have
-//                 different gradient magnitudes are normalized to the same
-//                 scale, preventing some layers from dominating.
-//    Impact:      Smoother multi-layer learning; reduces layer imbalance.
-//
-//  Backprop scope v10:
-//    - lm_head:          full gradient  ✅
-//    - embedding:        full gradient  ✅
-//    - All layers:       full analytical backprop ✅  [NEW v10]
-//    - Attention Q/K/V:  full analytical grad      ✅  [NEW v10]
-//    - FFN W1/W2/b:      full analytical grad      ✅  [NEW v10]
-//    - LayerNorm γ/β:    full analytical grad      ✅  [NEW v10]
-//    - Loss function:    FreeEnergy (CPU+GPU same) ✅  [NEW v10]
-//    - Grad scaling:     Āṇurūpyeṇa proportional  ✅  [NEW v10]
-//
-//  Vedic Math status v10:
-//    ✅ Nikhilam    — KV-cache int8 quantization
-//    ✅ Ūrdhva      — Tiled GEMM (VedicGEMM.hpp)
-//    ✅ Gunitasamuc — Checksum correctness verification
-//    ✅ Shunyam     — Sparse windowed attention mask
-//    ✅ Āṇurūpyeṇa — Proportional gradient scaling [NEW v10]
-//    ⚠️  Lopana     — Partial (windowed only)
-//    ⚠️  Vyashti    — Indirect via Reynolds BN
-// ============================================================
+
 #include "Tensor.hpp"
 #include "VedicGEMM.hpp"
 #include "Tokenizer.hpp"
@@ -62,10 +11,11 @@
 #include "Model.hpp"
 #include "Checkpoint.hpp"
 #include "DataLoader.hpp"
-#include "StreamingDataLoader.hpp"  // UnifiedDataLoader — must be before Evaluate.hpp
+#include "StreamingDataLoader.hpp"  
 #include "Evaluate.hpp"
-#include "Backprop.hpp"          // [v10] Full analytical backprop
-#include "AnurupyenaScaler.hpp"  // [v10] Āṇurūpyeṇa Vedic gradient scaler
+#include "Backprop.hpp"           
+#include "AnurupyenaScaler.hpp"  
+#include "TokenizerManager.hpp"  
 
 #include <iostream>
 #include <fstream>
@@ -77,7 +27,7 @@
 #include <stdexcept>
 #include <sstream>
 
-// ── BUG 5 FIX: Path Traversal Sanitizer ──────────────────────
+
 static bool is_safe_path(const std::string& path) {
     if (path.empty()) return false;
     if (path.find('\0') != std::string::npos) return false;
@@ -104,19 +54,12 @@ static std::string safe_arg(const char* raw, const std::string& fallback) {
     return s;
 }
 
-// ── [v10] Free Energy dLogits (CPU path) ─────────────────────
-// Replaces plain softmax-CE gradient with full Free Energy gradient:
-//   F = CE - T*S(entropy)
-//   dF/dlogit[v] = (p[v] - y[v])              [CE term]
-//                + T * p[v] * (log(p[v]+ε) + S) [entropy reg term]
-//
-// Returns scalar Free Energy loss (averaged over sequence).
-// Fills dLogits_out with FreeEnergy gradient for each position.
+/
 static float free_energy_loss_cpu(
-    const Tensor&              logits,       // (seq, vocab)
-    const std::vector<int>&    targets,      // (seq,)
-    float                      temperature,  // current Langevin T
-    Tensor&                    dLogits_out)  // (seq, vocab) — filled here
+    const Tensor&              logits,       
+    const std::vector<int>&    targets,      
+    float                      temperature,  
+    Tensor&                    dLogits_out)  
 {
     int seq   = logits.rows();
     int vocab = logits.cols();
@@ -130,7 +73,7 @@ static float free_energy_loss_cpu(
         int tgt = targets[i];
         if (tgt < 0 || tgt >= vocab) continue;
 
-        // Call PhysicsOpt::FreeEnergyLoss (same struct used on GPU path)
+        
         float F = FreeEnergyLoss::compute(
             &logits.data[i * vocab], vocab,
             tgt, temperature,
@@ -147,7 +90,7 @@ static float free_energy_loss_cpu(
     return cnt > 0 ? total_F / cnt : 0.0f;
 }
 
-// ── Unit Tests ────────────────────────────────────────────────
+
 void run_tests() {
     std::cout << "\n========== LOGOS Unit Tests ==========\n";
 
@@ -249,18 +192,17 @@ void run_tests() {
         std::cout << (!out.has_nan() ? "✅ Physics-wired forward: PASS\n" : "❌ Physics-wired forward: NaN\n");
     }
 
-    // ── [v10 NEW] AnurupyenaScaler test ─────────────────────────
     std::cout << "\n[4g] AnurupyenaScaler test (Āṇurūpyeṇa — Vedic proportional grad scale)...\n";
     {
-        // Create two tensors with very different gradient magnitudes
-        Tensor g_large({4,4}); g_large.fill(10.0f);  // large gradients
-        Tensor g_small({4,4}); g_small.fill(0.01f);  // small gradients
+       
+        Tensor g_large({4,4}); g_large.fill(10.0f); 
+        Tensor g_small({4,4}); g_small.fill(0.01f); 
         std::vector<Tensor*> test_grads = {&g_large, &g_small};
 
-        AnurupyenaScaler anurup(1.0f);  // target_rms = 1.0
+        AnurupyenaScaler anurup(1.0f);  
         anurup.scale_gradients(test_grads);
 
-        // After scaling, both should be closer to target_rms=1.0
+        
         float rms_large = 0.0f, rms_small = 0.0f;
         for (int i = 0; i < 16; ++i) {
             rms_large += g_large.data[i] * g_large.data[i];
@@ -278,10 +220,10 @@ void run_tests() {
                            : "⚠️  AnurupyenaScaler: clamped (check min/max_scale)\n");
     }
 
-    // ── [v10 NEW] FreeEnergy CPU Loss test ──────────────────────
+    
     std::cout << "\n[4h] FreeEnergy CPU Loss test (F = CE - T*S)...\n";
     {
-        // Small logit example
+      
         std::vector<float> logits_raw = {1.0f, 2.0f, 0.5f, -0.3f};
         int vocab_sz = 4;
         std::vector<float> grad_fe(vocab_sz);
@@ -296,7 +238,7 @@ void run_tests() {
                               : "❌ FreeEnergy CPU Loss: FAIL\n");
     }
 
-    // ── [v10 NEW] Full Backprop test ────────────────────────────
+    
     std::cout << "\n[4i] Full Backprop test (model_backward from Backprop.hpp)...\n";
     {
         ModelConfig cfgb;
@@ -313,7 +255,7 @@ void run_tests() {
 
         float loss_b = model_backward(mb, inp_b, tgt_b, grads_b, true);
 
-        // Check: embedding and lm_head grads should be non-zero
+        
         float emb_norm = 0.0f, lm_norm = 0.0f, layer_norm = 0.0f;
         for (int i = 0; i < grads_b[0].total_size; ++i) emb_norm += grads_b[0].data[i]*grads_b[0].data[i];
         for (int i = 0; i < grads_b[1].total_size; ++i) lm_norm  += grads_b[1].data[i]*grads_b[1].data[i];
@@ -347,7 +289,7 @@ void run_tests() {
 
     float loss0=-1, lossN=-1;
     for(int s=0;s<20;++s){
-        // [v10] Use model_backward for full analytical gradients
+        
         std::vector<Tensor> grads2;
         for(auto* p : params2) grads2.emplace_back(p->shape, 0.0f);
 
@@ -366,7 +308,7 @@ void run_tests() {
     std::cout << "\n========== All Tests Complete ==========\n";
 }
 
-// ── Forward Pass Test ─────────────────────────────────────────
+
 void run_forward_test() {
     std::cout << "\n========== Forward Pass Test ==========\n";
     ModelConfig cfg;
@@ -379,7 +321,6 @@ void run_forward_test() {
     std::cout << (logits.has_nan() ? "❌ NaN\n" : "✅ Forward pass: PASS\n");
 }
 
-// ── Benchmark ─────────────────────────────────────────────────
 void run_benchmark() {
     std::cout << "\n========== VedicGEMM Benchmark ==========\n";
     int N=512; int runs=5;
@@ -397,19 +338,7 @@ void run_benchmark() {
     std::cout << "Ratio: " << (r_ms/v_ms) << "x\n";
 }
 
-// ============================================================
-//  Training Loop — v10
-//
-//  Improvements over v9:
-//  [v10-1] model_backward() from Backprop.hpp: full analytical
-//          gradients for ALL parameters including every attention
-//          head's Q/K/V weights.
-//  [v10-2] FreeEnergy loss on CPU (matching GPU path exactly).
-//          Temperature from HybridSHMOptimizer passed to loss.
-//  [v10-3] AnurupyenaScaler (Āṇurūpyeṇa sutra): applied after
-//          clip and before optimizer. Proportionally normalizes
-//          gradient RMS across all param tensors.
-// ============================================================
+
 void run_training(const std::string& dataset_path) {
     std::cout << "\n========== LOGOS Training v10 ==========\n";
     std::cout << "Optimizer  : Hybrid Stochastic Hamiltonian (SHM) v9\n";
@@ -422,23 +351,18 @@ void run_training(const std::string& dataset_path) {
     std::cout << "Grad scale : [v10 NEW] Āṇurūpyeṇa proportional normalization\n";
     std::cout << "BN stats   : ReynoldsBatchNorm EMA saved/loaded in checkpoints\n\n";
 
-    // ── Tokenizer ─────────────────────────────────────────────
-    Tokenizer tok;
-    {
-        std::ifstream f(dataset_path);
-        if (!f){ std::cerr<<"Dataset not found: "<<dataset_path<<"\n"; return; }
-        std::string text((std::istreambuf_iterator<char>(f)),
-                          std::istreambuf_iterator<char>());
-        int vocab_sz = std::min(2048, std::max(256, (int)(text.size()/30)));
-        tok.build(text, vocab_sz);
-        tok.save("vocab.bin");
-        std::cout << "Tokenizer  : vocab=" << tok.vocab_size << "\n";
-        std::cout << "Dataset    : " << text.size()/1024 << " KB\n";
-    }
+    
+    Tokenizer tok = TokenizerManager::load_or_build(
+        dataset_path,   
+        /*target_vocab=*/0,   
+        /*force_rebuild=*/false
+    );
 
-    // ── Config ────────────────────────────────────────────────
     int SEQ = 64;
-    UnifiedDataLoader loader(dataset_path, tok, SEQ);
+    
+    constexpr int BATCH_SIZE = 8;  
+
+    UnifiedDataLoader loader(dataset_path, tok, SEQ, /*grad_accum=*/BATCH_SIZE);
 
     ModelConfig cfg;
     cfg.vocab_size  = tok.vocab_size;
@@ -453,7 +377,7 @@ void run_training(const std::string& dataset_path) {
     if (total_steps <= 0) total_steps = 10000;
     float LR          = 5e-4f;
 
-    // Optimizer
+    
     HybridSHMOptimizer opt(LR, /*friction*/0.1f, /*mom_decay*/0.9f,
                            /*T_start*/0.05f, /*T_end*/1e-6f,
                            /*alpha_H_start*/0.3f, /*alpha_H_end*/0.9f,
@@ -461,24 +385,15 @@ void run_training(const std::string& dataset_path) {
     auto params = model.parameters();
     opt.init(params);
 
-    // RiemannianMetric preconditioning
+    
     int total_param_count = 0;
     for (auto* p : params) total_param_count += p->total_size;
     RiemannianMetric riem(total_param_count);
 
-    // Feynman Path Integral LR adaptation
     WeightPathIntegral path_integral(1.0f, 200);
     const float BASE_LR = LR;
 
-    // [v10 NEW] Āṇurūpyeṇa proportional gradient scaler
-    // FIX (research pass): target_rms was hard-coded to 1.0f here, which
-    // silently re-introduced the pre-FIX-2 bug (see AnurupyenaScaler.hpp
-    // header comment). Real transformer grad RMS after clip_gradients(1.0)
-    // is ~1e-3..1e-2, so target=1.0 forces scale=target/rms to saturate at
-    // max_scale=10x on almost every step (confirmed in logs: grad_rms stays
-    // ~0.003-0.02 the whole run) — the "proportional" scaler degenerates
-    // into a constant 10x multiplier, defeating its own purpose and fighting
-    // the shock-wave clip. Use the documented safe default (0.01) instead.
+    
     AnurupyenaScaler anurup_scaler(
         /*target_rms=*/0.01f,
         /*epsilon=*/1e-8f,
@@ -488,6 +403,8 @@ void run_training(const std::string& dataset_path) {
         /*enabled=*/true);
 
     std::cout << "Seq       : " << SEQ << "\n";
+    std::cout << "Batch     : " << BATCH_SIZE << "  (effective tokens/step = "
+              << SEQ * BATCH_SIZE << ")\n";
     std::cout << "Batches   : " << loader.total_batches() << "\n";
     std::cout << "Epochs    : " << EPOCHS << "\n";
     std::cout << "Steps     : " << total_steps << "\n";
@@ -503,77 +420,79 @@ void run_training(const std::string& dataset_path) {
         std::vector<int> input_ids, target_ids;
 
         while (loader.next_batch(input_ids, target_ids)) {
-            int seq   = (int)input_ids.size();
-            int vocab = cfg.vocab_size;
+            
 
-            // ── [v10] Full Backprop ────────────────────────────
-            // model_backward() (Backprop.hpp) does:
-            //   1. Forward pass with all intermediate activations saved
-            //   2. Softmax-CE backward for dLogits
-            //   3. lm_head grad: dW_lm = X_final^T @ dLogits
-            //   4. Per-layer backward (in reverse): full Q/K/V/W_O/FFN/LN grads
-            //   5. Embedding grad from final dX
-            //
-            // v9 equivalent: used dX_rms * 0.1 proxy for layer grads (grads[2+])
-            // v10:           real analytical gradients for every parameter
             std::vector<Tensor> grads;
             for (auto* p : params) grads.emplace_back(p->shape, 0.0f);
 
-            // NOTE: model_backward internally uses plain CE loss for dLogits.
-            // We ALSO compute FreeEnergy loss separately for logging and for
-            // the path integral (which needs the physics-motivated loss value).
-            float loss_ce = model_backward(model, input_ids, target_ids, grads, true);
-            if (std::isnan(loss_ce) || std::isinf(loss_ce)) { ++step; continue; }
+           
+            float accum_loss_ce = 0.0f;
+            float accum_loss_fe = 0.0f;
+            int   valid_samples  = 0;
 
-            // ── [v10] FreeEnergy Loss (CPU) ───────────────────
-            // Re-compute logits for FreeEnergy loss (needed for T-dependent term).
-            // We use forward_with_hidden() for the logits (already computed inside
-            // model_backward, but not exposed — single extra forward is acceptable
-            // until Backprop.hpp exposes its intermediate logits).
-            //
-            // FreeEnergy F = CE - T*S:
-            //   CE component  = model_backward's loss (already computed above)
-            //   Entropy term  = T * Shannon_entropy(softmax(logits))
-            // We use FE loss for:
-            //   (a) Step logging (matches GPU training log format)
-            //   (b) WeightPathIntegral input (physics-motivated trajectory tracking)
-            //   (c) Best checkpoint selection (lower FE = better thermodynamic state)
-            //
-            // The gradient used for parameter update is still from model_backward
-            // (analytical backprop). FE adds entropy regularization to the LOSS
-            // that we LOG and use for LR scaling, so exploration is thermodynamically
-            // guided even on CPU.
-            auto [logits_fe, X_final_fe] = model.forward_with_hidden(input_ids, true);
-            Tensor dLogits_fe(logits_fe.shape, 0.0f);
-            float loss_fe = free_energy_loss_cpu(
-                logits_fe, target_ids,
-                opt.temperature,    // current annealed temperature
-                dLogits_fe);        // FE gradient (for logging only in v10)
-            // loss_fe is the thermodynamic loss F = CE - T*S.
-            // Use it for logging and path integral tracking.
-            float loss = std::isfinite(loss_fe) ? loss_fe : loss_ce;
+            
+            auto accumulate_one = [&](const std::vector<int>& inp,
+                                       const std::vector<int>& tgt) {
+                std::vector<Tensor> step_grads;
+                for (auto* p : params) step_grads.emplace_back(p->shape, 0.0f);
 
-            // ── Gradient pipeline ──────────────────────────────
+                Tensor logits_fe;
+                float loss_ce = model_backward_with_logits(model, inp, tgt, step_grads, logits_fe, true);
+                if (std::isnan(loss_ce) || std::isinf(loss_ce)) return;
+
+                Tensor dLogits_fe(logits_fe.shape, 0.0f);
+                float loss_fe = free_energy_loss_cpu(logits_fe, tgt, opt.temperature, dLogits_fe);
+
+                accum_loss_ce += std::isfinite(loss_ce) ? loss_ce : 0.0f;
+                accum_loss_fe += std::isfinite(loss_fe) ? loss_fe : loss_ce;
+                ++valid_samples;
+
+                for (int gi = 0; gi < (int)grads.size(); ++gi) {
+                    for (int k = 0; k < grads[gi].total_size; ++k)
+                        grads[gi].data[k] += step_grads[gi].data[k];
+                }
+            };
+
+           
+            accumulate_one(input_ids, target_ids);
+
+            
+            for (int bi = 1; bi < BATCH_SIZE; ++bi) {
+                std::vector<int> inp2, tgt2;
+                bool ok = loader.next_batch(inp2, tgt2);
+                if (!ok) break;
+                accumulate_one(inp2, tgt2);
+            }
+
+            if (valid_samples == 0) { ++step; continue; }
+
+            
+            float inv_bs = 1.0f / (float)valid_samples;
+            for (auto& g : grads)
+                for (int k = 0; k < g.total_size; ++k)
+                    g.data[k] *= inv_bs;
+
+            float loss_ce = accum_loss_ce * inv_bs;
+            float loss    = accum_loss_fe * inv_bs;
+
+           
             std::vector<Tensor*> gptrs;
             for (auto& g : grads) gptrs.push_back(&g);
 
-            // Step 1: Clip (prevent NaN/inf explosion)
+            
             clip_gradients(gptrs, 1.0f);
 
-            // Step 2: [v10 NEW] Āṇurūpyeṇa proportional gradient scaling
-            // Applied AFTER clip, BEFORE optimizer.
-            // Normalizes per-tensor gradient RMS to target_rms=1.0
+            
             anurup_scaler.scale_gradients(gptrs);
 
-            // Step 3: Path-integral adaptive LR
-            // lr_min_frac=0.5: learning rate 50% se neeche nahi girega
+            
             opt.learning_rate = BASE_LR * path_integral.lr_scale(0.5f);
 
-            // Step 4: Optimizer step
+            
             auto snap_before = WeightPathIntegral::snapshot(params);
             opt.step(params, gptrs);
 
-            // Step 5: Record path integral with FreeEnergy loss
+            
             path_integral.record_step_from_tensors(loss, params, snap_before);
 
             smooth = smooth < 0 ? loss : 0.95f*smooth + 0.05f*loss;
@@ -582,15 +501,11 @@ void run_training(const std::string& dataset_path) {
             if (step % 100 == 0) {
                 std::cout << std::fixed << std::setprecision(4)
                           << "Step " << std::setw(5) << step
+                          << " | BS: "      << valid_samples
                           << " | F(loss): " << loss
                           << " | CE: "      << loss_ce
                           << " | Smooth: "  << smooth
-                          // FIX (research pass): log the SAME lr_min_frac=0.5
-                          // used to actually scale the LR a few lines above.
-                          // The old code printed lr_scale() with its default
-                          // arg (0.1), a different number than what was
-                          // really applied — cosmetic bug that made the
-                          // console log lie about the true learning rate.
+                          
                           << " | T: "       << opt.temperature
                           << " | aH: "      << opt.alpha_H
                           << " | lr_x: "    << path_integral.lr_scale(0.5f) << "\n";
@@ -599,25 +514,9 @@ void run_training(const std::string& dataset_path) {
             if (step % 500 == 0) {
                 riem.log_state();
                 path_integral.log_state();
-                anurup_scaler.log_state(step);  // [v10] Āṇurūpyeṇa diagnostic
+                anurup_scaler.log_state(step);  
             }
-            // FIX (research pass): WeightPathIntegral.log_amplitude is an
-            // UNBOUNDED cumulative sum of -action every step (action =
-            // loss*||delta_theta|| >= 0), so it only ever decreases and
-            // best_log_amplitude is (with FIX-3's -1e30 init) essentially
-            // always set at step 0 and never beaten again. That makes
-            // relative_amplitude() = exp(log_A - best_log_A) decay to 0
-            // within a few thousand steps no matter how training is going
-            // (this is exactly what the logs showed: rel_A 1.000 -> 0.130 ->
-            // 0.032 -> ... -> 0.000, permanently, from step ~500 onward) —
-            // after that the "physics-adaptive" LR is just pinned at the
-            // lr_min_frac floor for the rest of the run and stops adapting.
-            // reset_best() (already written in PhysicsOpt.hpp, but never
-            // called anywhere) restarts the baseline periodically so the
-            // amplitude signal can keep reflecting *recent* trajectory
-            // instead of decaying against a baseline from the start of
-            // training. Calling it here is a minimal fix; a more complete
-            // fix would replace the cumulative sum with an EMA of action.
+           
             if (step > 0 && step % 2000 == 0) {
                 path_integral.reset_best();
             }
@@ -632,7 +531,6 @@ void run_training(const std::string& dataset_path) {
     std::cout << "========== Training Done ==========\n";
     save_checkpoint(model, "logos_final", step);
 
-    // evaluate() — overloaded for UnifiedDataLoader (Evaluate.hpp v5)
     auto r = evaluate(model, loader, 50);
     print_eval(r, step);
 
@@ -646,23 +544,52 @@ void run_training(const std::string& dataset_path) {
         std::cout << "⚠️  Need more steps\n";
 }
 
-// ── Eval ──────────────────────────────────────────────────────
+
 void run_eval(const std::string& ds, const std::string& ckpt) {
-    Tokenizer tok; tok.load("vocab.bin");
+    Tokenizer tok = TokenizerManager::load();
+
     ModelConfig cfg;
-    cfg.vocab_size=tok.vocab_size; cfg.d_model=64;
-    cfg.num_heads=4; cfg.num_layers=2; cfg.max_seq_len=64;
+    cfg.vocab_size = tok.vocab_size;
+
+    if (!ckpt.empty()) {
+        std::ifstream probe(ckpt, std::ios::binary);
+        if (probe) {
+            ModelConfig file_cfg;
+            probe.read(reinterpret_cast<char*>(&file_cfg), sizeof(ModelConfig));
+            if (probe && probe.gcount() == sizeof(ModelConfig)
+                && file_cfg.d_model > 0 && file_cfg.num_heads > 0
+                && file_cfg.num_layers > 0 && file_cfg.max_seq_len > 0) {
+                cfg.d_model     = file_cfg.d_model;
+                cfg.num_heads   = file_cfg.num_heads;
+                cfg.num_layers  = file_cfg.num_layers;
+                cfg.max_seq_len = file_cfg.max_seq_len;
+                if (file_cfg.vocab_size == tok.vocab_size)
+                    cfg.vocab_size = file_cfg.vocab_size;
+            }
+        }
+    }
+
+    if (cfg.d_model == 0)     cfg.d_model     = 64;
+    if (cfg.num_heads == 0)   cfg.num_heads   = 4;
+    if (cfg.num_layers == 0)  cfg.num_layers  = 2;
+    if (cfg.max_seq_len == 0) cfg.max_seq_len = 64;
+
     LOGOSModel model(cfg);
     if (!ckpt.empty()) load_checkpoint(model, ckpt);
-    DataLoader loader(ds, tok, 64);
+    DataLoader loader(ds, tok, cfg.max_seq_len);
     auto r = evaluate(model, loader, 200);
     print_eval(r, -1);
 }
 
-// ── Generate ──────────────────────────────────────────────────
 void run_generate(const std::string& ckpt, const std::string& prompt) {
+    
     Tokenizer tok;
-    if (!tok.load("vocab.bin")){ std::cerr<<"vocab.bin not found\n"; return; }
+    try {
+        tok = TokenizerManager::load();
+    } catch (const std::exception& e) {
+        std::cerr << "❌ " << e.what() << "\n";
+        return;
+    }
     ModelConfig cfg;
     cfg.vocab_size=tok.vocab_size; cfg.d_model=64;
     cfg.num_heads=4; cfg.num_layers=2; cfg.max_seq_len=64;
@@ -674,14 +601,14 @@ void run_generate(const std::string& ckpt, const std::string& prompt) {
     std::cout << tok.decode(out) << "\n";
 }
 
-// ── Main ──────────────────────────────────────────────────────
+
 int main(int argc, char* argv[]) {
     std::cout << "╔══════════════════════════════════════════════════╗\n"
               << "║  LOGOS v10 — Vedic-Physics Hybrid LLM            ║\n"
               << "║  Full Backprop | FreeEnergy CPU | Āṇurūpyeṇa     ║\n"
               << "╚══════════════════════════════════════════════════╝\n\n";
 
-    // BUG 8 FIX: Global RNG seed
+    
     logos_rng::set_global_seed(42);
     std::cout << "RNG seed  : 42 (deterministic weight init)\n\n";
 
@@ -689,8 +616,22 @@ int main(int argc, char* argv[]) {
     if      (mode == "--test")      run_tests();
     else if (mode == "--forward")   run_forward_test();
     else if (mode == "--benchmark") run_benchmark();
+    else if (mode == "--tokenizer-info") {
+        TokenizerManager::print_info();
+    }
     else if (mode == "--train") {
         std::string ds = safe_arg(argc > 2 ? argv[2] : nullptr, "dataset.txt");
+        bool force_rebuild = false;
+        for (int i = 2; i < argc; ++i) {
+            if (std::string(argv[i]) == "--retokenize") {
+                force_rebuild = true;
+                std::cout << "--retokenize: tokenizer force-rebuild mode\n";
+                break;
+            }
+        }
+        if (force_rebuild) {
+            TokenizerManager::load_or_build(ds, 0, true);
+        }
         run_training(ds);
     }
     else if (mode == "--eval") {

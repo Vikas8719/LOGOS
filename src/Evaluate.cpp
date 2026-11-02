@@ -1,15 +1,8 @@
-// ============================================================
-//  LOGOS — Evaluate.cpp
-//  Perplexity + Accuracy evaluation
-//
-//  Perplexity = exp(average cross-entropy loss)
-//  Lower = better. GPT-2 small ~30 on WikiText
-//  Random model = vocab_size (4096 ≈ 8.3 perplexity in log)
-// ============================================================
-#pragma once
+
+
 #include "../include/Tensor.hpp"
-#include "Model.cpp"
-#include "DataLoader.cpp"
+#include "../include/Model.hpp"
+#include "../include/DataLoader.hpp"
 #include <cmath>
 #include <iostream>
 #include <iomanip>
@@ -17,7 +10,7 @@
 struct EvalResult {
     float loss;
     float perplexity;
-    float top1_accuracy;   // Kitne tokens exactly sahi predict hue
+    float top1_accuracy;   
     int   total_tokens;
 };
 
@@ -30,22 +23,21 @@ EvalResult evaluate(LOGOSModel& model,
     int   total      = 0;
     int   batches    = 0;
 
-    loader.current_pos = 0;   // Eval hamesha start se
+    loader.reset();
 
     std::vector<int> input_ids, target_ids;
 
     while (loader.next_batch(input_ids, target_ids) && batches < max_batches) {
-        // Forward pass
-        Tensor logits = model.forward(input_ids);   // (seq, vocab)
+        Tensor logits = model.forward(input_ids);   
         int seq   = logits.rows();
         int vocab = logits.cols();
 
-        // Per-token loss + accuracy
+        
         for (int i = 0; i < seq && i < (int)target_ids.size(); ++i) {
             int target = target_ids[i];
             if (target < 0 || target >= vocab) continue;
 
-            // Cross-entropy loss
+            
             float max_l = logits.at(i, 0);
             for (int v = 1; v < vocab; ++v)
                 max_l = std::max(max_l, logits.at(i, v));
@@ -57,7 +49,6 @@ EvalResult evaluate(LOGOSModel& model,
             float token_loss = -(logits.at(i, target) - max_l - std::log(sum));
             total_loss += token_loss;
 
-            // Top-1 accuracy
             int pred = 0;
             float best = logits.at(i, 0);
             for (int v = 1; v < vocab; ++v)

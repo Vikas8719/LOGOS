@@ -1,25 +1,4 @@
 #pragma once
-//  Hybrid Stochastic Hamiltonian Mechanics:
-//    Same physics as GPU shm_hybrid_kernel (VedicGEMM.cu)
-//    Used in main.cpp / Kaggle / unit tests
-//
-//  v10-FIX: Three critical bugs fixed:
-//
-//  FIX-1: Temperature floor — T_end minimum clamped to 1e-3
-//    Pehle: T_end = 1e-5 → T → 0.0000 at late training
-//    Ab:    T_end >= 1e-3 enforced in anneal()
-//    Reason: F = CE - T*S mein T=0 → entropy regularization OFF
-//            → model overconfident on wrong predictions → loss spikes
-//
-//  FIX-2: AnurupyenaScaler target_rms lowered, max_scale tightened
-//    Pehle: target_rms=1.0, max_scale=100 → grad_rms=0.003 → 350x boost → explosion
-//    Ab:    target_rms=0.01, max_scale=10  → at most 10x rescale → stable
-//
-//  FIX-3: WeightPathIntegral best tracking fixed
-//    Pehle: best_log_amplitude=0.0f → log_A always < 0 → best_step always 0
-//    Ab:    best_log_amplitude = -1e30f (negative infinity) → always updated
-//           Also added: reset_best() for re-initialization after warmup
-// ============================================================
 #include "Tensor.hpp"
 #include <cmath>
 #include <vector>
@@ -29,18 +8,13 @@
 #include <algorithm>
 #include <cstdint>
 
-// ── FIX-1 constant: minimum temperature floor ─────────────────
-// T below this causes F=CE-T*S to lose entropy regularization.
-// 1e-3 keeps soft entropy signal alive throughout training.
 static constexpr float T_MIN_FLOOR = 1e-3f;
 
-// ── Free Energy Loss (CPU reference) ─────────────────────────
 struct FreeEnergyLoss {
     static float compute(const float* logits, int vocab,
                          int target, float temperature,
                          float* grad_out)
     {
-        // FIX-1: Clamp temperature — never let T drop to near-zero
         float T = std::max(temperature, T_MIN_FLOOR);
 
         float max_l = logits[0];
@@ -69,7 +43,6 @@ struct FreeEnergyLoss {
     }
 };
 
-// ── Leapfrog Langevin Optimizer ───────────────────────────────
 class LangevinOptimizer {
 public:
     float learning_rate;
@@ -88,7 +61,6 @@ public:
                       int steps=100000, int seed=42)
         : learning_rate(lr), friction(fric),
           temperature(T_start), temp_start(T_start),
-          // FIX-1: enforce T_end floor
           temp_end(std::max(T_end, T_MIN_FLOOR)),
           total_steps(steps), rng(seed)
     {}
@@ -103,7 +75,6 @@ public:
     void anneal() {
         float ratio = std::min(1.0f, (float)current_step / (float)total_steps);
         float cos_v = 0.5f * (1.0f + std::cos(3.14159265f * ratio));
-        // FIX-1: floor applied here too — can never reach 0
         temperature = std::max(T_MIN_FLOOR,
                                temp_end + (temp_start - temp_end) * cos_v);
     }
@@ -112,12 +83,15 @@ public:
               const std::vector<Tensor*>& grads)
     {
         if (velocity.empty()) init(params);
+        if (grads.size() != params.size())
+            throw std::invalid_argument("LangevinOptimizer::step: params/grads size mismatch");
         anneal();
         float noise_scale = std::sqrt(friction * temperature * learning_rate * 0.5f);
         for (int pi=0; pi<(int)params.size(); ++pi) {
             Tensor* W       = params[pi];
             const Tensor* G = grads[pi];
             auto& vel       = velocity[pi];
+            if ((int)vel.size() != W->total_size) vel.assign(W->total_size, 0.0f);
             for (int i=0; i<W->total_size; ++i) {
                 float grad = G->data[i];
                 if (std::isnan(grad)||std::isinf(grad)) grad=0.0f;
@@ -141,7 +115,6 @@ public:
     }
 };
 
-// ── Hybrid SHM Optimizer ──────────────────────────────────────
 class HybridSHMOptimizer {
 public:
     float learning_rate;
@@ -158,15 +131,12 @@ public:
     std::mt19937 rng;
     std::normal_distribution<float> noise_dist{0.0f, 1.0f};
 
-    // v10-HAM: Hamiltonian-dominant defaults
-    // T_start=0.5 (real annealing), aH_start=0.7 (gradient-strong from start)
     HybridSHMOptimizer(float lr=1e-4f, float fric=0.1f, float mom_d=0.95f,
                        float T_start=0.5f, float T_end=1e-3f,
                        float aH_start=0.7f, float aH_end=0.99f,
                        int steps=100000, int seed=42)
         : learning_rate(lr), friction(fric), mom_decay(mom_d),
           temperature(T_start), temp_start(T_start),
-          // FIX-1: enforce T_end floor — never zero
           temp_end(std::max(T_end, T_MIN_FLOOR)),
           alpha_H_start(aH_start), alpha_H_end(aH_end),
           total_steps(steps), rng(seed)
@@ -182,7 +152,6 @@ public:
     void anneal() {
         float ratio = std::min(1.0f, (float)current_step / (float)total_steps);
         float cos_v = 0.5f * (1.0f + std::cos(3.14159265f * ratio));
-        // FIX-1: temperature floor — entropy reg always active
         temperature = std::max(T_MIN_FLOOR,
                                temp_end + (temp_start - temp_end) * cos_v);
         alpha_H = alpha_H_start + (alpha_H_end - alpha_H_start) * (1.0f - cos_v);
@@ -193,12 +162,15 @@ public:
               const std::vector<Tensor*>& grads)
     {
         if (velocity.empty()) init(params);
+        if (grads.size() != params.size())
+            throw std::invalid_argument("HybridSHMOptimizer::step: params/grads size mismatch");
         anneal();
         float noise_scale = std::sqrt(friction * temperature * learning_rate * alpha_L);
         for (int pi=0; pi<(int)params.size(); ++pi) {
             Tensor* W       = params[pi];
             const Tensor* G = grads[pi];
             auto& vel       = velocity[pi];
+            if ((int)vel.size() != W->total_size) vel.assign(W->total_size, 0.0f);
             for (int i=0; i<W->total_size; ++i) {
                 float grad = G->data[i];
                 if (std::isnan(grad)||std::isinf(grad)) grad=0.0f;
@@ -225,7 +197,6 @@ public:
     }
 };
 
-// ── Natural Gradient Optimizer ────────────────────────────────
 class NaturalGradientOptimizer {
 public:
     float learning_rate;
@@ -270,11 +241,15 @@ public:
               const std::vector<Tensor*>& grads)
     {
         if (velocity.empty()) init(params);
+        if (grads.size() != params.size())
+            throw std::invalid_argument("NaturalGradientOptimizer::step: params/grads size mismatch");
         anneal();
         float noise_scale = std::sqrt(2.0f * temperature * learning_rate);
         for (int pi=0; pi<(int)params.size(); ++pi) {
             Tensor* W = params[pi]; const Tensor* G = grads[pi];
             auto& vel = velocity[pi]; auto& F = fisher_diag[pi];
+            if ((int)vel.size() != W->total_size) vel.assign(W->total_size, 0.0f);
+            if ((int)F.size()   != W->total_size) F.assign(W->total_size, epsilon);
             for (int i=0; i<W->total_size; ++i) {
                 float g = G->data[i];
                 if (std::isnan(g)||std::isinf(g)) g=0.0f;
@@ -300,7 +275,6 @@ public:
     }
 };
 
-// ── Weight Path Integral ──────────────────────────────────────
 struct WeightPathIntegral {
     float hbar;
     int   n_history;
@@ -314,7 +288,6 @@ struct WeightPathIntegral {
     };
     std::vector<PathStep> history;
 
-    // FIX-3: Initialize to -infinity so ANY first step becomes best_step
     float best_log_amplitude = -1e30f;
     int   best_step          = 0;
 
@@ -322,9 +295,6 @@ struct WeightPathIntegral {
         : hbar(std::max(1e-6f, hbar_)), n_history(hist)
     { history.reserve(hist); }
 
-    // FIX-3: reset_best() — call after warmup to restart best tracking
-    // This prevents the very first bad steps from dominating best_step forever.
-    // GPU path: record ||delta_theta|| directly and track an EMA of action (self-normalising LR signal).
     float ema_action  = 0.0f;
     float last_action = 0.0f;
     bool  ema_ready   = false;
@@ -337,7 +307,6 @@ struct WeightPathIntegral {
         last_action = action;
         ++step_count;
     }
-    // LR multiplier in [lr_min_frac,1]: shrinks when current action spikes above its running average.
     float lr_scale_ema(float lr_min_frac = 0.5f) const {
         float rel = std::min(1.0f, std::exp(-(last_action - ema_action) / (ema_action + 1e-8f)));
         return lr_min_frac + (1.0f - lr_min_frac) * rel;
@@ -357,7 +326,6 @@ struct WeightPathIntegral {
         log_amplitude     -= action / hbar;
         cumulative_action += action;
 
-        // FIX-3: now correctly triggers because best starts at -1e30
         if (log_amplitude > best_log_amplitude) {
             best_log_amplitude = log_amplitude;
             best_step          = step_count;
@@ -367,8 +335,7 @@ struct WeightPathIntegral {
         if ((int)history.size() < n_history) {
             history.push_back(ps);
         } else {
-            history.erase(history.begin());
-            history.push_back(ps);
+            history[step_count % n_history] = ps;
         }
         ++step_count;
     }
@@ -376,8 +343,15 @@ struct WeightPathIntegral {
     void record_step_from_tensors(float loss,
                                    const std::vector<Tensor*>& params_after,
                                    const std::vector<float>&   snapshot_before) {
+        int total = 0;
+        for (const auto* p : params_after) total += p->total_size;
+        if ((int)snapshot_before.size() < total)
+            throw std::invalid_argument(
+                "record_step_from_tensors: snapshot_before too small ("
+                + std::to_string(snapshot_before.size()) + " < "
+                + std::to_string(total) + ")");
         std::vector<float> delta;
-        delta.reserve(snapshot_before.size());
+        delta.reserve(total);
         int offset = 0;
         for (const auto* p : params_after) {
             for (int i=0; i<p->total_size; ++i)
@@ -425,5 +399,3 @@ struct WeightPathIntegral {
     }
 };
 
-// NOTE: ReynoldsBatchNorm is defined in LayerNorm.hpp
-// NOTE: FeynmanDropout    is defined in FeedForward.hpp

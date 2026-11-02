@@ -11,7 +11,6 @@ struct GPUBlock {
     GPUTensor ln2_gamma, ln2_beta;
 };
 
-// INT8 compressed tensor for Nikhilam KV cache
 struct NikhilamTensor {
     int8_t* data  = nullptr;
     float   scale = 1.0f;
@@ -38,14 +37,13 @@ struct NikhilamTensor {
     bool valid() const { return data != nullptr && size > 0; }
 };
 
-// Per-head forward cache (float32 K/V kept for backward; INT8 for stats)
 struct HeadCache {
     GPUTensor Q, K, V;
     GPUTensor attn_probs;
     GPUTensor head_out;
     NikhilamTensor K_int8, V_int8;
-    GPUTensor Q_adv;  // advected Q used in scores
-    GPUTensor V_s;    // diffused V used in head_out
+    GPUTensor Q_adv;  
+    GPUTensor V_s;    
 };
 
 struct LayerCache {
@@ -53,9 +51,9 @@ struct LayerCache {
     GPUTensor normed1, normed2;
     GPUTensor ffn_H, ffn_A;
     GPUTensor attn_out, concat;
-    GPUTensor post_attn;  // X after attention residual — true input of LN2
-    GPUTensor ffn_mask;   // Feynman dropout mask (invalid when training=false)
-    GPUTensor ln1_w, ln2_w;  // Reynolds laminar weight per token
+    GPUTensor post_attn;  
+    GPUTensor ffn_mask;   
+    GPUTensor ln1_w, ln2_w;  
     std::vector<HeadCache> heads;
 };
 
@@ -105,7 +103,7 @@ public:
     ModelConfig cfg;
     HyperConfig hyper_cfg;
     GPUPhysicsConfig phys;
-    std::vector<GPUTensor> run_mean, run_var;  // Reynolds BN running stats, 2 per layer
+    std::vector<GPUTensor> run_mean, run_var;  
     unsigned dropout_seed = 12345u;
 
     GPUTensor gpu_embedding, gpu_pos_embedding, gpu_lm_head;
@@ -113,13 +111,12 @@ public:
 
     int* d_token_ids = nullptr;
     GPUTensor last_hidden;
-    GPUTensor X_euclidean;  // embedding before hyperbolic map (for backward)
-
+    GPUTensor X_euclidean;  
     std::vector<LayerCache> layer_cache;
 
-    // FP16 shadow weight pointers, parallel to all_parameters() — set by train loop before forward
     bool amp_enabled = false;
     std::vector<const __half*> fp16_param_ptrs;
+    bool flash_logged = false;
 
     ModelGPU(const ModelConfig& cfg, const HyperConfig& hcfg = {});
     ~ModelGPU();

@@ -1,5 +1,3 @@
-// ============================================================
-//  LOGOS — tests/test_rapidcheck.cpp
 
 #include "../include/VedicGEMM.hpp"
 #include "../include/Tensor.hpp"
@@ -31,9 +29,7 @@ private:
     std::streambuf* previous_;
 };
 
-// ── Helpers ───────────────────────────────────────────────────
 
-// Naive reference GEMM — ground truth
 static std::vector<float> naive_gemm(
     const std::vector<float>& A,
     const std::vector<float>& B,
@@ -59,7 +55,6 @@ static bool mat_close(const std::vector<float>& A,
     return true;
 }
 
-// CPU softmax + CE + entropy (same as test_math_unit.cpp)
 static std::vector<float> cpu_softmax(const std::vector<float>& logits) {
     float mx = *std::max_element(logits.begin(), logits.end());
     std::vector<float> p(logits.size());
@@ -79,18 +74,12 @@ static float cpu_ce(const std::vector<float>& p, int target) {
     return -std::log(std::max(p[target], 1e-12f));
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC1] VedicGEMM == reference_gemm — random sizes + values
-// ═══════════════════════════════════════════════════════════════
 static void rc1_vedic_matches_reference() {
     rc::check("[RC1] vedic_gemm(A,B) == reference_gemm(A,B) for random inputs", []() {
-        // Random matrix dimensions: [1, 32] — small for speed
-        // RC_PRE = precondition (skip invalid)
         int M = *rc::gen::inRange(1, 33);
         int K = *rc::gen::inRange(1, 33);
         int N = *rc::gen::inRange(1, 33);
 
-        // Random finite floats [-1, 1]
         auto float_gen = rc::gen::map(
             rc::gen::inRange(-100, 101),
             [](int v) { return v * 0.01f; }
@@ -99,45 +88,25 @@ static void rc1_vedic_matches_reference() {
         auto flat_a = *rc::gen::container<std::vector<float>>(M * K, float_gen);
         auto flat_b = *rc::gen::container<std::vector<float>>(K * N, float_gen);
 
-        // Build Tensors
         Tensor A({M, K}); A.data = flat_a;
         Tensor B({K, N}); B.data = flat_b;
 
-        // VedicGEMM (actual LOGOS code)
         Tensor C = vedic_gemm(A, B);
 
-        // Reference (naive triple loop)
         auto C_ref = naive_gemm(flat_a, flat_b, M, K, N);
 
         RC_ASSERT(mat_close(C.data, C_ref));
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC2] VEDIC_BLOCK=64 boundary sizes
-//  Off-by-one tiling bugs sirf specific sizes pe dikhte hain
-//
-//  NOTE: RC_PARAMS env var nested rc::check() calls mein inherit nahi hota
-//  kyunki RapidCheck env var sirf top-level TestParams se read karta hai.
-//  Isliye yahan explicit rc::TestParams use karo — guaranteed 200 tests per size.
-//  9 boundary sizes × 200 = 1800 total matrix multiplications.
-// ═══════════════════════════════════════════════════════════════
 static void rc2_tiling_boundary() {
     const std::vector<int> boundary_sizes = {1, 63, 64, 65, 127, 128, 129, 192, 193};
 
-    // RC_PARAMS env var nested rc::check() calls mein inherit nahi hota —
-    // RapidCheck sirf top-level call pe env var padhta hai.
-    // Workaround: RC_PARAMS string directly set karo har call se pehle.
-    // rc::detail::configuration() = rc::Configuration::fromString(...) — internal API.
-    //
-    // Safe public alternative: setenv se RC_PARAMS temporarily set karo,
-    // phir rc::check call karo, phir restore. Yeh portable hai.
     const std::string saved_rc = []() -> std::string {
         const char* v = std::getenv("RC_PARAMS");
         return v ? v : "";
     }();
 
-    // 200 random matrices per boundary size × 9 sizes = 1800 total
     setenv("RC_PARAMS", "max_success=200;max_discard_ratio=10", 1);
 
     for (int sz : boundary_sizes) {
@@ -162,16 +131,12 @@ static void rc2_tiling_boundary() {
             });
     }
 
-    // Restore original RC_PARAMS
     if (saved_rc.empty())
         unsetenv("RC_PARAMS");
     else
         setenv("RC_PARAMS", saved_rc.c_str(), 1);
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC3] vedic_gemm_bias correctness
-// ═══════════════════════════════════════════════════════════════
 static void rc3_gemm_bias() {
     rc::check("[RC3] vedic_gemm_bias(A, W, b) == reference(A,W) + b", []() {
         int M = *rc::gen::inRange(1, 17);
@@ -191,10 +156,8 @@ static void rc3_gemm_bias() {
         Tensor W({K, N}); W.data = flat_w;
         Tensor bias({N}); bias.data = flat_b;
 
-        // LOGOS actual code
         Tensor C_bias = vedic_gemm_bias(A, W, bias);
 
-        // Reference: naive GEMM + bias
         auto C_ref = naive_gemm(flat_a, flat_w, M, K, N);
         for (int i = 0; i < M; ++i)
             for (int j = 0; j < N; ++j)
@@ -204,11 +167,7 @@ static void rc3_gemm_bias() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC4] Free Energy F = CE - T*S properties
-// ═══════════════════════════════════════════════════════════════
 static void rc4_free_energy_properties() {
-    // Property A: S >= 0 hamesha
     rc::check("[RC4a] Entropy S >= 0 for any probability distribution", []() {
         int vocab = *rc::gen::inRange(2, 33);
         auto float_gen = rc::gen::map(
@@ -227,7 +186,6 @@ static void rc4_free_energy_properties() {
         for (float pi : p) RC_ASSERT(std::isfinite(pi) && pi > 0.0f);
     });
 
-    // Property B: T=0 pe F = CE
     rc::check("[RC4b] F = CE when T = 0", []() {
         int vocab  = *rc::gen::inRange(2, 17);
         int target = *rc::gen::inRange(0, vocab);
@@ -246,7 +204,6 @@ static void rc4_free_energy_properties() {
         RC_ASSERT(std::abs(F_T0 - CE) < 1e-6f);
     });
 
-    // Property C: F <= CE jab T > 0 (entropy term reduce karta hai F)
     rc::check("[RC4c] F <= CE when T > 0", []() {
         int vocab  = *rc::gen::inRange(2, 17);
         int target = *rc::gen::inRange(0, vocab);
@@ -267,7 +224,6 @@ static void rc4_free_energy_properties() {
         RC_ASSERT(F >= CE - T * std::log(static_cast<float>(vocab)) - 1e-5f);
     });
 
-    // Property D: F nan nahi hona chahiye valid inputs pe
     rc::check("[RC4d] F is not NaN for valid inputs", []() {
         int vocab  = *rc::gen::inRange(2, 17);
         int target = *rc::gen::inRange(0, vocab);
@@ -289,9 +245,6 @@ static void rc4_free_energy_properties() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC5] Tensor::reshape roundtrip
-// ═══════════════════════════════════════════════════════════════
 static void rc5_tensor_reshape() {
     rc::check("[RC5] Tensor reshape roundtrip: data unchanged", []() {
         int rows = *rc::gen::inRange(1, 33);
@@ -306,11 +259,9 @@ static void rc5_tensor_reshape() {
         Tensor T({rows, cols});
         T.data = flat;
 
-        // Reshape to [total, 1] → back to [rows, cols]
         Tensor T2 = T.reshape({rows * cols, 1});
         Tensor T3 = T2.reshape({rows, cols});
 
-        // Data hamesha same rehna chahiye
         RC_ASSERT(T3.data == T.data);
         RC_ASSERT(T3.rows() == rows);
         RC_ASSERT(T3.cols() == cols);
@@ -327,11 +278,7 @@ static void rc5_tensor_reshape() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC6] Riemannian distance properties
-// ═══════════════════════════════════════════════════════════════
 static void rc6_riemannian_distance() {
-    // Property A: d(θ, θ) = 0
     rc::check("[RC6a] Riemannian self-distance = 0", []() {
         int dim = *rc::gen::inRange(1, 65);
 
@@ -351,7 +298,6 @@ static void rc6_riemannian_distance() {
         RC_ASSERT(std::abs(d) < 1e-6f);
     });
 
-    // Property B: d(θ1, θ2) > 0 jab θ1 ≠ θ2
     rc::check("[RC6b] Riemannian distance > 0 for different points", []() {
         int dim = *rc::gen::inRange(1, 33);
 
@@ -362,7 +308,6 @@ static void rc6_riemannian_distance() {
         auto vals1 = *rc::gen::container<std::vector<float>>(dim, float_gen);
         auto vals2 = *rc::gen::container<std::vector<float>>(dim, float_gen);
 
-        // Ensure they are actually different
         RC_PRE(vals1 != vals2);
 
         RiemannianMetric rm(dim, 1e-4f);
@@ -374,7 +319,6 @@ static void rc6_riemannian_distance() {
         RC_ASSERT(d > 0.0f);
     });
 
-    // Property C: Symmetry d(θ1, θ2) == d(θ2, θ1)
     rc::check("[RC6c] Riemannian distance is symmetric", []() {
         int dim = *rc::gen::inRange(1, 33);
 
@@ -396,7 +340,6 @@ static void rc6_riemannian_distance() {
         RC_ASSERT(std::abs(d12 - d21) < 1e-6f);
     });
 
-    // Property D: triangle inequality for the same positive diagonal metric.
     rc::check("[RC6d] Riemannian distance satisfies triangle inequality", []() {
         int dim = *rc::gen::inRange(1, 33);
         auto float_gen = rc::gen::map(
@@ -415,25 +358,17 @@ static void rc6_riemannian_distance() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC7] Checkpoint expected_bytes formula — random ModelConfig
-// ═══════════════════════════════════════════════════════════════
 static void rc7_checkpoint_size_formula() {
     rc::check("[RC7] serialized size matches actual model parameters", []() {
-        // Valid config ranges (same as CKPT_MAX_* constants)
         int vocab_size  = *rc::gen::inRange(2, 513);
         int d_model_div = *rc::gen::inRange(1, 9);   // d_model = d_model_div * 4
         int d_model     = d_model_div * 4;            // must be multiple of 4 (for heads)
-        // rc::gen::element({1,2,4}) — picks one value from initializer list
-        // rc::gen::elementOf(vec) — alternative for named vector
-        // Safest: use inRange index to pick from array
         const int heads_arr[] = {1, 2, 4};
         int heads_idx = *rc::gen::inRange(0, 3);
         int num_heads = heads_arr[heads_idx];
         int num_layers  = *rc::gen::inRange(1, 5);
         int max_seq_len = *rc::gen::inRange(2, 65);
 
-        // d_model num_heads ka multiple hona chahiye
         RC_PRE(d_model % num_heads == 0);
 
         ScopedCoutSilencer silence;
@@ -473,31 +408,8 @@ static void rc7_checkpoint_size_formula() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  [RC8] Leapfrog energy drift < Euler drift
-//
-//  Harmonic oscillator: d²W/dt² = -W
-//  Stability regions (undamped, ω=1):
-//    Euler:    stable iff lr < 0 (unstable for all lr > 0 — always diverges!)
-//    Leapfrog: stable iff lr < 2.0 (symplectic — bounded energy oscillation)
-//
-//  Test A (strict lr < 2): leapfrog drift << euler drift
-//    — Euler ALWAYS diverges (energy grows each step), leapfrog stays bounded.
-//    — This is the definitive property: leapfrog drift < euler drift always.
-//
-//  Test B (leapfrog absolute bound): lr < 1.0 pe leapfrog drift < 0.01
-//    — Small lr mein leapfrog almost perfectly conserves energy.
-//    — Euler drift grows exponentially with steps — no such bound.
-//
-//  OLD BUG: lr was sampled up to 0.20 but some generated (lr, steps) combos
-//  could have leapfrog also diverge when lr is near the stability boundary.
-//  FIX: lr strictly < 0.5 ensures leapfrog stable AND euler always worse.
-// ═══════════════════════════════════════════════════════════════
 static void rc8_leapfrog_vs_euler() {
-    // Property A: leapfrog drift < euler drift (strict lr range)
     rc::check("[RC8a] Leapfrog energy drift < Euler drift — lr in (0.01, 0.5)", []() {
-        // lr in (0.01, 0.50): leapfrog ALWAYS stable here (stability < 2.0)
-        // Euler ALWAYS unstable (diverges for any lr > 0).
         float lr = *rc::gen::map(
             rc::gen::inRange(1, 51),   // 1..50 → 0.01..0.50
             [](int v) { return v * 0.01f; }
@@ -507,7 +419,6 @@ static void rc8_leapfrog_vs_euler() {
         const float W0 = 1.0f, V0 = 0.0f;
         const float E0 = 0.5f * W0 * W0 + 0.5f * V0 * V0;  // = 0.5
 
-        // Explicit Euler — always diverges for ω=1 harmonic oscillator
         float W_e = W0, V_e = V0;
         for (int i = 0; i < steps; ++i) {
             float w_old = W_e, v_old = V_e;
@@ -517,7 +428,6 @@ static void rc8_leapfrog_vs_euler() {
         float E_euler = 0.5f * W_e * W_e + 0.5f * V_e * V_e;
         float euler_drift = std::abs(E_euler - E0) / E0;
 
-        // Leapfrog / Störmer-Verlet — symplectic, energy bounded for lr < 2.0
         float W_l = W0, V_l = V0;
         for (int i = 0; i < steps; ++i) {
             V_l -= (lr * 0.5f) * W_l;
@@ -529,13 +439,10 @@ static void rc8_leapfrog_vs_euler() {
 
         RC_ASSERT(std::isfinite(euler_drift));
         RC_ASSERT(std::isfinite(lf_drift));
-        // Leapfrog symplectic → drift always finite and bounded
         RC_ASSERT(lf_drift < 1.0f);          // leapfrog stays near E0
-        // Euler diverges → drift > leapfrog
         RC_ASSERT(lf_drift < euler_drift);
     });
 
-    // Property B: small lr pe leapfrog near-perfect energy conservation
     rc::check("[RC8b] Leapfrog drift < 1% for small lr (< 0.1)", []() {
         float lr = *rc::gen::map(
             rc::gen::inRange(1, 11),   // 0.01..0.10
@@ -553,15 +460,10 @@ static void rc8_leapfrog_vs_euler() {
         float drift = std::abs(0.5f * W * W + 0.5f * V * V - E0) / E0;
 
         RC_ASSERT(std::isfinite(drift));
-        // Small lr leapfrog: drift < 1% (0.01)
-        // Mathematical bound: leapfrog modified Hamiltonian error ~ O(lr²)
         RC_ASSERT(drift < 0.01f);
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  MAIN
-// ═══════════════════════════════════════════════════════════════
 int main() {
     std::cout << "╔══════════════════════════════════════════════════╗\n";
     std::cout << "║  LOGOS — RapidCheck Property-Based Tests         ║\n";

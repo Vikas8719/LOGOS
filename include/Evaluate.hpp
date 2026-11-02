@@ -1,7 +1,4 @@
 #pragma once
-// ============================================================
-//  LOGOS — Evaluate.hpp  v5 — FINAL FIX
-// ============================================================
 #include "Tensor.hpp"
 #include "Model.hpp"
 #include "DataLoader.hpp"
@@ -19,9 +16,6 @@ struct EvalResult {
     int   total_tokens;
 };
 
-// ── Shared implementation ─────────────────────────────────────
-// Called by both overloads. Iterates next_batch until done or
-// max_batches reached. Loader must already be reset by caller.
 namespace logos_eval {
 inline EvalResult run(LOGOSModel& model,
                       DataLoader& loader,
@@ -59,20 +53,17 @@ inline EvalResult run(LOGOSModel& model,
 }
 } // namespace logos_eval
 
-// ── Overload A: DataLoader ────────────────────────────────────
 inline EvalResult evaluate(LOGOSModel& model,
                            DataLoader& loader,
                            int max_batches = 50)
 {
-    loader.current_pos = 0;
+    if (loader.streaming)
+        loader.reset_stream();
+    else
+        loader.current_pos = 0;
     return logos_eval::run(model, loader, max_batches);
 }
 
-// ── Overload B: UnifiedDataLoader ────────────────────────────
-// UnifiedDataLoader wraps DataLoader + StreamingDataLoader.
-// It exposes .reset() and .next_batch() — but next_batch() is
-// defined on the outer UnifiedDataLoader, not on DataLoader.
-// So we implement this overload separately with its own loop.
 inline EvalResult evaluate(LOGOSModel& model,
                            UnifiedDataLoader& loader,
                            int max_batches = 50)
@@ -109,8 +100,6 @@ inline EvalResult evaluate(LOGOSModel& model,
     return r;
 }
 
-// ── evaluate_unified: alias kept for backward compat ─────────
-// (old main.cpp versions that called evaluate_unified still work)
 inline EvalResult evaluate_unified(LOGOSModel& model,
                                    UnifiedDataLoader& loader,
                                    int max_batches = 50)

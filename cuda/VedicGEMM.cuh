@@ -6,23 +6,7 @@
 #include <cstdio>
 #include <cmath>
 
-// ============================================================
-//  CudaPtr<T> — RAII smart pointer for raw GPU memory
-//  Replaces bare cudaMalloc/cudaFree patterns that leak on exceptions.
-//
-//  Usage:
-//    CudaPtr<float>  d_buf(n);         // alloc n floats, zero-init
-//    CudaPtr<int8_t> d_i8(n, false);   // alloc without zeroing
-//    float* raw = d_buf.get();          // raw ptr for kernel calls
-//    T val = d_scalar.scalar();         // single value device->host
-//    // auto freed at scope exit — even on exception / early return
-//
-//  Rules:
-//    - Non-copyable (like unique_ptr)
-//    - Movable
-//    - .get() returns raw device ptr
-//    - Destructor calls cudaFree — never throws
-// ============================================================
+
 template<typename T>
 struct CudaPtr {
     T*  ptr  = nullptr;
@@ -82,7 +66,6 @@ struct CudaPtr {
     void to_host(T* dst, int n) const {
         cudaMemcpy(dst, ptr, (size_t)n * sizeof(T), cudaMemcpyDeviceToHost);
     }
-    // Single scalar device->host (for reduction outputs)
     T scalar() const {
         T val{};
         cudaMemcpy(&val, ptr, sizeof(T), cudaMemcpyDeviceToHost);
@@ -91,10 +74,7 @@ struct CudaPtr {
 
     bool empty() const { return ptr == nullptr || size == 0; }
 
-    // [v27-MEM2-FIX] release(): ownership transfer ke liye (unique_ptr::release() jaisa).
-    // Caller raw ptr ka ownership leta hai — CudaPtr nullptr ho jaata hai, destructor free nahi karega.
-    // Use case: CudaPtr<int8_t> mein alloc karo, quantize karo, phir NikhilamTensor ko do.
-    // Agar quantize fail ho to CudaPtr destructor cleanup karta hai; success pe caller owns it.
+    
     T* release() noexcept {
         T* p = ptr;
         ptr  = nullptr;
@@ -132,7 +112,6 @@ private:
         } \
     } while(0)
 
-// RAII GPU float32 tensor
 struct GPUTensor {
     float* data = nullptr;
     int rows = 0, cols = 0, size = 0;
@@ -158,7 +137,6 @@ struct GPUTensor {
     bool valid() const { return data != nullptr && size > 0; }
 };
 
-// Vedic sutram verify result: sum(C) vs dot(col_sums_A, row_sums_B)
 struct VedicVerifyResult {
     float checksum_C;
     float checksum_vedic;
@@ -166,7 +144,6 @@ struct VedicVerifyResult {
     bool  pass;
 };
 
-// Free energy loss result per batch step
 struct FreeEnergyResult {
     float cross_entropy;
     float entropy;
@@ -187,7 +164,6 @@ void  cuda_layernorm(const GPUTensor& X, const GPUTensor& gamma, const GPUTensor
 void  cuda_gelu(GPUTensor& data);
 float cuda_clip_gradients(std::vector<GPUTensor*>& grads, float max_norm);
 
-// add_bias_kernel defined in VedicGEMM.cu — declared here for cross-file launch in ModelGPU.cu
 extern __global__ void add_bias_kernel(float* __restrict__ C, const float* __restrict__ bias, int M, int N);
 
 VedicVerifyResult cuda_vedic_verify(const GPUTensor& A, const GPUTensor& B, const GPUTensor& C, float tolerance = 0.01f);
@@ -215,24 +191,7 @@ __global__ void shm_hybrid_kernel(
 
 std::string validate_model_config(int d_model, int num_heads, int num_layers, int vocab_size, int max_seq_len);
 
-// ============================================================
-//  [v31-FLASH] Flash Attention — O(seq) memory, no seq×seq tensor
-//  Tiled SRAM computation: Q,K,V tiles → output directly
-//  Eliminates: scores[seq×seq] = 256MB per head for seq=8192
-//
-//  Parameters:
-//    Q, K, V  : raw device ptrs [seq × DH] float32
-//    out      : raw device ptr  [seq × DH] float32 (pre-allocated)
-//    attn_ptr : if non-null, saved attn_probs for backward [seq × seq]
-//               (set to nullptr to skip — pure inference / no backward needed)
-//    seq      : sequence length
-//    DH       : head dimension
-//    scale    : 1/sqrt(DH)
-//    causal   : true = causal mask (training), false = full attn (inference)
-//    shunyam  : true = sparse window attention mask
-//    window   : shunyam window size
-//    stride   : shunyam stride
-// ============================================================
+
 void cuda_flash_attention_fwd(
     const float* Q, const float* K, const float* V,
     float* out,
@@ -242,12 +201,7 @@ void cuda_flash_attention_fwd(
     bool causal,
     bool shunyam, int window, int stride);
 
-// FP16/FP32 conversion and mixed precision GEMM (H100 Tensor Core)
-// [BUG4-FIX] cuda_cast_fp32_to_fp16 / cuda_cast_fp16_to_fp32 declarations REMOVED —
-// MixedPrecision.cuh mein inline definitions hain (cuda_ prefix wrappers).
-// Duplicate declaration → ambiguous call error at link time.
-// train_gpu.cu #includes MixedPrecision.cuh AFTER VedicGEMM.cuh, isliye definitions
-// wahan se milti hain — yahan redeclaration ki zarurat nahi.
+
 void cuda_gemm_fp16_fp32out(const __half* A, int M, int K, const __half* B, int N, float* C, float alpha=1.f, float beta=0.f);
 void cuda_gemm_fp16_fp16out(const __half* A, int M, int K, const __half* B, int N, __half* C, float alpha=1.f, float beta=0.f);
 void cuda_layernorm_fp16(const __half* X, const float* gamma, const float* beta, __half* Y, int seq, int d, float eps=1e-5f);

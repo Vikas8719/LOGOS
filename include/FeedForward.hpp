@@ -1,7 +1,4 @@
 #pragma once
-// ============================================================
-//  LOGOS — FeedForward.hpp
-// ============================================================
 #include "Tensor.hpp"
 #include "VedicGEMM.hpp"
 #include <cmath>
@@ -19,7 +16,6 @@ struct FeynmanDropout {
     bool  training = true;
 
     mutable std::mt19937 rng;
-    // Gamma distribution samplers (for Beta via ratio method)
     mutable std::gamma_distribution<float> gamma_alive;   // Gamma(α=(1-p)ħ, 1)
     mutable std::gamma_distribution<float> gamma_dead;    // Gamma(β=pħ,   1)
 
@@ -29,14 +25,7 @@ struct FeynmanDropout {
           gamma_dead (std::max(1e-3f,           dropout_p  * hbar_), 1.0f)
     {}
 
-    // Sample one path-integral weight for a single neuron
-    // Returns a value in [0,1] drawn from Beta((1-p)ħ, pħ)
-    // Near ħ→0: approaches Bernoulli(1-p)
-    // Large ħ:   concentrates around the mean (1-p)
     float sample_weight() const {
-        // std::gamma_distribution loses precision for very small shape values.
-        // The limiting distribution is exactly Bernoulli(1-p), so sample that
-        // limit directly before the Gamma ratio becomes numerically degenerate.
         if (hbar <= 0.05f) {
             std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
             return uniform(rng) < p ? 0.0f : 1.0f;
@@ -48,9 +37,6 @@ struct FeynmanDropout {
         return x / total;                     // Beta(α,β) via ratio method
     }
 
-    // Forward pass with Feynman path integral dropout
-    // In training mode: each activation weighted by a Beta-drawn amplitude
-    // In eval mode:     identity (return X unchanged)
     Tensor forward(const Tensor& X) const {
         if (!training || p <= 0.0f) return X;  // eval or p=0 → identity
 
@@ -64,8 +50,6 @@ struct FeynmanDropout {
         return Y;
     }
 
-    // Update ħ during training (e.g., anneal from quantum → classical)
-    // hbar_new → 0 makes dropout sharper (classical limit)
     void set_hbar(float hbar_new) {
         hbar = std::max(1e-3f, hbar_new);
         gamma_alive = std::gamma_distribution<float>(
@@ -74,7 +58,6 @@ struct FeynmanDropout {
             std::max(1e-3f,    p*hbar),     1.0f);
     }
 
-    // Convenience: current mean weight (should ≈ 1-p regardless of ħ)
     float mean_weight() const { return 1.0f - p; }
 };
 
@@ -82,10 +65,6 @@ struct FeedForward {
     Tensor W1, b1, W2, b2;
     int d_model, d_ff;
 
-    // [WIRED] FeynmanDropout was defined above but never called from
-    // forward(). It's now a real member, applied after GELU (the
-    // standard placement for Transformer FFN dropout — between the
-    // activation and the down-projection).
     bool  use_dropout;
     FeynmanDropout dropout;
 
@@ -107,8 +86,6 @@ struct FeedForward {
         b1.zero(); b2.zero();
     }
 
-    // is_training: forwarded into FeynmanDropout so eval/generate runs
-    // get the identity path (no dropout), matching standard practice.
     Tensor forward(const Tensor& X, bool is_training = true) {
         Tensor H = vedic_gemm_bias(X, W1, b1);
         for (float& v : H.data) v = gelu(v);

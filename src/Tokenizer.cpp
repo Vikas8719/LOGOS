@@ -1,25 +1,4 @@
-// ============================================================
-//  LOGOS — Tokenizer.cpp
-//  BPE (Byte Pair Encoding) Tokenizer
-//  Text → Token IDs (same vocab.bin training + inference mein)
-//
-//  Pipeline:
-//    1. Character-level vocabulary build karo
-//    2. Most frequent adjacent pairs merge karo (BPE)
-//    3. vocab.bin mein save karo (magic header + version + size check)
-//    4. Encode: text → vector<int>
-//    5. Decode: vector<int> → text
-//
-//  SECURITY FIX (vocab.bin header/version/size validation):
-//    Pehle: koi magic/version nahi tha — corrupt/wrong file silently
-//           load hoti thi aur OOB reads + bad_alloc possible the.
-//    Ab:
-//      - 4-byte magic: "LGVB" (LOGOS Vocab Binary)
-//      - 2-byte version: VOCAB_VERSION (currently 1)
-//      - 4-byte expected_n: save ke waqt ka vocab size
-//      - Load par: magic, version, n bounds — teeno check hote hain
-//        kisi bhi mismatch par load fail hota hai (no silent corruption)
-// ============================================================
+
 
 #include "../include/Tensor.hpp"
 #include <string>
@@ -33,62 +12,56 @@
 #include <cassert>
 #include <cstring>
 
-// ── vocab.bin binary format constants ────────────────────────
-static constexpr char     VOCAB_MAGIC[4] = {'L','G','V','B'};  // "LGVB"
+
+static constexpr char     VOCAB_MAGIC[4] = {'L','G','V','B'};  
 static constexpr uint16_t VOCAB_VERSION  = 1;
 
-// ── Special tokens ────────────────────────────────────────────
-static constexpr int TOKEN_UNK = 0;   // Unknown
-static constexpr int TOKEN_BOS = 1;   // Beginning of sequence
-static constexpr int TOKEN_EOS = 2;   // End of sequence
-static constexpr int TOKEN_PAD = 3;   // Padding
+static constexpr int TOKEN_UNK = 0;   
+static constexpr int TOKEN_BOS = 1;   
+static constexpr int TOKEN_EOS = 2;  
+static constexpr int TOKEN_PAD = 3;   
 
 class Tokenizer {
 public:
-    // vocab: token_string → id
+   
     std::unordered_map<std::string, int> vocab;
-    // id → token_string (for decode)
+   
     std::vector<std::string> id_to_token;
-    // BPE merge rules: (a, b) → merged_id
+    
     std::vector<std::pair<std::string,std::string>> merges;
 
     int vocab_size = 0;
-    static constexpr int MAX_VOCAB        = 8192;   // 10M model ke liye enough
-    static constexpr int MAX_TOKEN_LEN    = 4096;   // single token max bytes
+    static constexpr int MAX_VOCAB        = 8192;   
+    static constexpr int MAX_TOKEN_LEN    = 4096;   
     static constexpr int MAX_MERGE_COUNT  = MAX_VOCAB * 4;
 
-    // ── Build vocabulary from text ────────────────────────────
     void build(const std::string& text, int target_vocab = 4096) {
         vocab.clear();
         id_to_token.clear();
         merges.clear();
 
-        // Special tokens pehle
         add_token("<UNK>");  // 0
         add_token("<BOS>");  // 1
         add_token("<EOS>");  // 2
         add_token("<PAD>");  // 3
 
-        // Character-level base vocab (UTF-8 bytes 0-255)
         for (int c = 0; c < 256; ++c) {
             std::string ch(1, static_cast<char>(c));
             if (vocab.find(ch) == vocab.end())
                 add_token(ch);
         }
 
-        // Tokenize text into char sequences (word-level split first)
         std::vector<std::vector<std::string>> word_tokens;
         std::istringstream iss(text);
         std::string word;
         while (iss >> word) {
             std::vector<std::string> chars;
-            chars.push_back(" ");   // GPT-2 style: space prefix
+            chars.push_back(" ");   
             for (char c : word)
                 chars.push_back(std::string(1, c));
             word_tokens.push_back(chars);
         }
 
-        // BPE merge loop
         while (vocab_size < target_vocab) {
             std::map<std::pair<std::string,std::string>, int> pair_freq;
             for (const auto& seq : word_tokens) {
@@ -123,7 +96,7 @@ public:
         std::cout << "✅ Tokenizer built: vocab_size=" << vocab_size << "\n";
     }
 
-    // ── Encode: string → token IDs ────────────────────────────
+  
     std::vector<int> encode(const std::string& text, int max_len = 512) const {
         std::vector<int> ids;
         ids.push_back(TOKEN_BOS);
@@ -150,10 +123,10 @@ public:
             }
 
             for (const auto& tok : seq) {
-                // ── SECURITY: token ID bounds strict check ──
+               
                 auto it = vocab.find(tok);
                 int id = (it != vocab.end()) ? it->second : TOKEN_UNK;
-                // Clamp: id must be in [0, vocab_size)
+                
                 if (id < 0 || id >= vocab_size) id = TOKEN_UNK;
                 ids.push_back(id);
                 if ((int)ids.size() >= max_len - 1) break;
@@ -165,12 +138,10 @@ public:
         return ids;
     }
 
-    // ── Decode: token IDs → string ────────────────────────────
     std::string decode(const std::vector<int>& ids) const {
         std::string result;
         for (int id : ids) {
             if (id == TOKEN_BOS || id == TOKEN_EOS || id == TOKEN_PAD) continue;
-            // ── SECURITY: strict OOB check before indexing ──
             if (id >= 0 && id < (int)id_to_token.size())
                 result += id_to_token[id];
             else
@@ -180,19 +151,21 @@ public:
         return result;
     }
 
-    // ── Save vocab to binary file ─────────────────────────────
-    // Format (v1):
-    //   [4]  magic     = "LGVB"
-    //   [2]  version   = VOCAB_VERSION (uint16_t, little-endian)
-    //   [4]  n         = vocab token count (int)
-    //   [4]  m         = merge rule count (int)
-    //   then token entries: [4 len][len bytes] * n
-    //   then merge entries: [4 la][la bytes][4 lb][lb bytes] * m
+    
     bool save(const std::string& path = "vocab.bin") const {
+        if (path.empty() || path.find('\0') != std::string::npos) {
+            std::cerr << "❌ save(): invalid path\n"; return false;
+        }
+        {
+            std::string norm = path;
+            for (char& c : norm) if (c == '\\') c = '/';
+            std::string seg; std::istringstream ss(norm);
+            while (std::getline(ss, seg, '/'))
+                if (seg == "..") { std::cerr << "❌ save(): path traversal rejected: " << path << "\n"; return false; }
+        }
         std::ofstream f(path, std::ios::binary);
         if (!f) { std::cerr << "Cannot open " << path << "\n"; return false; }
 
-        // ── Header ──
         f.write(VOCAB_MAGIC, 4);
         f.write(reinterpret_cast<const char*>(&VOCAB_VERSION), sizeof(uint16_t));
 
@@ -201,14 +174,12 @@ public:
         f.write(reinterpret_cast<const char*>(&n), sizeof(int));
         f.write(reinterpret_cast<const char*>(&m), sizeof(int));
 
-        // ── Token table ──
         for (const auto& tok : id_to_token) {
             int len = (int)tok.size();
             f.write(reinterpret_cast<const char*>(&len), sizeof(int));
             f.write(tok.data(), len);
         }
 
-        // ── Merge table ──
         auto write_str = [&](const std::string& s) {
             int l = (int)s.size();
             f.write(reinterpret_cast<const char*>(&l), sizeof(int));
@@ -225,15 +196,21 @@ public:
         return true;
     }
 
-    // ── Load vocab from binary file ───────────────────────────
-    // SECURITY: magic, version, n, len — sab validate karte hain
-    // Pehle: koi validation nahi — corrupt file pe bad_alloc / OOB possible
-    // Ab:    strict checks, kisi bhi mismatch par early return false
+    
     bool load(const std::string& path = "vocab.bin") {
+        if (path.empty() || path.find('\0') != std::string::npos) {
+            std::cerr << "❌ load(): invalid path\n"; return false;
+        }
+        {
+            std::string norm = path;
+            for (char& c : norm) if (c == '\\') c = '/';
+            std::string seg; std::istringstream ss(norm);
+            while (std::getline(ss, seg, '/'))
+                if (seg == "..") { std::cerr << "❌ load(): path traversal rejected: " << path << "\n"; return false; }
+        }
         std::ifstream f(path, std::ios::binary);
         if (!f) { std::cerr << "❌ Cannot open " << path << "\n"; return false; }
 
-        // ── Magic check ──
         char magic[4] = {};
         f.read(magic, 4);
         if (!f || std::memcmp(magic, VOCAB_MAGIC, 4) != 0) {
@@ -245,7 +222,6 @@ public:
             return false;
         }
 
-        // ── Version check ──
         uint16_t version = 0;
         f.read(reinterpret_cast<char*>(&version), sizeof(uint16_t));
         if (!f || version != VOCAB_VERSION) {
@@ -256,7 +232,6 @@ public:
             return false;
         }
 
-        // ── n (token count) validate ──
         int n = 0, m = 0;
         f.read(reinterpret_cast<char*>(&n), sizeof(int));
         f.read(reinterpret_cast<char*>(&m), sizeof(int));
@@ -275,7 +250,6 @@ public:
             return false;
         }
 
-        // ── Token table ──
         id_to_token.clear();
         id_to_token.reserve(n);
         vocab.clear();
@@ -299,7 +273,6 @@ public:
             vocab[tok] = i;
         }
 
-        // ── Merge table ──
         merges.resize(m);
         auto read_str = [&](std::string& s) -> bool {
             int l = 0;
@@ -335,7 +308,7 @@ private:
     }
 };
 
-// ── Quick Test (compile with -DLOGOS_TEST_TOKENIZER) ─────────
+
 #ifdef LOGOS_TEST_TOKENIZER
 int main() {
     Tokenizer tok;
