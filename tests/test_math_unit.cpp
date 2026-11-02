@@ -2625,7 +2625,7 @@ void test_m29_survived_mutant_kills() {
         TEST("Langevin anneal ratio=0 -> T near T_start (kills ratio formula mutation)",
              T_start > T_end_val);
         TEST("Langevin anneal ratio=1 -> T near T_end (kills cos_v formula mutation)",
-             T_end_val <= 1e-4f);
+             T_end_val <= T_MIN_FLOOR + 1e-6f);
 
         opt.current_step = 50;
         opt.anneal();
