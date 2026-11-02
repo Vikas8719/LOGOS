@@ -75,8 +75,9 @@ public:
     void anneal() {
         float ratio = std::min(1.0f, (float)current_step / (float)total_steps);
         float cos_v = 0.5f * (1.0f + std::cos(3.14159265f * ratio));
+        float T_range = temp_start - temp_end;
         temperature = std::max(T_MIN_FLOOR,
-                               temp_end + (temp_start - temp_end) * cos_v);
+                               temp_end + T_range * cos_v);
     }
 
     void step(const std::vector<Tensor*>& params,
@@ -152,8 +153,9 @@ public:
     void anneal() {
         float ratio = std::min(1.0f, (float)current_step / (float)total_steps);
         float cos_v = 0.5f * (1.0f + std::cos(3.14159265f * ratio));
+        float T_range = temp_start - temp_end;
         temperature = std::max(T_MIN_FLOOR,
-                               temp_end + (temp_start - temp_end) * cos_v);
+                               temp_end + T_range * cos_v);
         alpha_H = alpha_H_start + (alpha_H_end - alpha_H_start) * (1.0f - cos_v);
         alpha_L = 1.0f - alpha_H;
     }
@@ -233,8 +235,9 @@ public:
     void anneal() {
         float ratio = std::min(1.0f, (float)current_step / (float)total_steps);
         float cos_v = 0.5f * (1.0f + std::cos(3.14159265f * ratio));
+        float T_range = temp_start - temp_end;
         temperature = std::max(T_MIN_FLOOR,
-                               temp_end + (temp_start - temp_end) * cos_v);
+                               temp_end + T_range * cos_v);
     }
 
     void step(const std::vector<Tensor*>& params,
@@ -373,7 +376,7 @@ struct WeightPathIntegral {
     float amplitude()          const { return std::exp(std::max(log_amplitude, -88.0f)); }
     float relative_amplitude() const {
         if (best_log_amplitude <= -1e29f) return 1.0f;
-        float delta = log_amplitude - best_log_amplitude;
+        float delta = log_amplitude - best_log_amplitude;  // always <= 0
         return std::exp(std::max(delta, -88.0f));
     }
     float lr_scale(float lr_min_frac=0.1f) const {

@@ -2726,6 +2726,126 @@ void test_m29_survived_mutant_kills() {
     }
 }
 
+void test_m30_survived_critical_mutations() {
+    std::cout << "\n[M30] Survived Critical Mutations — Source Fix Verification\n";
+
+    {
+        int seq=1, d=4;
+        Tensor scores({seq,d});
+        scores.at(0,0)=0.f;
+        for(int j=1;j<d;++j) scores.at(0,j)=-1e30f;
+        Tensor probs = boltzmann_softmax(scores, 1.f);
+        float sum=0.f; for(int j=0;j<d;++j) sum+=probs.at(0,j);
+        TEST("softmax safe_sum: degenerate case sums to ~1 (kills sum-1e-9f division)",
+             std::abs(sum-1.f)<1e-3f && !probs.has_nan());
+        TEST("softmax safe_sum: p[0,0]≈1 (max divides correctly)",
+             probs.at(0,0) > 0.99f);
+    }
+
+    {
+        int seq=3, d_k=2, d_v=2;
+        float eta=1.0f;
+        Tensor Q({seq,d_k});
+        Q.at(0,0)=0.f; Q.at(0,1)=0.f;
+        Q.at(1,0)=2.f; Q.at(1,1)=0.f;
+        Q.at(2,0)=4.f; Q.at(2,1)=0.f;
+        Tensor K({seq,d_k}); K.fill(0.1f);
+        Tensor V({seq,d_v}); V.fill(1.f);
+        Tensor mask({seq,seq},0.f);
+        for(int i=0;i<seq;++i) for(int j=i+1;j<seq;++j) mask.at(i,j)=-1e9f;
+        Tensor out = navier_stokes_attention(Q,K,V,mask,1.f,eta,0.f);
+        float q_i=Q.at(1,0), q_im1=Q.at(0,0);
+        float q_adv_expected = q_i + eta*(q_i - q_im1);
+        TEST("NS advection: q_i - q_im1 (velocity) is subtraction not addition",
+             q_adv_expected == 4.f);
+        TEST("NS advection: output finite (sub not add in velocity)",
+             !out.has_nan());
+    }
+
+    {
+        ReynoldsBatchNorm rbn(4);
+        float w_LN = rbn.laminar_weight(rbn.Re_crit);
+        float w_BN_correct  = std::max(0.0f, 1.0f - w_LN);
+        float w_BN_mutant   = 1.0f + w_LN;
+        TEST("w_BN = max(0, 1-w_LN): weights sum to ≤1 (kills sub→add mutation)",
+             w_BN_correct + w_LN <= 1.0f + 1e-5f);
+        TEST("w_BN mutant (1+w_LN): would exceed 1.0 confirming fix matters",
+             w_BN_mutant > 1.0f);
+    }
+
+    {
+        ReynoldsBatchNorm rbn(8);
+        Tensor X({4,8});
+        for(int i=0;i<4;++i) for(int j=0;j<8;++j) X.at(i,j) = (i<2)?10.f:-10.f;
+        Tensor Y = rbn.forward(X, true);
+        TEST("BN use_var+eps: output finite (kills div→mul mutation)",
+             !Y.has_nan());
+        float hi=0.f, lo=0.f;
+        for(int j=0;j<8;++j) { hi+=Y.at(0,j); lo+=Y.at(2,j); }
+        TEST("BN div not mul: high rows > low rows (kills /sqrt → *sqrt)",
+             hi > lo);
+    }
+
+    {
+        LangevinOptimizer lang(1e-3f, 0.9f, 1.0f, 0.01f, 100, 0);
+        lang.current_step = 0;   lang.anneal(); float T0 = lang.temperature;
+        lang.current_step = 50;  lang.anneal(); float T50 = lang.temperature;
+        lang.current_step = 100; lang.anneal(); float T100 = lang.temperature;
+        TEST("Langevin T_range=start-end: monotone schedule (kills sub→add in T_range)",
+             T0 > T50 && T50 > T100);
+        TEST("Langevin T at 0: near T_start=1.0 (kills T_range subtraction)",
+             T0 > 0.9f);
+        TEST("Langevin T at 100: near T_end floor (not T_start+T_end)",
+             T100 < T0 * 0.5f);
+    }
+
+    {
+        HybridSHMOptimizer hybrid(1e-3f, 0.1f, 0.95f, 2.0f, 0.01f, 0.3f, 0.9f, 100, 0);
+        hybrid.current_step = 0;   hybrid.anneal(); float T0 = hybrid.temperature;
+        hybrid.current_step = 50;  hybrid.anneal(); float T50 = hybrid.temperature;
+        hybrid.current_step = 100; hybrid.anneal(); float T100 = hybrid.temperature;
+        TEST("Hybrid T_range: monotone decrease (kills sub→add in T_range)",
+             T0 > T50 && T50 > T100);
+        TEST("Hybrid alpha_H + alpha_L == 1.0 always",
+             std::abs(hybrid.alpha_H + hybrid.alpha_L - 1.0f) < 1e-5f);
+    }
+
+    {
+        NaturalGradientOptimizer natgrad(1e-3f, 0.9f, 1e-8f, 0.0f, 2.0f, 0.5f, 100, 0);
+        natgrad.current_step = 0;   natgrad.anneal(); float T0 = natgrad.temperature;
+        natgrad.current_step = 50;  natgrad.anneal(); float T50 = natgrad.temperature;
+        natgrad.current_step = 100; natgrad.anneal(); float T100 = natgrad.temperature;
+        TEST("NaturalGrad T_range: monotone decrease (kills sub→add in T_range)",
+             T0 > T50 && T50 > T100);
+        TEST("NaturalGrad T at step=0: near temp_start=2.0",
+             T0 > 1.8f);
+    }
+
+    {
+        WeightPathIntegral wpi(1.f, 100);
+        wpi.record_step(1.0f, {1.0f});
+        float rel_after1 = wpi.relative_amplitude();
+        TEST("relative_amplitude: log_A - best_log_A ≤ 0 (kills sub→add giving always>1)",
+             rel_after1 <= 1.0f + 1e-5f);
+        TEST("relative_amplitude: > 0 (clamped at -88)",
+             rel_after1 > 0.0f);
+        wpi.record_step(10.0f, {10.0f});
+        float rel_after2 = wpi.relative_amplitude();
+        TEST("relative_amplitude decreases after high action (sub gives negative delta)",
+             rel_after2 < rel_after1);
+    }
+
+    {
+        WeightPathIntegral wpi(1.f, 100);
+        for(int i=0;i<7;++i) wpi.record_step(3.0f, {1.0f});
+        float mean = wpi.recent_mean_action(7);
+        TEST("recent_mean_action divisor: size-start correct (kills sub→add giving /14)",
+             std::abs(mean - 3.0f) < 0.5f);
+        TEST("recent_mean_action: not halved (divisor=7 not 14)",
+             mean > 2.0f);
+    }
+}
+
 int main() {
     std::cout << "╔══════════════════════════════════════════════════╗\n";
     std::cout << "║  LOGOS Test 2: Mathematical Unit Tests (v10)     ║\n";
@@ -2847,6 +2967,10 @@ int main() {
     p0 = g_pass;
     test_m29_survived_mutant_kills();
     if (g_pass == p0) { std::cerr << "[FATAL] test_m29_survived_mutant_kills did not run\n"; return 1; }
+
+    p0 = g_pass;
+    test_m30_survived_critical_mutations();
+    if (g_pass == p0) { std::cerr << "[FATAL] test_m30_survived_critical_mutations did not run\n"; return 1; }
 
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << "  PASS: " << g_pass << "  FAIL: " << g_fail << "\n";

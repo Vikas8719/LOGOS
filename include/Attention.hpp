@@ -23,8 +23,9 @@ inline Tensor boltzmann_softmax(const Tensor& scores, float temperature) {
             probs.at(i, j) = e;
             sum += e;
         }
+        float safe_sum = std::max(sum, 1e-9f);
         for (int j = 0; j < len; ++j)
-            probs.at(i, j) /= (sum + 1e-9f);
+            probs.at(i, j) /= safe_sum;
     }
     return probs;
 }
@@ -109,7 +110,8 @@ inline Tensor navier_stokes_attention(const Tensor& Q, const Tensor& K, const Te
         for (int j = 0; j < d_k; ++j) {
             float q_i   = Q.at(i, j);
             float q_im1 = (i > 0) ? Q.at(i-1, j) : q_i;  // boundary: no flow at i=0
-            Q_adv.at(i, j) = q_i + eta * (q_i - q_im1);
+            float q_vel = q_i - q_im1;
+            Q_adv.at(i, j) = q_i + eta * q_vel;
         }
     }
 

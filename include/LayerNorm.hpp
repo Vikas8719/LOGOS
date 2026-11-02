@@ -99,7 +99,7 @@ struct ReynoldsBatchNorm {
 
         float Re = reynolds_number(X);
         float w_LN = laminar_weight(Re);      // laminar weight
-        float w_BN = 1.0f - w_LN;            // turbulent weight
+        float w_BN = std::max(0.0f, 1.0f - w_LN);
 
         Tensor LN_out(X.shape);
         for (int i = 0; i < seq; ++i) {
@@ -140,7 +140,7 @@ struct ReynoldsBatchNorm {
         for (int i = 0; i < seq; ++i)
             for (int j = 0; j < dim; ++j)
                 BN_out.at(i,j) = (X.at(i,j) - use_mean[j])
-                                / std::sqrt(use_var[j] + eps);
+                                / std::sqrt(std::max(0.0f, use_var[j]) + eps);
 
         for (int i = 0; i < seq; ++i)
             for (int j = 0; j < dim; ++j)
