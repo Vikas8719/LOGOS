@@ -564,7 +564,8 @@ set_tests_properties("T8_Bench_Smoke" PROPERTIES
     TIMEOUT 300
     LABELS "BENCH"
     PASS_REGULAR_EXPRESSION "ALL.*PASS|0 above threshold"
-    FAIL_REGULAR_EXPRESSION "FAIL")
+    FAIL_REGULAR_EXPRESSION "FAIL"
+    REQUIRED_FILES "$<TARGET_FILE:logos_bench>")
 
 message(STATUS "✅ Benchmark target: logos_bench  (T8_Bench_Smoke)")
 message(STATUS "   Run:   cmake --build build --target logos_bench && ./build/logos_bench")
@@ -602,7 +603,8 @@ add_test(NAME "T9_Fuzz_Selftest" COMMAND logos_fuzz_selftest --selftest)
 set_tests_properties("T9_Fuzz_Selftest" PROPERTIES
     TIMEOUT 120
     LABELS "FUZZ"
-    PASS_REGULAR_EXPRESSION "All 13 fuzz targets smoke-tested OK")
+    PASS_REGULAR_EXPRESSION "All 13 fuzz targets smoke-tested OK"
+    REQUIRED_FILES "$<TARGET_FILE:logos_fuzz_selftest>")
 
 if(LOGOS_FUZZ)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
