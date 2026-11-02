@@ -709,6 +709,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install gcc-12, clang-15, LLVM-15, and MULL-15
+        id: mull_install
         run: |
           # ── gcc-12 PEHLE install karo ────────────────────────────
           sudo apt-get update -qq
@@ -757,9 +758,15 @@ jobs:
           echo "GCC-12 crtbeginS.o: $(g++-12 -print-file-name=crtbeginS.o)"
           clang++ --version | head -1
           mull-runner --version 2>&1 | head -1 || echo "mull-runner not available"
+          if mull-runner --version >/dev/null 2>&1 && command -v llvm-profdata-15 >/dev/null; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
 
 
       - name: Configure (MULL + Debug + clang++ + GCC-12 sysroot)
+        if: steps.mull_install.outputs.available == 'true'
         run: |
           GCC12_PREFIX=/usr
           echo "GCC-12 prefix: ${GCC12_PREFIX}"
@@ -793,12 +800,14 @@ jobs:
             -DMULL_PASS_PLUGIN="${MULL_PLUGIN}"
 
       - name: Build mutation targets
+        if: steps.mull_install.outputs.available == 'true'
         run: |
           cmake --build build \
             --target mull_math_unit mull_checkpoint \
             --parallel $(nproc)
 
       - name: Check mull-runner version + output format
+        if: steps.mull_install.outputs.available == 'true'
         run: |
           echo "=== mull-runner version ==="
           mull-runner --version 2>&1 || mull-runner -version 2>&1 || true
@@ -806,6 +815,7 @@ jobs:
           mull-runner --help 2>&1 | head -20 || true
 
       - name: Diagnose mull-runner + binaries
+        if: steps.mull_install.outputs.available == 'true'
         run: |
           echo "=== mull-runner full path ==="
           which mull-runner || echo "NOT IN PATH"
@@ -828,6 +838,7 @@ jobs:
 
       - name: Run MULL — test_math_unit (M1-M16)
         id: mull_math
+        if: steps.mull_install.outputs.available == 'true'
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/math build/mull-report/math-run
@@ -895,6 +906,7 @@ jobs:
 
       - name: Run MULL — test_checkpoint (T2b)
         id: mull_ckpt
+        if: steps.mull_install.outputs.available == 'true'
         continue-on-error: true
         run: |
           mkdir -p build/mull-report/checkpoint build/mull-report/checkpoint-run

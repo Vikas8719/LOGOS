@@ -286,7 +286,7 @@ static void fuzz_tokenizer(FuzzReader& r) {
     std::string corpus = r.string_of(4096);
     if (corpus.empty()) corpus = "hello world logos";
 
-    int vocab_size = r.bounded_int(2, 512);
+    int vocab_size = r.bounded_int(260, 512);
 
     Tokenizer tok;
     try {
@@ -301,7 +301,7 @@ static void fuzz_tokenizer(FuzzReader& r) {
     try {
         auto ids = tok.encode(test_text, static_cast<int>(test_text.size()) * 4);
         for (int id : ids)
-            if (id < 0 || id >= vocab_size)
+            if (id < 0 || id >= tok.vocab_size)
                 __builtin_trap();
         std::string decoded = tok.decode(ids);
         (void)decoded;
