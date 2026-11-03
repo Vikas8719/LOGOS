@@ -2752,26 +2752,26 @@ void test_m31_survived_mutant_targeted_kills() {
     {
         int seq = 4, d_k = 2, d_v = 2;
         Tensor Q({seq, d_k});
-        // Strongly increasing values so q_vel = Q[i] - Q[i-1] is large and positive.
-        // This makes Q_adv with eta=1 very different from Q itself (eta=0).
-        for (int i = 0; i < seq; ++i)
-            for (int j = 0; j < d_k; ++j)
-                Q.at(i, j) = (float)(i * 10 + j);  // rows: [0,1], [10,11], [20,21], [30,31]
-
-        // q_vel for row i = Q[i] - Q[i-1] = 10 (positive for all rows 1..seq-1)
-        // q_adv = q_i + eta * (q_i - q_im1)
-        // If mutant used +, q_vel = q_i + q_im1 → q_adv = q_i + eta*(q_i+q_im1) (different)
-        // We test that standard attention with eta=1 differs from eta=0 in the expected direction.
-        // K: identity-like so Q_adv dot K^T produces scores proportional to Q_adv.
-        // K: all-ones so Q_adv dot K^T produces scores = sum of Q_adv rows
-        // This makes score differences from advection directly visible.
-        Tensor K({seq, d_k}); K.fill(1.0f);
-        // V must have DIFFERENT values per row so the shift in attention weights
-        // from eta=1 vs eta=0 actually changes the output.
-        // Row 0 has large V; rows 1-3 have small V.
+        // col-0 large, col-1 negative: advection flips the score ordering
+        // Row 0: [4, -4], Row 1: [2, 2], Row 2: [3, 3], Row 3: [4, 4]
+        // q_vel[1] = [2-4, 2-(-4)] = [-2, 6]
+        // q_adv_eta1[1] = [2+(-2), 2+6] = [0, 8] → score[0]=K[j,0]*0, score[1]=K[j,1]*8
+        // q_adv_eta0[1] = [2, 2]            → score[0]=K[j,0]*2, score[1]=K[j,1]*2
+        // With K[0]=[1,0], K[1]=[0,1]: score[1,0]=0 vs 2, score[1,1]=8 vs 2 → weights flip!
+        Q.at(0,0)=4.0f; Q.at(0,1)=-4.0f;
+        Q.at(1,0)=2.0f; Q.at(1,1)=2.0f;
+        Q.at(2,0)=3.0f; Q.at(2,1)=3.0f;
+        Q.at(3,0)=4.0f; Q.at(3,1)=4.0f;
+        // K: asymmetric so each K row gives different dot product with Q_adv.
+        // K[0] = [1,0], K[1] = [0,1], K[2] = [1,0], K[3] = [0,1]
+        // With Q_adv[1] = [20,21] (eta=1) vs [10,11] (eta=0),
+        // score[1,0] = 20*1+21*0=20 vs 10; score[1,1] = 20*0+21*1=21 vs 11 → different weights
+        Tensor K({seq, d_k}); K.fill(0.0f);
+        K.at(0,0)=1.0f; K.at(1,1)=1.0f; K.at(2,0)=1.0f; K.at(3,1)=1.0f;
+        // V: rows 0 and 1 differ greatly so attention weight shift changes output.
         Tensor V({seq, d_v});
-        V.at(0,0)=100.0f; V.at(0,1)=100.0f;
-        V.at(1,0)=1.0f;   V.at(1,1)=1.0f;
+        V.at(0,0)=100.0f; V.at(0,1)=0.0f;
+        V.at(1,0)=0.0f;   V.at(1,1)=100.0f;
         V.at(2,0)=1.0f;   V.at(2,1)=1.0f;
         V.at(3,0)=1.0f;   V.at(3,1)=1.0f;
         Tensor mask({seq, seq}, 0.0f);
@@ -2803,7 +2803,13 @@ void test_m31_survived_mutant_targeted_kills() {
         // q_vel[1] = 5-20 = -15 (sub); q_vel[1] = 5+20 = 25 (add mutant) — large divergence
         // q_adv_sub[1,0]  = 5 + 1*(-15) = -10  → very negative score
         // q_adv_add[1,0]  = 5 + 1*(25)  =  30  → very positive score (mutant)
-        Tensor K2({seq2, d_k2}); K2.fill(1.0f);
+        Tensor K2({seq2, d_k2}); K2.fill(0.0f);
+        // Asymmetric K: K2[0]=[1,0], K2[1]=[0,1] repeating
+        // score[i,j] = Q_adv[i,0]*K2[j,0] + Q_adv[i,1]*K2[j,1]
+        // For row1 eta=1: q_adv=[−10,0]; score vs K2[0]=[1,0] → −10; vs K2[1]=[0,1] → 0
+        // For row1 eta=0: q_adv=[5,0];   score vs K2[0]=[1,0] → 5;   vs K2[1]=[0,1] → 0
+        // Weights differ drastically → output differs
+        K2.at(0,0)=1.0f; K2.at(1,1)=1.0f; K2.at(2,0)=1.0f; K2.at(3,1)=1.0f;
         // V2 must have different values so attention weight shift changes output.
         // Row 0 has very large V so when q_adv is very negative (sub case) for row 1,
         // row 1's score drops → it attends less to row 0 → lower output vs eta=0.
