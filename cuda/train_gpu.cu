@@ -1067,7 +1067,7 @@ void train_gpu(const std::string& dataset_path) {
     
     int EPOCHS=2;
     int64_t batches_per_epoch=loader.total_batches_per_epoch();
-    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS",150000.f);
+    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS", 500000.f);  // [v35] default 150k→500k (T4 ke liye kaafi)
     
     const int64_t start_step = resumed
         ? (int64_t)logos_env_f("LOGOS_START_STEP", 0.f)
@@ -1270,6 +1270,24 @@ void train_gpu(const std::string& dataset_path) {
            resumed?"YES":"NO", (long long)start_step, best_loss, (long long)total_steps);
     printf("  Config: d=%d L=%d H=%d seq=%d vocab=%d grad_accum=%d\n",
            cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size, grad_accum);
+    // [v35] Step-0 initial checkpoint — session crash ke baad bhi resume ho sake
+    if (!resumed && start_step == 0) {
+        printf("  [v35] Step-0 initial checkpoint save kar raha hoon (crash recovery ke liye)...\n");
+        CUDA_CHECK(cudaDeviceSynchronize());
+        gpu_model.sync_to_cpu(cpu_model);
+        save_checkpoint(cpu_model, "logos_gpu_ckpt", 0);
+        printf("  ✅ logos_gpu_ckpt_step0.bin saved\n");
+        fflush(stdout);
+    }
+    // [v35] Early-stop guard: agar step 0 pe hi total_steps==0 ho toh crash se bachao
+    if (total_steps <= start_step) {
+        printf("\n⚠️  [v35] total_steps=%lld <= start_step=%lld — kuch nahi karna!\n",
+               (long long)total_steps, (long long)start_step);
+        printf("     LOGOS_STEPS env var set karo: export LOGOS_STEPS=500000\n");
+        printf("     Ya LOGOS_START_STEP check karo agar resume kar rahe ho.\n");
+        return;
+    }
+
     int     vedic_checks=0, vedic_pass=0;
     char    vedic_status[8]="N/A";
 
