@@ -3432,18 +3432,23 @@ void test_m31_survived_mutant_targeted_kills() {
         // update with grad of exactly dim size
         Tensor g({1, dim}); g.data = {1.0f, 2.0f, 3.0f, 4.0f};
         rm.update(g, 0.0f);  // loop: for i < grad.total_size && i < dim
+        // After beta=0 update: metric_diag[i] = g[i]^2 = {1, 4, 9, 16}
         TEST("RiemannianMetric update: all dim elements updated (kills i<total_size→i<=OOB)",
              std::abs(rm.metric_diag[3] - 16.0f) < 1e-4f);
 
         // riemannian_gradient_at with offset: n = min(total_size, dim-offset)
+        // Use a FRESH RiemannianMetric with known metric_diag = {1, 2, 3, 4}
+        // so that G[offset+i] values are predictable.
         int offset = 1;
+        RiemannianMetric rm_off(dim, 0.0f);
+        rm_off.metric_diag = {1.0f, 2.0f, 3.0f, 4.0f};
         // n = min(4, 4-1) = 3; last elem i=3 NOT computed via G, falls to else branch
         Tensor g2({1, dim}); g2.data = {2.0f, 4.0f, 6.0f, 8.0f};
-        Tensor gnat = rm.riemannian_gradient_at(g2, offset);
-        // g_nat[0] = g[0]/(G[1]+0) = 2/2 = 1
-        // g_nat[1] = g[1]/(G[2]+0) = 4/3 ≈ 1.333
-        // g_nat[2] = g[2]/(G[3]+0) = 6/4 = 1.5
-        // g_nat[3] = g[3] (fallback, n=3)
+        Tensor gnat = rm_off.riemannian_gradient_at(g2, offset);
+        // g_nat[0] = g[0]/(G[0+1]+0) = 2/2 = 1
+        // g_nat[1] = g[1]/(G[1+1]+0) = 4/3 ≈ 1.333
+        // g_nat[2] = g[2]/(G[2+1]+0) = 6/4 = 1.5
+        // g_nat[3] = g[3] (fallback, n=3) = 8
         TEST("riemannian_gradient_at offset: first 3 from metric, last 1 raw (kills lt→le)",
              std::abs(gnat.data[0] - 1.0f) < 1e-4f);
         TEST("riemannian_gradient_at offset: g_nat[2]=6/4=1.5",
