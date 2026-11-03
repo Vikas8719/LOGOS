@@ -2752,6 +2752,8 @@ void test_m31_survived_mutant_targeted_kills() {
     {
         int seq = 4, d_k = 2, d_v = 2;
         Tensor Q({seq, d_k});
+        // Strongly increasing values so q_vel = Q[i] - Q[i-1] is large and positive.
+        // This makes Q_adv with eta=1 very different from Q itself (eta=0).
         for (int i = 0; i < seq; ++i)
             for (int j = 0; j < d_k; ++j)
                 Q.at(i, j) = (float)(i * 10 + j);  // rows: [0,1], [10,11], [20,21], [30,31]
@@ -2783,18 +2785,24 @@ void test_m31_survived_mutant_targeted_kills() {
         // q_adv[1,0] = Q[1,0] + 1.0*10 = 20  (sub case)
         // q_adv[1,0] = Q[1,0] + 1.0*(10+0) = 20  (add case gives same here)
         // Use asymmetric: row 1 has LOWER value than row 0.
-        Tensor Q2({seq, 1});
-        Q2.at(0,0) = 10.0f; Q2.at(1,0) = 2.0f; Q2.at(2,0) = 3.0f; Q2.at(3,0) = 4.0f;
-        // q_vel[1] = 2-10 = -8 (sub); q_vel[1] = 2+10 = 12 (add mutant)
-        // q_adv_sub[1]  = 2 + 1*(-8) = -6  (will be very negative → different score)
-        // q_adv_add[1]  = 2 + 1*12   = 14  (very positive)
-        Tensor K2({seq, 1}); K2.fill(1.0f);
-        Tensor V2({seq, 1}); V2.fill(1.0f);
-        Tensor mask2({seq, seq}, 0.0f);
-        for (int i=0; i<seq; ++i) for (int j=i+1; j<seq; ++j) mask2.at(i,j) = -1e9f;
+        // Use a multi-dimensional Q so that Q_adv drives score differences more strongly.
+        // With d_k=2, scores = Q_adv @ K^T, making the eta=1 vs eta=0 gap clearly visible.
+        int seq2 = 4, d_k2 = 2, d_v2 = 2;
+        Tensor Q2({seq2, d_k2});
+        // Decreasing first column: 20, 5, 6, 7  → q_vel[1,0] = 5-20 = -15 (sub), +25 (add mutant)
+        Q2.at(0,0) = 20.0f; Q2.at(0,1) = 0.0f;
+        Q2.at(1,0) =  5.0f; Q2.at(1,1) = 0.0f;
+        Q2.at(2,0) =  6.0f; Q2.at(2,1) = 0.0f;
+        Q2.at(3,0) =  7.0f; Q2.at(3,1) = 0.0f;
+        // q_vel[1] = 5-20 = -15 (sub); q_vel[1] = 5+20 = 25 (add mutant) — large divergence
+        // q_adv_sub[1,0]  = 5 + 1*(-15) = -10  → very negative score
+        // q_adv_add[1,0]  = 5 + 1*(25)  =  30  → very positive score (mutant)
+        Tensor K2({seq2, d_k2}); K2.fill(1.0f);
+        Tensor V2({seq2, d_v2}); V2.fill(1.0f);
+        Tensor mask2({seq2, seq2}, 0.0f);
+        for (int i=0; i<seq2; ++i) for (int j=i+1; j<seq2; ++j) mask2.at(i,j) = -1e9f;
         Tensor out_sub = navier_stokes_attention(Q2, K2, V2, mask2, 1.0f, 1.0f, 0.0f);
         TEST("NS advection sub: output finite for decreasing Q", !out_sub.has_nan());
-        // Can't easily verify without reimplementing, but can check it's non-trivially different
         Tensor out_sub0 = navier_stokes_attention(Q2, K2, V2, mask2, 1.0f, 0.0f, 0.0f);
         float diff2 = 0.0f;
         for (int i=0; i<out_sub.total_size; ++i) diff2 += std::abs(out_sub.data[i]-out_sub0.data[i]);
