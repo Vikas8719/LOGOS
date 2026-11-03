@@ -28,6 +28,11 @@ extern __global__ void grad_scale_kernel(float*, float, int);
 extern __global__ void vedic_gemm_kernel(const float*, const float*, float*, int, int, int);
 extern __global__ void boltzmann_softmax_kernel(const float*, float*, int, int, float);
 extern __global__ void causal_mask_kernel(float*, int);
+extern __global__ void shm_hybrid_kernel(float*, float*, const float*, float, float, float, float, float, float, unsigned int, int);
+extern __global__ void reynolds_bwd_kernel(const float*, const float*, const float*, const float*, const float*, const float*, float*, float*, float*, int, int, float);
+extern __global__ void ns_diffuse_bwd_kernel(const float*, float*, int, int, float);
+extern __global__ void ns_advect_bwd_kernel(const float*, float*, int, int, float);
+extern __global__ void expmap0_bwd_kernel(const float*, const float*, float*, int, int, float);
 
 
 static constexpr float GPU_T_MIN_FLOOR = 1e-3f;
@@ -1397,7 +1402,6 @@ void train_gpu(const std::string& dataset_path) {
             ckpt_freq = std::max((int64_t)100, std::min((int64_t)50000, ckpt_freq));  // clamp: [100, 50k]
 
             if (step % ckpt_freq == 0 && step > 0) {
-                              {
                 GPUTensor C_proxy = gpu_alloc(gpu_model.last_hidden.rows,
                                               gpu_model.gpu_lm_head.cols);
                 cuda_vedic_gemm(gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy);
@@ -1416,7 +1420,7 @@ void train_gpu(const std::string& dataset_path) {
                     printf("\n[Gunitasamuchayah] WARN @ step %lld err=%.4f (tol=%.2f)\n",
                            (long long)step, vr.relative_error, vedic_tol);
                 }
-                } 
+            }  // end: if (step % ckpt_freq == 0 && step > 0)
 
             
             int64_t log_freq_default = is_t4 ? 100LL : 500LL;
@@ -1802,7 +1806,7 @@ int main(int argc, char* argv[]) {
         std::string s(raw);
         if (s.find('\0')!=std::string::npos) return fb;
         if (s.find("..")!=std::string::npos) return fb;
-        if (!s.empty() && s[0]=='/') return fb;
+        // Note: absolute paths (starting with '/') are allowed for checkpoint paths
         if (s.empty()) return fb;
         return s;
     };
