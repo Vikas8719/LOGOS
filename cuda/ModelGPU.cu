@@ -852,9 +852,6 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
                 CUDA_CHECK(cudaMemcpy(hc.V_s.data,  hc.V.data,seq*DH*sizeof(float),cudaMemcpyDeviceToDevice));
             }
 
-           
-            /
-
             hc.head_out = gpu_alloc(seq, DH);
 
             float* attn_save_ptr = nullptr;

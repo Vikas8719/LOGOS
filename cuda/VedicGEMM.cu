@@ -25,6 +25,12 @@
 
 #define TILE_SIZE 16
 
+// hash32: GPU-side fast integer hash (needed by SHM/Langevin kernels)
+__device__ __forceinline__ unsigned int hash32(unsigned int x) {
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
 
 __global__ void vedic_gemm_kernel(
     const float* __restrict__ A,
