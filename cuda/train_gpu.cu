@@ -1067,7 +1067,7 @@ void train_gpu(const std::string& dataset_path) {
     
     int EPOCHS=2;
     int64_t batches_per_epoch=loader.total_batches_per_epoch();
-    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS", 500000.f);  // [v35] default 150k→500k (T4 ke liye kaafi)
+    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS", 20.f);  // [v36-TEST] default=20 steps (testing ke liye) — production ke liye set karo LOGOS_STEPS=500000
     
     const int64_t start_step = resumed
         ? (int64_t)logos_env_f("LOGOS_START_STEP", 0.f)
@@ -1415,9 +1415,9 @@ void train_gpu(const std::string& dataset_path) {
             if (step > start_step && (step - start_step) % 5000 == 0) gpu_path_integral.reset_best();
 
             
-            int64_t ckpt_freq_default = is_h100 ? 5000LL : 2000LL;  // [v33] T4: 1000→2000
+            int64_t ckpt_freq_default = is_h100 ? 5000LL : is_a100 ? 3000LL : 50LL;  // [v36-TEST] T4 testing: 500→50
             int64_t ckpt_freq = (int64_t)logos_env_f("LOGOS_CKPT_FREQ", (float)ckpt_freq_default);
-            ckpt_freq = std::max((int64_t)100, std::min((int64_t)50000, ckpt_freq));  // clamp: [100, 50k]
+            ckpt_freq = std::max((int64_t)1, std::min((int64_t)50000, ckpt_freq));
 
             if (step % ckpt_freq == 0 && step > 0) {
                 GPUTensor C_proxy = gpu_alloc(gpu_model.last_hidden.rows,
@@ -1441,9 +1441,9 @@ void train_gpu(const std::string& dataset_path) {
             }  // end: if (step % ckpt_freq == 0 && step > 0)
 
             
-            int64_t log_freq_default = is_t4 ? 100LL : 500LL;
+            int64_t log_freq_default = 1LL;  // [v36-TEST] har step pe log — testing ke liye
             int64_t log_freq = (int64_t)logos_env_f("LOGOS_LOG_FREQ", (float)log_freq_default);
-            log_freq = std::max((int64_t)10, std::min((int64_t)10000, log_freq));
+            log_freq = std::max((int64_t)1, std::min((int64_t)10000, log_freq));
 
             if (step % log_freq == 0) {
                 float cur_T, cur_aH, cur_aL;
