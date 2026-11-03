@@ -19,6 +19,9 @@
 #include <stdexcept>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>       // [v38-PARALLEL] std::thread
+#include <atomic>       // [v38-PARALLEL] atomic flags
+#include <mutex>        // [v38-PARALLEL] grad reduce lock
 
 
 
@@ -1379,107 +1382,135 @@ void train_gpu(const std::string& dataset_path) {
             float batch_F=0.f, batch_CE=0.f, batch_S=0.f;
             int   valid_mb=0;
 
-            // [v37-MULTIGPU] micro-batches split: even→GPU0, odd→GPU1
-            for (int mbi = 0; mbi < (int)micro_batches.size(); ++mbi) {
-                auto& [input_ids, target_ids] = micro_batches[mbi];
-                int seq=(int)input_ids.size();
+            // [v38-PARALLEL] GPU0 aur GPU1 ek saath chalein — true parallel
+            // micro_batches[0,2] → GPU0 thread | micro_batches[1,3] → GPU1 thread
+            struct MBResult {
+                float F=0.f, CE=0.f, S=0.f;
+                int valid=0;
+            };
+            MBResult res0, res1;
 
-                bool use_gpu1 = use_multi_gpu && gpu_model1 && (mbi % 2 == 1);
-                int target_device = use_gpu1 ? 1 : 0;
-                if (use_gpu1) cudaSetDevice(1);
+            // GPU0 ka kaam — main thread karta hai
+            auto run_on_gpu = [&](int gpu_id, ModelGPU& model,
+                                  std::vector<GPUTensor*>& grads,
+                                  MBResult& result)
+            {
+                cudaSetDevice(gpu_id);
+                // grad zero
+                for (auto* g : grads)
+                    cudaMemset(g->data, 0, g->size*sizeof(float));
 
-                ModelGPU&              cur_model  = use_gpu1 ? *gpu_model1 : gpu_model;
-                std::vector<GPUTensor*>& cur_grads = use_gpu1 ? gpu_grads1  : gpu_grads;
-                int*   cur_targets  = use_gpu1 ? nullptr : d_targets;   // GPU1 apna alloc karega
-                float* cur_loss_buf = use_gpu1 ? nullptr : d_loss_buf;
-                float* cur_grad_out = use_gpu1 ? nullptr : d_grad_out;
+                for (int mbi = gpu_id; mbi < (int)micro_batches.size(); mbi += 2) {
+                    auto& [input_ids, target_ids] = micro_batches[mbi];
+                    int seq = (int)input_ids.size();
 
-                // GPU1 ke liye local buffers
-                CudaPtr<int>*   d_vtgt1_ptr  = nullptr;
-                CudaPtr<float>* d_vloss1_ptr = nullptr;
-                CudaPtr<float>* d_vgrad1_ptr = nullptr;
-                std::unique_ptr<CudaPtr<int>>   d_vtgt1_owner;
-                std::unique_ptr<CudaPtr<float>> d_vloss1_owner;
-                std::unique_ptr<CudaPtr<float>> d_vgrad1_owner;
+                    // GPU1 ke liye local buffers
+                    CudaPtr<int>   loc_tgt(SEQ);
+                    CudaPtr<float> loc_loss(SEQ);
+                    CudaPtr<float> loc_grad((int64_t)SEQ * V);
 
-                if (use_gpu1) {
-                    d_vtgt1_owner  = std::make_unique<CudaPtr<int>>(SEQ);
-                    d_vloss1_owner = std::make_unique<CudaPtr<float>>(SEQ);
-                    d_vgrad1_owner = std::make_unique<CudaPtr<float>>((int64_t)SEQ * V);
-                    cur_targets  = d_vtgt1_owner->get();
-                    cur_loss_buf = d_vloss1_owner->get();
-                    cur_grad_out = d_vgrad1_owner->get();
+                    GPUTensor logits = model.forward(input_ids);
+
+                    cudaMemcpy(loc_tgt.get(), target_ids.data(),
+                               seq*sizeof(int), cudaMemcpyHostToDevice);
+                    cudaMemset(loc_loss.get(), 0, seq*sizeof(float));
+                    cudaMemset(loc_grad.get(), 0, seq*V*sizeof(float));
+
+                    FreeEnergyResult fe;
+                    cuda_free_energy_loss(logits.data, loc_tgt.get(),
+                                          loc_loss.get(), loc_grad.get(),
+                                          seq, V, optimizer.temperature, fe);
+
+                    GPUTensor logits_grad = gpu_alloc(SEQ, V);
+                    cudaMemcpy(logits_grad.data, loc_grad.get(),
+                               seq*V*sizeof(float), cudaMemcpyDeviceToDevice);
+
+                    if (isfinite(fe.free_energy) && fe.free_energy > 1e-8f) {
+                        result.F  += fe.free_energy;
+                        result.CE += fe.cross_entropy;
+                        result.S  += fe.entropy;
+                        ++result.valid;
+
+                        GPUTensor t_dX     = gpu_alloc(SEQ, D);
+                        GPUTensor t_ffnout = gpu_alloc(SEQ, D);
+                        GPUTensor t_ffnA   = gpu_alloc(SEQ, D4);
+                        GPUTensor t_ffnH   = gpu_alloc(SEQ, D4);
+                        GPUTensor t_n2     = gpu_alloc(SEQ, D);
+                        GPUTensor t_ln     = gpu_alloc(SEQ, D);
+                        GPUTensor t_attn   = gpu_alloc(SEQ, D);
+
+                        run_backward(model, cfg, grads,
+                                     logits_grad, t_dX,
+                                     t_ffnout, t_ffnA, t_ffnH,
+                                     t_n2, t_ln, t_attn, seq);
+                        model.update_norm_stats();
+                        model.free_layer_cache();
+                    }
                 }
+                cudaDeviceSynchronize();  // is GPU ka kaam khatam
+            };
 
-                GPUTensor logits = cur_model.forward(input_ids);
+            if (use_multi_gpu && gpu_model1) {
+                // [v38-PARALLEL] GPU1 alag thread mein — GPU0 ke saath ek saath!
+                std::thread t1(run_on_gpu, 1, std::ref(*gpu_model1),
+                               std::ref(gpu_grads1), std::ref(res1));
 
-                CUDA_CHECK(cudaMemcpy(cur_targets, target_ids.data(),
-                           seq*sizeof(int), cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemset(cur_loss_buf, 0, seq*sizeof(float)));
-                CUDA_CHECK(cudaMemset(cur_grad_out, 0, seq*V*sizeof(float)));
+                // GPU0 main thread mein
+                run_on_gpu(0, gpu_model, gpu_grads, res0);
 
-                FreeEnergyResult fe_result;
-                cuda_free_energy_loss(
-                    logits.data, cur_targets,
-                    cur_loss_buf, cur_grad_out,
-                    seq, V,
-                    optimizer.temperature,
-                    fe_result);
+                t1.join();  // dono khatam hone ka wait
 
-                // logits_grad GPU pe hi rakho
-                GPUTensor cur_logits_grad = gpu_alloc(SEQ, V);
-                CUDA_CHECK(cudaMemcpy(cur_logits_grad.data, cur_grad_out,
-                           seq*V*sizeof(float), cudaMemcpyDeviceToDevice));
+                // results merge karo
+                batch_F  = res0.F  + res1.F;
+                batch_CE = res0.CE + res1.CE;
+                batch_S  = res0.S  + res1.S;
+                valid_mb = res0.valid + res1.valid;
 
-                if (isfinite(fe_result.free_energy) && fe_result.free_energy > 1e-8f) {
-                    batch_F  += fe_result.free_energy;
-                    batch_CE += fe_result.cross_entropy;
-                    batch_S  += fe_result.entropy;
-                    ++valid_mb;
-
-                    // backward ke liye temp buffers (device pe)
-                    GPUTensor t_dX_out      = gpu_alloc(SEQ, D);
-                    GPUTensor t_d_ffn_out   = gpu_alloc(SEQ, D);
-                    GPUTensor t_d_ffn_A     = gpu_alloc(SEQ, D4);
-                    GPUTensor t_d_ffn_H     = gpu_alloc(SEQ, D4);
-                    GPUTensor t_d_normed2   = gpu_alloc(SEQ, D);
-                    GPUTensor t_dX_ln       = gpu_alloc(SEQ, D);
-                    GPUTensor t_dX_attn_in  = gpu_alloc(SEQ, D);
-
-                    run_backward(cur_model, cfg, cur_grads,
-                                 cur_logits_grad, t_dX_out,
-                                 t_d_ffn_out, t_d_ffn_A, t_d_ffn_H,
-                                 t_d_normed2, t_dX_ln, t_dX_attn_in, seq);
-
-                    cur_model.update_norm_stats();
-                    cur_model.free_layer_cache();
-                }
-
-                if (use_gpu1) cudaSetDevice(0);  // wapas GPU0
-            }
-
-            // [v37-MULTIGPU] GPU1 grads ko GPU0 pe add karo
-            if (use_multi_gpu && gpu_model1 && !gpu_grads1.empty() && valid_mb > 0) {
+                // [v38-PARALLEL] GPU1 grads → GPU0 add (peer-to-peer attempt)
+                cudaSetDevice(0);
                 for (int gi = 0; gi < (int)gpu_grads.size() && gi < (int)gpu_grads1.size(); ++gi) {
                     int sz = gpu_grads[gi]->size;
-                    // GPU1 se GPU0 pe copy + add
                     std::vector<float> h_g1(sz);
                     cudaSetDevice(1);
-                    CUDA_CHECK(cudaMemcpy(h_g1.data(), gpu_grads1[gi]->data,
-                               sz*sizeof(float), cudaMemcpyDeviceToHost));
+                    cudaMemcpy(h_g1.data(), gpu_grads1[gi]->data,
+                               sz*sizeof(float), cudaMemcpyDeviceToHost);
                     cudaSetDevice(0);
-                    // GPU0 grad mein add karo
-                    CudaPtr<float> d_g1_tmp(sz);
-                    CUDA_CHECK(cudaMemcpy(d_g1_tmp.get(), h_g1.data(),
-                               sz*sizeof(float), cudaMemcpyHostToDevice));
-                    vec_add_kernel<<<(sz+255)/256,256>>>(gpu_grads[gi]->data, d_g1_tmp.get(), sz);
-                    CUDA_KERNEL_CHECK();
-                    // GPU1 grad zero karo next step ke liye
+                    CudaPtr<float> d_tmp(sz);
+                    cudaMemcpy(d_tmp.get(), h_g1.data(),
+                               sz*sizeof(float), cudaMemcpyHostToDevice);
+                    vec_add_kernel<<<(sz+255)/256,256>>>(gpu_grads[gi]->data, d_tmp.get(), sz);
                     cudaSetDevice(1);
-                    CUDA_CHECK(cudaMemset(gpu_grads1[gi]->data, 0, sz*sizeof(float)));
+                    cudaMemset(gpu_grads1[gi]->data, 0, sz*sizeof(float));
                     cudaSetDevice(0);
                 }
-                // GPU1 weights bhi sync karo optimizer step ke baad
+                CUDA_KERNEL_CHECK();
+            } else {
+                // single GPU — purana loop
+                for (auto& [input_ids, target_ids] : micro_batches) {
+                    int seq = (int)input_ids.size();
+                    GPUTensor logits = gpu_model.forward(input_ids);
+                    CUDA_CHECK(cudaMemcpy(d_targets, target_ids.data(),
+                               seq*sizeof(int), cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemset(d_loss_buf, 0, seq*sizeof(float)));
+                    CUDA_CHECK(cudaMemset(d_grad_out, 0, seq*V*sizeof(float)));
+                    FreeEnergyResult fe_result;
+                    cuda_free_energy_loss(logits.data, d_targets, d_loss_buf, d_grad_out,
+                                          seq, V, optimizer.temperature, fe_result);
+                    CUDA_CHECK(cudaMemcpy(d_logits_grad.data, d_grad_out,
+                               seq*V*sizeof(float), cudaMemcpyDeviceToDevice));
+                    if (isfinite(fe_result.free_energy) && fe_result.free_energy > 1e-8f) {
+                        batch_F  += fe_result.free_energy;
+                        batch_CE += fe_result.cross_entropy;
+                        batch_S  += fe_result.entropy;
+                        ++valid_mb;
+                        run_backward(gpu_model, cfg, gpu_grads,
+                                     d_logits_grad, d_dX_out,
+                                     d_d_ffn_out, d_d_ffn_A, d_d_ffn_H,
+                                     d_d_normed2, d_dX_ln, d_dX_attn_in, seq);
+                        gpu_model.update_norm_stats();
+                        gpu_model.free_layer_cache();
+                    }
+                }
             }
 
             if (valid_mb==0) { ++step; continue; }
