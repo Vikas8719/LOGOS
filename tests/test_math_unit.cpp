@@ -2763,7 +2763,9 @@ void test_m31_survived_mutant_targeted_kills() {
         // If mutant used +, q_vel = q_i + q_im1 → q_adv = q_i + eta*(q_i+q_im1) (different)
         // We test that standard attention with eta=1 differs from eta=0 in the expected direction.
         // K: identity-like so Q_adv dot K^T produces scores proportional to Q_adv.
-        Tensor K({seq, d_k}); K.fill(0.0f); for(int i=0;i<seq;++i) K.at(i,i%d_k)=1.0f;
+        // K: all-ones so Q_adv dot K^T produces scores = sum of Q_adv rows
+        // This makes score differences from advection directly visible.
+        Tensor K({seq, d_k}); K.fill(1.0f);
         // V must have DIFFERENT values per row so the shift in attention weights
         // from eta=1 vs eta=0 actually changes the output.
         // Row 0 has large V; rows 1-3 have small V.
