@@ -2762,16 +2762,20 @@ void test_m31_survived_mutant_targeted_kills() {
         // q_adv = q_i + eta * (q_i - q_im1)
         // If mutant used +, q_vel = q_i + q_im1 → q_adv = q_i + eta*(q_i+q_im1) (different)
         // We test that standard attention with eta=1 differs from eta=0 in the expected direction.
+        // K: identity-like so Q_adv dot K^T produces scores proportional to Q_adv.
         Tensor K({seq, d_k}); K.fill(0.0f); for(int i=0;i<seq;++i) K.at(i,i%d_k)=1.0f;
-        Tensor V({seq, d_v}); V.fill(0.1f);
+        // V must have DIFFERENT values per row so the shift in attention weights
+        // from eta=1 vs eta=0 actually changes the output.
+        // Row 0 has large V; rows 1-3 have small V.
+        Tensor V({seq, d_v});
+        V.at(0,0)=100.0f; V.at(0,1)=100.0f;
+        V.at(1,0)=1.0f;   V.at(1,1)=1.0f;
+        V.at(2,0)=1.0f;   V.at(2,1)=1.0f;
+        V.at(3,0)=1.0f;   V.at(3,1)=1.0f;
         Tensor mask({seq, seq}, 0.0f);
         for (int i = 0; i < seq; ++i)
             for (int j = i+1; j < seq; ++j) mask.at(i,j) = -1e9f;
 
-        // With correct subtraction: q_adv[1] = Q[1] + 1.0*(Q[1]-Q[0]) = 2*Q[1] - Q[0]
-        //                                     = [20,22] - [0,1] = [20,21] (row 1 doubled minus row0)
-        // With mutant addition:     q_adv[1] = Q[1] + 1.0*(Q[1]+Q[0]) = [20,22]
-        // The outputs differ, so just check output is finite and different from nu=0,eta=0.
         Tensor out_eta1 = navier_stokes_attention(Q, K, V, mask, 1.0f, 1.0f, 0.0f);
         Tensor out_eta0 = navier_stokes_attention(Q, K, V, mask, 1.0f, 0.0f, 0.0f);
         float diff = 0.0f;
@@ -2798,7 +2802,14 @@ void test_m31_survived_mutant_targeted_kills() {
         // q_adv_sub[1,0]  = 5 + 1*(-15) = -10  → very negative score
         // q_adv_add[1,0]  = 5 + 1*(25)  =  30  → very positive score (mutant)
         Tensor K2({seq2, d_k2}); K2.fill(1.0f);
-        Tensor V2({seq2, d_v2}); V2.fill(1.0f);
+        // V2 must have different values so attention weight shift changes output.
+        // Row 0 has very large V so when q_adv is very negative (sub case) for row 1,
+        // row 1's score drops → it attends less to row 0 → lower output vs eta=0.
+        Tensor V2({seq2, d_v2});
+        V2.at(0,0)=100.0f; V2.at(0,1)=100.0f;
+        V2.at(1,0)=1.0f;   V2.at(1,1)=1.0f;
+        V2.at(2,0)=1.0f;   V2.at(2,1)=1.0f;
+        V2.at(3,0)=1.0f;   V2.at(3,1)=1.0f;
         Tensor mask2({seq2, seq2}, 0.0f);
         for (int i=0; i<seq2; ++i) for (int j=i+1; j<seq2; ++j) mask2.at(i,j) = -1e9f;
         Tensor out_sub = navier_stokes_attention(Q2, K2, V2, mask2, 1.0f, 1.0f, 0.0f);
