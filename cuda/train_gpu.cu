@@ -737,6 +737,32 @@ void train_gpu(const std::string& dataset_path) {
            prop.name, prop.totalGlobalMem/1024/1024,
            prop.multiProcessorCount, prop.major, prop.minor);
 
+    // [v37-MULTIGPU] Kitne GPU available hain check karo
+    int num_gpus = 0;
+    cudaGetDeviceCount(&num_gpus);
+    bool use_multi_gpu = (num_gpus >= 2);
+    if (use_multi_gpu) {
+        // GPU 1 bhi same family hai check karo
+        cudaDeviceProp prop1;
+        cudaGetDeviceProperties(&prop1, 1);
+        // CC match hona chahiye warna disable karo
+        if (prop1.major != prop.major || prop1.minor != prop.minor) {
+            printf("  [v37-MULTIGPU] GPU0 CC=%d.%d != GPU1 CC=%d.%d — single GPU mode\n",
+                   prop.major, prop.minor, prop1.major, prop1.minor);
+            use_multi_gpu = false;
+        }
+    }
+    if (use_multi_gpu) {
+        cudaDeviceProp prop1;
+        cudaGetDeviceProperties(&prop1, 1);
+        printf("  [v37-MULTIGPU] %d GPUs detected!\n", num_gpus);
+        printf("    GPU0: %s | %.1f GB\n", prop.name,  (float)prop.totalGlobalMem/1024/1024/1024);
+        printf("    GPU1: %s | %.1f GB\n", prop1.name, (float)prop1.totalGlobalMem/1024/1024/1024);
+        printf("  [v37-MULTIGPU] Data Parallel ON — micro-batches split across GPUs\n");
+    } else {
+        printf("  [v37-MULTIGPU] Single GPU mode (%d GPU detected)\n", num_gpus);
+    }
+
     bool is_h100 = (prop.major == 9 && prop.minor == 0);   
     bool is_a100 = (prop.major == 8 && prop.minor == 0);   
     bool is_t4   = (prop.major == 7 && prop.minor == 5
@@ -1005,22 +1031,38 @@ void train_gpu(const std::string& dataset_path) {
     ModelGPU   gpu_model(cfg);
     gpu_model.load_from_cpu(cpu_model);
 
+    // [v37-MULTIGPU] GPU1 pe replica banao
+    ModelGPU* gpu_model1 = nullptr;
+    if (use_multi_gpu) {
+        cudaSetDevice(1);
+        gpu_model1 = new ModelGPU(cfg);
+        gpu_model1->load_from_cpu(cpu_model);
+        cudaSetDevice(0);  // wapas GPU0 pe
+        printf("  [v37-MULTIGPU] GPU1 model replica ready\n");
+    }
+
     
-    gpu_model.phys.training        = true;   
-    gpu_model.phys.nikhilam_kv     = true;   
-    gpu_model.phys.shunyam         = true;   
-    
+    gpu_model.phys.training        = true;
+    gpu_model.phys.nikhilam_kv     = true;
+    gpu_model.phys.shunyam         = true;
     gpu_model.phys.window          = (cfg.max_seq_len >= 8192) ? 64 : 32;
     gpu_model.phys.stride          = (cfg.max_seq_len >= 8192) ? 16 : 8;
-    gpu_model.phys.navier_stokes   = true;   
+    gpu_model.phys.navier_stokes   = true;
     gpu_model.phys.ns_eta          = 0.1f;
     gpu_model.phys.ns_nu           = 0.05f;
-    gpu_model.phys.feynman_dropout = true;   
+    gpu_model.phys.feynman_dropout = true;
     gpu_model.phys.drop_p          = 0.1f;
     gpu_model.phys.drop_hbar       = 1.0f;
-    gpu_model.phys.reynolds        = true;   
+    gpu_model.phys.reynolds        = true;
     gpu_model.phys.re_crit         = 2.0f;
     gpu_model.phys.re_k            = 5.0f;
+
+    // [v37-MULTIGPU] GPU1 pe same physics config
+    if (use_multi_gpu && gpu_model1) {
+        gpu_model1->phys = gpu_model.phys;
+        gpu_model1->phys.drop_p        = 0.1f;
+        gpu_model1->phys.drop_hbar     = 1.0f;
+    }
     printf("  ✦ phys.training=true  → Feynman dropout ACTIVE\n");
     printf("  ✦ Nikhilam KV INT8    → 4x KV compression\n");
     printf("  ✦ Shunyam sparse attn → window=%d stride=%d (8192 ctx)\n", gpu_model.phys.window, gpu_model.phys.stride);
@@ -1067,7 +1109,7 @@ void train_gpu(const std::string& dataset_path) {
     
     int EPOCHS=2;
     int64_t batches_per_epoch=loader.total_batches_per_epoch();
-    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS", 20.f);  // [v36-TEST] default=20 steps (testing ke liye) — production ke liye set karo LOGOS_STEPS=500000
+    const int64_t steps_cap=(int64_t)logos_env_f("LOGOS_STEPS", 500000.f);  // production default; testing ke liye set karo LOGOS_STEPS=20
     
     const int64_t start_step = resumed
         ? (int64_t)logos_env_f("LOGOS_START_STEP", 0.f)
@@ -1101,6 +1143,21 @@ void train_gpu(const std::string& dataset_path) {
         GradGuard(std::vector<GPUTensor*>& g) : grads(g) {}
         ~GradGuard() { for (auto* g : grads) delete g; }
     } grad_guard(gpu_grads);
+
+    // [v37-MULTIGPU] GPU1 grad buffers
+    std::vector<GPUTensor*> gpu_grads1;
+    struct GradGuard1 {
+        std::vector<GPUTensor*>& grads;
+        bool active;
+        GradGuard1(std::vector<GPUTensor*>& g, bool a) : grads(g), active(a) {}
+        ~GradGuard1() { if (active) for (auto* g : grads) { cudaFree(g->data); delete g; } }
+    };
+    if (use_multi_gpu && gpu_model1) {
+        cudaSetDevice(1);
+        gpu_grads1 = gpu_model1->alloc_grad_buffers();
+        cudaSetDevice(0);
+    }
+    GradGuard1 grad_guard1(gpu_grads1, use_multi_gpu);
 
     
     WeightPathIntegral gpu_path_integral(/*hbar=*/1.0f, /*history=*/500);
@@ -1322,24 +1379,56 @@ void train_gpu(const std::string& dataset_path) {
             float batch_F=0.f, batch_CE=0.f, batch_S=0.f;
             int   valid_mb=0;
 
-            for (auto& [input_ids,target_ids] : micro_batches) {
+            // [v37-MULTIGPU] micro-batches split: even→GPU0, odd→GPU1
+            for (int mbi = 0; mbi < (int)micro_batches.size(); ++mbi) {
+                auto& [input_ids, target_ids] = micro_batches[mbi];
                 int seq=(int)input_ids.size();
-                GPUTensor logits=gpu_model.forward(input_ids);
 
-                CUDA_CHECK(cudaMemcpy(d_targets,target_ids.data(),
-                           seq*sizeof(int),cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemset(d_loss_buf,0,seq*sizeof(float)));
-                CUDA_CHECK(cudaMemset(d_grad_out,0,seq*V*sizeof(float)));
+                bool use_gpu1 = use_multi_gpu && gpu_model1 && (mbi % 2 == 1);
+                int target_device = use_gpu1 ? 1 : 0;
+                if (use_gpu1) cudaSetDevice(1);
+
+                ModelGPU&              cur_model  = use_gpu1 ? *gpu_model1 : gpu_model;
+                std::vector<GPUTensor*>& cur_grads = use_gpu1 ? gpu_grads1  : gpu_grads;
+                int*   cur_targets  = use_gpu1 ? nullptr : d_targets;   // GPU1 apna alloc karega
+                float* cur_loss_buf = use_gpu1 ? nullptr : d_loss_buf;
+                float* cur_grad_out = use_gpu1 ? nullptr : d_grad_out;
+
+                // GPU1 ke liye local buffers
+                CudaPtr<int>*   d_vtgt1_ptr  = nullptr;
+                CudaPtr<float>* d_vloss1_ptr = nullptr;
+                CudaPtr<float>* d_vgrad1_ptr = nullptr;
+                std::unique_ptr<CudaPtr<int>>   d_vtgt1_owner;
+                std::unique_ptr<CudaPtr<float>> d_vloss1_owner;
+                std::unique_ptr<CudaPtr<float>> d_vgrad1_owner;
+
+                if (use_gpu1) {
+                    d_vtgt1_owner  = std::make_unique<CudaPtr<int>>(SEQ);
+                    d_vloss1_owner = std::make_unique<CudaPtr<float>>(SEQ);
+                    d_vgrad1_owner = std::make_unique<CudaPtr<float>>((int64_t)SEQ * V);
+                    cur_targets  = d_vtgt1_owner->get();
+                    cur_loss_buf = d_vloss1_owner->get();
+                    cur_grad_out = d_vgrad1_owner->get();
+                }
+
+                GPUTensor logits = cur_model.forward(input_ids);
+
+                CUDA_CHECK(cudaMemcpy(cur_targets, target_ids.data(),
+                           seq*sizeof(int), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemset(cur_loss_buf, 0, seq*sizeof(float)));
+                CUDA_CHECK(cudaMemset(cur_grad_out, 0, seq*V*sizeof(float)));
 
                 FreeEnergyResult fe_result;
                 cuda_free_energy_loss(
-                    logits.data, d_targets,
-                    d_loss_buf, d_grad_out,
+                    logits.data, cur_targets,
+                    cur_loss_buf, cur_grad_out,
                     seq, V,
                     optimizer.temperature,
                     fe_result);
 
-                CUDA_CHECK(cudaMemcpy(d_logits_grad.data, d_grad_out,
+                // logits_grad GPU pe hi rakho
+                GPUTensor cur_logits_grad = gpu_alloc(SEQ, V);
+                CUDA_CHECK(cudaMemcpy(cur_logits_grad.data, cur_grad_out,
                            seq*V*sizeof(float), cudaMemcpyDeviceToDevice));
 
                 if (isfinite(fe_result.free_energy) && fe_result.free_energy > 1e-8f) {
@@ -1347,16 +1436,50 @@ void train_gpu(const std::string& dataset_path) {
                     batch_CE += fe_result.cross_entropy;
                     batch_S  += fe_result.entropy;
                     ++valid_mb;
-                    run_backward(gpu_model,cfg,gpu_grads,
-                                 d_logits_grad,d_dX_out,
-                                 d_d_ffn_out,d_d_ffn_A,d_d_ffn_H,
-                                 d_d_normed2,d_dX_ln,d_dX_attn_in,seq);
-                    
-                    gpu_model.update_norm_stats();
-                    
-                    gpu_model.free_layer_cache();
-                    
+
+                    // backward ke liye temp buffers (device pe)
+                    GPUTensor t_dX_out      = gpu_alloc(SEQ, D);
+                    GPUTensor t_d_ffn_out   = gpu_alloc(SEQ, D);
+                    GPUTensor t_d_ffn_A     = gpu_alloc(SEQ, D4);
+                    GPUTensor t_d_ffn_H     = gpu_alloc(SEQ, D4);
+                    GPUTensor t_d_normed2   = gpu_alloc(SEQ, D);
+                    GPUTensor t_dX_ln       = gpu_alloc(SEQ, D);
+                    GPUTensor t_dX_attn_in  = gpu_alloc(SEQ, D);
+
+                    run_backward(cur_model, cfg, cur_grads,
+                                 cur_logits_grad, t_dX_out,
+                                 t_d_ffn_out, t_d_ffn_A, t_d_ffn_H,
+                                 t_d_normed2, t_dX_ln, t_dX_attn_in, seq);
+
+                    cur_model.update_norm_stats();
+                    cur_model.free_layer_cache();
                 }
+
+                if (use_gpu1) cudaSetDevice(0);  // wapas GPU0
+            }
+
+            // [v37-MULTIGPU] GPU1 grads ko GPU0 pe add karo
+            if (use_multi_gpu && gpu_model1 && !gpu_grads1.empty() && valid_mb > 0) {
+                for (int gi = 0; gi < (int)gpu_grads.size() && gi < (int)gpu_grads1.size(); ++gi) {
+                    int sz = gpu_grads[gi]->size;
+                    // GPU1 se GPU0 pe copy + add
+                    std::vector<float> h_g1(sz);
+                    cudaSetDevice(1);
+                    CUDA_CHECK(cudaMemcpy(h_g1.data(), gpu_grads1[gi]->data,
+                               sz*sizeof(float), cudaMemcpyDeviceToHost));
+                    cudaSetDevice(0);
+                    // GPU0 grad mein add karo
+                    CudaPtr<float> d_g1_tmp(sz);
+                    CUDA_CHECK(cudaMemcpy(d_g1_tmp.get(), h_g1.data(),
+                               sz*sizeof(float), cudaMemcpyHostToDevice));
+                    vec_add_kernel<<<(sz+255)/256,256>>>(gpu_grads[gi]->data, d_g1_tmp.get(), sz);
+                    CUDA_KERNEL_CHECK();
+                    // GPU1 grad zero karo next step ke liye
+                    cudaSetDevice(1);
+                    CUDA_CHECK(cudaMemset(gpu_grads1[gi]->data, 0, sz*sizeof(float)));
+                    cudaSetDevice(0);
+                }
+                // GPU1 weights bhi sync karo optimizer step ke baad
             }
 
             if (valid_mb==0) { ++step; continue; }
@@ -1408,6 +1531,25 @@ void train_gpu(const std::string& dataset_path) {
             
             float adapted_lr_scale = gpu_path_integral.lr_scale_ema(0.5f);
             optimizer.update(gpu_params, gpu_grads, adapted_lr_scale);
+
+            // [v37-MULTIGPU] GPU0 updated weights → GPU1 sync (har step)
+            if (use_multi_gpu && gpu_model1) {
+                cudaSetDevice(0);
+                auto params0 = gpu_model.all_parameters();
+                cudaSetDevice(1);
+                auto params1 = gpu_model1->all_parameters();
+                for (int pi2 = 0; pi2 < (int)params0.size() && pi2 < (int)params1.size(); ++pi2) {
+                    int sz = params0[pi2]->size;
+                    std::vector<float> h_w(sz);
+                    cudaSetDevice(0);
+                    CUDA_CHECK(cudaMemcpy(h_w.data(), params0[pi2]->data,
+                               sz*sizeof(float), cudaMemcpyDeviceToHost));
+                    cudaSetDevice(1);
+                    CUDA_CHECK(cudaMemcpy(params1[pi2]->data, h_w.data(),
+                               sz*sizeof(float), cudaMemcpyHostToDevice));
+                }
+                cudaSetDevice(0);
+            }
 
             
             gpu_path_integral.record_step_norm(avg_F, grad_norm * optimizer.lr);
@@ -1614,6 +1756,14 @@ void train_gpu(const std::string& dataset_path) {
 
     training_done:
     CUDA_CHECK(cudaDeviceSynchronize());
+    if (use_multi_gpu && gpu_model1) {
+        cudaSetDevice(1);
+        cudaDeviceSynchronize();
+        delete gpu_model1;
+        gpu_model1 = nullptr;
+        cudaSetDevice(0);
+        printf("  [v37-MULTIGPU] GPU1 cleanup done\n");
+    }
 
     gpu_model.sync_to_cpu(cpu_model);
     save_checkpoint(cpu_model,"logos_final",(int)step);
