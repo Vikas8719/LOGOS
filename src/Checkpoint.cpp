@@ -312,7 +312,7 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
 }
 
 
-static constexpr uint32_t OPTSTATE_MAGIC   = 0x4F505431u;  // "OPT1"
+static constexpr uint32_t OPTSTATE_MAGIC   = 0x4F505431u;
 static constexpr uint32_t OPTSTATE_VERSION = 1u;
 
 bool save_optimizer_state(const OptimizerState& state,
@@ -362,13 +362,11 @@ bool load_optimizer_state(OptimizerState& state,
     std::string path = base_path + "_step" + std::to_string(step) + ".optstate";
     std::ifstream f(path, std::ios::binary);
     if (!f) {
-        
         std::cout << "  ℹ️  No optimizer state found (" << path
                   << ") — optimizer starts cold (normal for step 60000 checkpoint)\n";
         return false;
     }
 
-   
     uint32_t magic = 0, version = 0;
     int64_t  n_params = 0;
     f.read(reinterpret_cast<char*>(&magic),    sizeof(magic));

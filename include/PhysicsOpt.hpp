@@ -220,7 +220,7 @@ public:
                               int steps=100000, int seed=42)
         : learning_rate(lr), beta(ema_beta), epsilon(eps), mom_decay(mom),
           temperature(T_start), temp_start(T_start),
-          temp_end(std::max(T_end, T_MIN_FLOOR)),   // FIX-1
+          temp_end(std::max(T_end, T_MIN_FLOOR)),
           total_steps(steps), rng(seed)
     {}
 
@@ -376,7 +376,7 @@ struct WeightPathIntegral {
     float amplitude()          const { return std::exp(std::max(log_amplitude, -88.0f)); }
     float relative_amplitude() const {
         if (best_log_amplitude <= -1e29f) return 1.0f;
-        float delta = log_amplitude - best_log_amplitude;  // always <= 0
+        float delta = log_amplitude - best_log_amplitude;
         return std::exp(std::max(delta, -88.0f));
     }
     float lr_scale(float lr_min_frac=0.1f) const {
@@ -388,7 +388,7 @@ struct WeightPathIntegral {
         int start = std::max(0, (int)history.size()-last_n);
         float sum=0.0f;
         for (int i=start; i<(int)history.size(); ++i) sum+=history[i].action;
-        return sum / (float)(history.size()-start);
+        return sum / (float)(history.size() - start);
     }
 
     void log_state() const {
@@ -401,4 +401,3 @@ struct WeightPathIntegral {
                   << " | hbar=" << hbar << "\n";
     }
 };
-

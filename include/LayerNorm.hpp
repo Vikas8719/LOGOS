@@ -9,8 +9,8 @@ struct LayerNorm {
     float eps = 1e-5f;
 
     LayerNorm(int d_model_) : d_model(d_model_),
-        gamma({1, d_model_}, 1.0f),   // Init to 1 (scale)
-        beta ({1, d_model_}, 0.0f)    // Init to 0 (shift)
+        gamma({1, d_model_}, 1.0f),
+        beta ({1, d_model_}, 0.0f)
     {}
 
     Tensor forward(const Tensor& X) const {
@@ -22,8 +22,8 @@ struct LayerNorm {
             float mean = 0.0f, M2 = 0.0f;
             for (int j = 0; j < dim; ++j) {
                 float delta = X.at(i, j) - mean;
-                mean += delta / (j + 1);              // running mean
-                M2   += delta * (X.at(i, j) - mean); // running sum of sq deviations
+                mean += delta / (j + 1);
+                M2   += delta * (X.at(i, j) - mean);
             }
             float var     = M2 / dim;
             float inv_std = 1.0f / std::sqrt(var + eps);
@@ -42,8 +42,8 @@ struct ReynoldsBatchNorm {
     Tensor gamma, beta;
     int    d_model;
     float  eps      = 1e-5f;
-    float  Re_crit  = 1.0f;   // Reynolds criticality threshold (annealed externally)
-    float  k_slope  = 5.0f;   // sigmoid steepness for laminar→turbulent transition
+    float  Re_crit  = 1.0f;
+    float  k_slope  = 5.0f;
 
     std::vector<float> running_mean;
     std::vector<float> running_var;
@@ -98,7 +98,7 @@ struct ReynoldsBatchNorm {
         Tensor Y(X.shape);
 
         float Re = reynolds_number(X);
-        float w_LN = laminar_weight(Re);      // laminar weight
+        float w_LN = laminar_weight(Re);
         float w_BN = std::max(0.0f, 1.0f - w_LN);
 
         Tensor LN_out(X.shape);
@@ -119,7 +119,7 @@ struct ReynoldsBatchNorm {
             float m = 0.0f, v = 0.0f;
             for (int i = 0; i < seq; ++i) m += X.at(i,j);
             m /= (seq + 1e-8f);
-            for (int i = 0; i < seq; ++i) v += (X.at(i,j)-m)*(X.at(i,j)-m);
+            for (int i = 0; i < seq; ++i) v += (X.at(i,j) - m) * (X.at(i,j) - m);
             v /= (seq + 1e-8f);
             batch_mean[j] = m;
             batch_var[j]  = v;
@@ -127,8 +127,8 @@ struct ReynoldsBatchNorm {
 
         if (is_training) {
             for (int j = 0; j < dim; ++j) {
-                running_mean[j] = ema_decay * running_mean[j] + (1.0f-ema_decay) * batch_mean[j];
-                running_var[j]  = ema_decay * running_var[j]  + (1.0f-ema_decay) * batch_var[j];
+                running_mean[j] = ema_decay * running_mean[j] + (1.0f - ema_decay) * batch_mean[j];
+                running_var[j]  = ema_decay * running_var[j]  + (1.0f - ema_decay) * batch_var[j];
             }
             initialized = true;
         }

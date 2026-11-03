@@ -58,7 +58,7 @@ inline const Tensor& causal_mask_cached(int seq_len) {
 
 
 inline Tensor causal_mask(int seq_len) {
-    return causal_mask_cached(seq_len);  // delegate to cache
+    return causal_mask_cached(seq_len);
 }
 
 
@@ -66,17 +66,15 @@ inline Tensor shunyam_sparse_mask(int seq_len,
                                    int window = 8,
                                    int stride = 4)
 {
-    Tensor mask({seq_len, seq_len}, -1e9f);  
+    Tensor mask({seq_len, seq_len}, -1e9f);
 
     for (int i = 0; i < seq_len; ++i) {
-        
         int local_start = std::max(0, i - window);
         for (int j = local_start; j <= i; ++j)
-            mask.at(i, j) = 0.0f;  
+            mask.at(i, j) = 0.0f;
 
-        
         for (int j = 0; j < i; j += stride)
-            mask.at(i, j) = 0.0f;  
+            mask.at(i, j) = 0.0f;
     }
     return mask;
 }
@@ -99,30 +97,27 @@ inline const Tensor& shunyam_sparse_mask_cached(int seq_len,
 inline Tensor navier_stokes_attention(const Tensor& Q, const Tensor& K, const Tensor& V,
                                        const Tensor& mask,
                                        float temperature,
-                                       float eta  = 0.1f,    // advection
-                                       float nu   = 0.05f)   // viscosity
+                                       float eta  = 0.1f,
+                                       float nu   = 0.05f)
 {
     int seq = Q.rows(), d_k = Q.cols(), d_v = V.cols();
 
-   
     Tensor Q_adv(Q.shape, 0.0f);
     for (int i = 0; i < seq; ++i) {
         for (int j = 0; j < d_k; ++j) {
             float q_i   = Q.at(i, j);
-            float q_im1 = (i > 0) ? Q.at(i-1, j) : q_i;  // boundary: no flow at i=0
+            float q_im1 = (i > 0) ? Q.at(i-1, j) : q_i;
             float q_vel = q_i - q_im1;
             Q_adv.at(i, j) = q_i + eta * q_vel;
         }
     }
 
-   
     Tensor K_T    = K.transpose();
     Tensor scores = vedic_gemm(Q_adv, K_T);
-    scores += mask;  // causal / sparse mask
+    scores += mask;
 
     Tensor attn_weights = boltzmann_softmax(scores, temperature);
 
-   
     Tensor V_smooth(V.shape, 0.0f);
     for (int i = 0; i < seq; ++i) {
         int i_left  = (i > 0)      ? i - 1 : 0;
@@ -133,7 +128,6 @@ inline Tensor navier_stokes_attention(const Tensor& Q, const Tensor& K, const Te
         }
     }
 
-   
     return vedic_gemm(attn_weights, V_smooth);
 }
 
@@ -156,11 +150,10 @@ struct AttentionHead {
     bool  use_sparse     = true;
     int   sparse_window  = 8;
     int   sparse_stride  = 4;
-   
     bool  use_navier_stokes = false;
-    float ns_alpha          = 0.3f;   
-    float ns_eta            = 0.1f;   
-    float ns_nu             = 0.05f;  
+    float ns_alpha          = 0.3f;
+    float ns_eta            = 0.1f;
+    float ns_nu             = 0.05f;
 
     Tensor forward(const Tensor& X) {
         float temperature = std::sqrt(static_cast<float>(d_k));
@@ -178,7 +171,6 @@ struct AttentionHead {
         }
 
         if (use_navier_stokes && ns_alpha > 0.0f) {
-            
             Tensor K_T       = K.transpose();
             Tensor scores_std = vedic_gemm(Q, K_T);
             scores_std       += *mask_ptr;
@@ -186,19 +178,16 @@ struct AttentionHead {
             Tensor out_std    = vedic_gemm(w_std, V);
             Tensor out_std_O  = vedic_gemm(out_std, W_O);
 
-            
             Tensor out_ns = navier_stokes_attention(Q, K, V, *mask_ptr,
                                                      temperature, ns_eta, ns_nu);
             Tensor out_ns_O = vedic_gemm(out_ns, W_O);
 
-            
             Tensor blended({seq, d_model}, 0.0f);
             float w1 = 1.0f - ns_alpha, w2 = ns_alpha;
             for (int i = 0; i < blended.total_size; ++i)
                 blended.data[i] = w1 * out_std_O.data[i] + w2 * out_ns_O.data[i];
             return blended;
         } else {
-            
             Tensor K_T    = K.transpose();
             Tensor scores = vedic_gemm(Q, K_T);
             scores       += *mask_ptr;
