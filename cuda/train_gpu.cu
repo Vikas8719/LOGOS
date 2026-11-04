@@ -1811,7 +1811,6 @@ void train_gpu(const std::string& dataset_path) {
                         FreeEnergyResult vfe;
                         cuda_free_energy_loss(vlogits.data, d_vtgt,
                             d_vloss, d_vgrad, vseq, V, optimizer.temperature, vfe);
-
                         if (isfinite(vfe.cross_entropy)) {
                             val_ce_sum += vfe.cross_entropy;
                             ++val_count;

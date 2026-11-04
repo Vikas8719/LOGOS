@@ -608,7 +608,7 @@ float cuda_clip_gradients(std::vector<GPUTensor*>& grads, float max_norm) {
         grad_norm_kernel<<<blocks, threads>>>(g->data, d_total_sq.get(), sz);
         CUDA_KERNEL_CHECK();
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(0));
 
     float total_norm_sq = d_total_sq.scalar();
     float total_norm    = sqrtf(total_norm_sq + 1e-12f);
@@ -651,7 +651,7 @@ VedicVerifyResult cuda_vedic_verify(const GPUTensor& A,
         CUDA_KERNEL_CHECK();
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(0));
 
     std::vector<float> h_col_A(K), h_row_B(K);
     d_col_sums_A.to_host(h_col_A.data(), K);
@@ -700,7 +700,7 @@ void cuda_free_energy_loss(
         d_ce_buf, d_S_buf,
         seq_len, vocab_size, temperature);
     CUDA_KERNEL_CHECK();
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(0));
 
     std::vector<float> h_F(seq_len), h_CE(seq_len), h_S(seq_len);
     CUDA_CHECK(cudaMemcpy(h_F.data(),  d_loss_buf, seq_len*sizeof(float), cudaMemcpyDeviceToHost));
