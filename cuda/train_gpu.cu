@@ -1538,12 +1538,14 @@ void train_gpu(const std::string& dataset_path) {
                 int valid=0;
             };
             MBResult res0, res1;
+            std::exception_ptr thread_ex; // [v43] GPU1 thread exception forward karne ke liye
 
             // GPU0 ka kaam — main thread karta hai
             auto run_on_gpu = [&](int gpu_id, ModelGPU& model,
                                   std::vector<GPUTensor*>& grads,
                                   MBResult& result)
             {
+              try {
                 cudaSetDevice(gpu_id);
                 // grad zero
                 for (auto* g : grads)
@@ -1601,6 +1603,11 @@ void train_gpu(const std::string& dataset_path) {
                     }
                 }
                 cudaDeviceSynchronize();  // is GPU ka kaam khatam
+              } catch (...) {
+                // [v43] GPU1 thread exception — main thread pe forward karo
+                if (gpu_id == 1) thread_ex = std::current_exception();
+                else             throw;  // GPU0 = main thread, seedha rethrow
+              }
             };
 
             if (use_multi_gpu && gpu_model1) {
