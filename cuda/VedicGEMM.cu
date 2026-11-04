@@ -723,7 +723,7 @@ void cuda_free_energy_loss(
 
 
 #define FA_TILE     16     
-#define FA_DH_MAX  128     
+#define FA_DH_MAX   64     // [v44-FIX] T4 pe DH=64 (d=1024/H=16) — 128 se ghata ke smem half kiya
 
 __global__ void flash_attention_kernel(
     const float* __restrict__ Q,     
@@ -895,11 +895,35 @@ void cuda_flash_attention_fwd(
             " exceeds FA_DH_MAX=" + std::to_string(FA_DH_MAX) +
             ". Increase FA_DH_MAX or reduce num_heads.");
     }
+    // [v44-FIX] FA_DH_MAX=64 (T4 DH=64), smem exact calculate karo
     size_t smem_bytes = sizeof(float) * (4 * FA_TILE * FA_DH_MAX + 2 * FA_TILE);
 
-    cudaFuncSetAttribute(flash_attention_kernel,
+    // T4 shared memory limit: 48KB. Check karo
+    {
+        int dev; cudaGetDevice(&dev);
+        cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
+        size_t max_smem = prop.sharedMemPerBlockOptin;
+        if (smem_bytes > max_smem) {
+            // fallback: FA_DH_MAX ke bajaay exact DH use karo
+            smem_bytes = sizeof(float) * (4 * FA_TILE * DH + 2 * FA_TILE);
+            if (smem_bytes > max_smem) {
+                throw std::runtime_error(
+                    "[v31-FLASH] smem " + std::to_string(smem_bytes) +
+                    " > GPU max " + std::to_string(max_smem) +
+                    " bytes. DH=" + std::to_string(DH));
+            }
+        }
+    }
+
+    cudaError_t attr_err = cudaFuncSetAttribute(flash_attention_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem_bytes);
+    if (attr_err != cudaSuccess) {
+        // attribute set fail hone par bhi proceed karo — kernel already launched nahi
+        fprintf(stderr, "[v31-FLASH] cudaFuncSetAttribute warning: %s\n",
+                cudaGetErrorString(attr_err));
+        cudaGetLastError(); // clear error
+    }
 
     int q_tiles = (seq + FA_TILE - 1) / FA_TILE;
     flash_attention_kernel<<<q_tiles, FA_TILE, smem_bytes>>>(

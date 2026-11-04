@@ -1620,6 +1620,9 @@ void train_gpu(const std::string& dataset_path) {
 
                 t1.join();  // dono khatam hone ka wait
 
+                // [v44-FIX] GPU1 thread exception rethrow karo (terminate prevent)
+                if (thread_ex) std::rethrow_exception(thread_ex);
+
                 // results merge karo
                 batch_F  = res0.F  + res1.F;
                 batch_CE = res0.CE + res1.CE;

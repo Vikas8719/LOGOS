@@ -1,13 +1,9 @@
 
 #include "../include/Tensor.hpp"
-#include "../include/PhysicsOpt.hpp"    
-                                         
-                                         
+#include "../include/PhysicsOpt.hpp"
 #include "../include/LayerNorm.hpp"     
 #include "../include/FeedForward.hpp"   
 #include "../include/Attention.hpp"    
-
-
 
 namespace logos_physics_driver {
 
