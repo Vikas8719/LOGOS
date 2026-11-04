@@ -178,30 +178,52 @@ inline Tensor softmax_backward_2d(const Tensor& A,   // (seq, seq) softmax outpu
     return dS;
 }
 
+// [v40-BUG3-FIX] AttentionHead mein saved Q/K/V/A cache store karo
+// Ye forward pass ke baad fill hoga — backward mein recompute nahi hoga
+struct AttnFwdCache {
+    Tensor Q, K, V, A;   // (seq, d_k) each; A is (seq, seq)
+    bool valid = false;
+};
+
+// [v40-BUG3-FIX] Cache-aware backward — agar cache valid hai toh recompute nahi
+// saved_cache: forward pass mein bhara hua Q/K/V/A
+// Agar saved_cache.valid == false → fallback to full recompute (old behavior)
 inline Tensor attention_head_backward(
     AttentionHead& head,
-    const Tensor& X,        // (seq, d_model) — block input to this head
-    const Tensor& dO,       // (seq, d_k)     — upstream grad w.r.t. head output O
-    Tensor& dW_Q, Tensor& dW_K, Tensor& dW_V, Tensor& dW_O)
+    const Tensor& X,            // (seq, d_model) — block input to this head
+    const Tensor& dO,           // (seq, d_k)     — upstream grad w.r.t. head output O
+    Tensor& dW_Q, Tensor& dW_K, Tensor& dW_V, Tensor& dW_O,
+    const AttnFwdCache* saved_cache = nullptr)  // [v40-BUG3] optional cache
 {
     float temperature = std::sqrt((float)head.d_k);
     int   seq         = X.rows();
 
-    Tensor Q = vedic_gemm(X, head.W_Q);  // (seq, d_k)
-    Tensor K = vedic_gemm(X, head.W_K);  // (seq, d_k)
-    Tensor V = vedic_gemm(X, head.W_V);  // (seq, d_k)
+    // [v40-BUG3-FIX] Cache hit → recompute avoid karo (Flash-style)
+    // Cache miss → old fallback (correctness preserve)
+    Tensor Q, K, V, A;
+    if (saved_cache && saved_cache->valid) {
+        // Saved Q/K/V/A use karo — seq² memory + recompute dono bachte hain
+        Q = saved_cache->Q;
+        K = saved_cache->K;
+        V = saved_cache->V;
+        A = saved_cache->A;
+    } else {
+        // Fallback: full recompute (pehle wala behavior)
+        Q = vedic_gemm(X, head.W_Q);  // (seq, d_k)
+        K = vedic_gemm(X, head.W_K);  // (seq, d_k)
+        V = vedic_gemm(X, head.W_V);  // (seq, d_k)
 
-    Tensor mask;
-    if (head.use_sparse && seq > head.sparse_window)
-        mask = shunyam_sparse_mask_cached(seq, head.sparse_window, head.sparse_stride);
-    else
-        mask = causal_mask_cached(seq);
+        Tensor mask;
+        if (head.use_sparse && seq > head.sparse_window)
+            mask = shunyam_sparse_mask_cached(seq, head.sparse_window, head.sparse_stride);
+        else
+            mask = causal_mask_cached(seq);
 
-    Tensor K_T = K.transpose();
-    Tensor S   = vedic_gemm(Q, K_T);
-    S += mask;
-    Tensor A   = boltzmann_softmax(S, temperature);  // (seq, seq)
-    Tensor O   = vedic_gemm(A, V);                   // (seq, d_k)
+        Tensor K_T = K.transpose();
+        Tensor S   = vedic_gemm(Q, K_T);
+        S += mask;
+        A = boltzmann_softmax(S, temperature);  // (seq, seq)
+    }
 
     Tensor V_T = V.transpose();                       // (d_k, seq)
     Tensor dA  = vedic_gemm(dO, V_T);                // (seq, seq) ✅
@@ -309,9 +331,20 @@ inline Tensor block_backward(TransformerBlock& block,
     int num_heads = block.mha.num_heads;
     int d_k       = block.mha.d_k;
 
+    // [v40-BUG3-FIX] cached head outputs use karo — agar cache valid hai
+    // Block forward mein forward_cached call hona chahiye
     Tensor concat({seq, d}, 0.0f);
     for (int hh = 0; hh < num_heads; ++hh) {
-        Tensor head_out = block.mha.heads[hh].forward(normed1);
+        // forward_cached se saved output use karo (cache valid hai toh)
+        // Agar cache nahi hai toh fallback forward call
+        Tensor head_out;
+        if (block.mha.heads[hh].fwd_cache.valid) {
+            // A*V already computed — cache se reconstruct karo
+            head_out = vedic_gemm(block.mha.heads[hh].fwd_cache.A,
+                                   block.mha.heads[hh].fwd_cache.V);
+        } else {
+            head_out = block.mha.heads[hh].forward(normed1);
+        }
         for (int i = 0; i < seq; ++i)
             for (int j = 0; j < d_k; ++j)
                 concat.at(i, hh * d_k + j) = head_out.at(i, j);
@@ -332,9 +365,22 @@ inline Tensor block_backward(TransformerBlock& block,
             for (int j = 0; j < d_k; ++j)
                 dY_head.at(i,j) = d_concat.at(i, hh * d_k + j);
 
+        // [v40-BUG3-FIX] Cache-aware backward call — saved Q/K/V/A pass karo
+        const AttnFwdCache* cache_ptr = nullptr;
+        AttnFwdCache tmp_cache;
+        if (block.mha.heads[hh].fwd_cache.valid) {
+            tmp_cache.Q     = block.mha.heads[hh].fwd_cache.Q;
+            tmp_cache.K     = block.mha.heads[hh].fwd_cache.K;
+            tmp_cache.V     = block.mha.heads[hh].fwd_cache.V;
+            tmp_cache.A     = block.mha.heads[hh].fwd_cache.A;
+            tmp_cache.valid = true;
+            cache_ptr = &tmp_cache;
+        }
+
         Tensor dX_head = attention_head_backward(
             block.mha.heads[hh], normed1, dY_head,
-            grads.dW_Q, grads.dW_K, grads.dW_V, grads.dW_O);
+            grads.dW_Q, grads.dW_K, grads.dW_V, grads.dW_O,
+            cache_ptr);  // [v40-BUG3] cache pass karo
 
         for (int i = 0; i < d_normed1.total_size; ++i)
             d_normed1.data[i] += dX_head.data[i];
@@ -379,8 +425,9 @@ inline float model_backward(LOGOSModel&              model,
     apply_rope(X, seq, d);
     layer_inputs[0] = X;
 
+    // [v40-BUG3-FIX] forward_cached use karo — backward mein Q/K/V/A recompute nahi hoga
     for (int l = 0; l < L; ++l) {
-        layer_inputs[l+1] = model.layers[l].forward(layer_inputs[l], is_training);
+        layer_inputs[l+1] = model.layers[l].forward_cached(layer_inputs[l], is_training);
     }
     Tensor X_final = layer_inputs[L];
 
@@ -388,7 +435,11 @@ inline float model_backward(LOGOSModel&              model,
     float  loss   = 0.0f;
     Tensor dLogits = softmax_ce_backward(logits, target_ids, loss);
 
-    if (std::isnan(loss) || std::isinf(loss)) return loss;
+    if (std::isnan(loss) || std::isinf(loss)) {
+        // Cache clear karo on failure bhi
+        for (int l = 0; l < L; ++l) model.layers[l].clear_attn_cache();
+        return loss;
+    }
 
     Tensor X_T     = X_final.transpose();
     Tensor dW_lm_c = vedic_gemm(X_T, dLogits);
@@ -458,6 +509,9 @@ inline float model_backward(LOGOSModel&              model,
             grads_out[0].at(tok, di) += dX.at(si, di);
     }
 
+    // [v40-BUG3-FIX] Cache clear karo — next step ke liye fresh start
+    for (int l = 0; l < L; ++l) model.layers[l].clear_attn_cache();
+
     return loss;
 }
 
@@ -483,8 +537,9 @@ inline float model_backward_with_logits(LOGOSModel&              model,
     apply_rope(X, seq, d);
     layer_inputs[0] = X;
 
+    // [v40-BUG3-FIX] forward_cached use karo — attn Q/K/V/A cache fill hoga
     for (int l = 0; l < L; ++l)
-        layer_inputs[l+1] = model.layers[l].forward(layer_inputs[l], is_training);
+        layer_inputs[l+1] = model.layers[l].forward_cached(layer_inputs[l], is_training);
 
     Tensor X_final = layer_inputs[L];
     logits_out = vedic_gemm(X_final, model.lm_head);
@@ -492,7 +547,10 @@ inline float model_backward_with_logits(LOGOSModel&              model,
     float  loss    = 0.0f;
     Tensor dLogits = softmax_ce_backward(logits_out, target_ids, loss);
 
-    if (std::isnan(loss) || std::isinf(loss)) return loss;
+    if (std::isnan(loss) || std::isinf(loss)) {
+        for (int l = 0; l < L; ++l) model.layers[l].clear_attn_cache();
+        return loss;
+    }
 
     Tensor X_T     = X_final.transpose();
     Tensor dW_lm_c = vedic_gemm(X_T, dLogits);
@@ -560,6 +618,9 @@ inline float model_backward_with_logits(LOGOSModel&              model,
         for (int di = 0; di < d; ++di)
             grads_out[0].at(tok, di) += dX.at(si, di);
     }
+
+    // [v40-BUG3-FIX] Cache clear karo — next step ke liye
+    for (int l = 0; l < L; ++l) model.layers[l].clear_attn_cache();
 
     return loss;
 }

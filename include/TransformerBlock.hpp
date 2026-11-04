@@ -54,6 +54,33 @@ struct TransformerBlock {
         return divergence_free(h + ffn_out);
     }
 
+    // [v40-BUG3-FIX] Cache-filling forward — backward mein recompute avoid hoga
+    // Training loop mein is_training=true ke saath call karo
+    Tensor forward_cached(const Tensor& X, bool is_training = true) {
+        Tensor normed1  = ln1.forward(X, is_training);
+
+        // Har head ka Q/K/V/A cache fill karo
+        int seq = normed1.rows(), d_k = mha.d_k;
+        Tensor concat({seq, mha.d_model}, 0.0f);
+        for (int h = 0; h < mha.num_heads; ++h) {
+            Tensor head_out = mha.heads[h].forward_cached(normed1);
+            for (int i = 0; i < seq; ++i)
+                for (int j = 0; j < d_k; ++j)
+                    concat.at(i, h * d_k + j) = head_out.at(i, j);
+        }
+        Tensor attn_out = vedic_gemm(concat, mha.W_proj);
+        Tensor h        = divergence_free(X + attn_out);
+
+        Tensor normed2  = ln2.forward(h, is_training);
+        Tensor ffn_out  = ffn.forward(normed2, is_training);
+        return divergence_free(h + ffn_out);
+    }
+
+    // Cache clear karo (inference ya next step ke liye)
+    void clear_attn_cache() {
+        for (auto& head : mha.heads) head.clear_cache();
+    }
+
     std::vector<Tensor*> parameters() {
         std::vector<Tensor*> p;
         auto app = [&](std::vector<Tensor*> v){

@@ -155,6 +155,41 @@ struct AttentionHead {
     float ns_eta            = 0.1f;
     float ns_nu             = 0.05f;
 
+    // [v40-BUG3-FIX] Forward cache — Q/K/V/A save karo
+    // Backward mein recompute avoid hoga (Flash-style activation reuse)
+    struct FwdCache {
+        Tensor Q, K, V, A;   // A = attn probs (seq, seq)
+        bool valid = false;
+    };
+    mutable FwdCache fwd_cache;
+
+    // [v40-BUG3-FIX] Cache-filling forward — training mein call karo
+    Tensor forward_cached(const Tensor& X) {
+        float temperature = std::sqrt(static_cast<float>(d_k));
+        int seq = X.rows();
+
+        fwd_cache.Q = vedic_gemm(X, W_Q);
+        fwd_cache.K = vedic_gemm(X, W_K);
+        fwd_cache.V = vedic_gemm(X, W_V);
+
+        const Tensor* mask_ptr = nullptr;
+        if (use_sparse && seq > sparse_window)
+            mask_ptr = &shunyam_sparse_mask_cached(seq, sparse_window, sparse_stride);
+        else
+            mask_ptr = &causal_mask_cached(seq);
+
+        Tensor K_T    = fwd_cache.K.transpose();
+        Tensor scores = vedic_gemm(fwd_cache.Q, K_T);
+        scores       += *mask_ptr;
+        fwd_cache.A   = boltzmann_softmax(scores, temperature);
+        fwd_cache.valid = true;
+
+        Tensor output = vedic_gemm(fwd_cache.A, fwd_cache.V);
+        return output;  // (seq, d_k) — W_O projection MHA level pe hoti hai
+    }
+
+    void clear_cache() { fwd_cache.valid = false; }
+
     Tensor forward(const Tensor& X) {
         float temperature = std::sqrt(static_cast<float>(d_k));
 
