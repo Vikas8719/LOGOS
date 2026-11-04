@@ -566,9 +566,13 @@ struct LayerBwdBuffers {
     }
 };
 
-// [v40-BUG1] Static buffers — process lifetime tak live rahenge, cudaMalloc ek baar
+// [v40-BUG1] Static buffers — GPU0 main thread ke liye only
 static HeadBwdBuffers s_head_bwd;
 static LayerBwdBuffers s_layer_bwd;
+
+// [v41-MULTIGPU-FIX] GPU1 thread ke liye alag thread-local buffers
+static HeadBwdBuffers s_head_bwd_gpu1;
+static LayerBwdBuffers s_layer_bwd_gpu1;
 
 static void run_backward(
     ModelGPU& gpu_model, ModelConfig& cfg,
@@ -577,7 +581,9 @@ static void run_backward(
     GPUTensor& d_d_ffn_out, GPUTensor& d_d_ffn_A,
     GPUTensor& d_d_ffn_H,   GPUTensor& d_d_normed2,
     GPUTensor& d_dX_ln,     GPUTensor& d_dX_attn_in,
-    int seq)
+    int seq,
+    HeadBwdBuffers* head_bwd_override = nullptr,
+    LayerBwdBuffers* layer_bwd_override = nullptr)
 {
     int D=cfg.d_model, V=cfg.vocab_size, D4=4*D;
     int H=cfg.num_heads, DH=D/H;
@@ -585,6 +591,10 @@ static void run_backward(
     const int wproj_off=H*4, w1_off=H*4+1, w2_off=H*4+3;
     const int ln1g_off=H*4+5, ln1b_off=H*4+6;
     const int ln2g_off=H*4+7, ln2b_off=H*4+8;
+
+    // [v41-MULTIGPU-FIX] GPU1 thread ke liye override buffers use karo, warna static GPU0 buffers
+    HeadBwdBuffers&  head_bwd  = head_bwd_override  ? *head_bwd_override  : s_head_bwd;
+    LayerBwdBuffers& layer_bwd = layer_bwd_override ? *layer_bwd_override : s_layer_bwd;
 
     { dim3 blk(32),grd(D,(V+31)/32);
       lmhead_grad_dw_kernel<<<grd,blk>>>(
@@ -656,8 +666,8 @@ static void run_backward(
         { int sz=seq*D;
           vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln.data,sz); CUDA_KERNEL_CHECK(); }
 
-        // [v40-BUG1-FIX] d_concat — pre-alloc reuse (s_layer_bwd.d_concat)
-        GPUTensor& d_concat = s_layer_bwd.d_concat;
+        // [v40-BUG1-FIX] d_concat — pre-alloc reuse (layer_bwd.d_concat)
+        GPUTensor& d_concat = layer_bwd.d_concat;
         { dim3 g(D,(D+31)/32),b(32);
           attn_dWproj_kernel<<<g,b>>>(cache.concat.data,d_dX_out.data,
                                       gpu_grads[base+wproj_off]->data,seq,D); CUDA_KERNEL_CHECK(); }
@@ -666,16 +676,16 @@ static void run_backward(
                                        d_concat.data,seq,D); CUDA_KERNEL_CHECK(); }
 
         // [v40-BUG1-FIX] Pre-allocated buffers use karo — har head loop mein alloc nahi
-        s_head_bwd.ensure(seq, DH);
-        s_layer_bwd.ensure(seq, D);
+        head_bwd.ensure(seq, DH);
+        layer_bwd.ensure(seq, D);
 
         CUDA_CHECK(cudaMemset(d_dX_attn_in.data,0,seq*D*sizeof(float)));
         for (int h=0;h<H;++h) {
             auto& hc=cache.heads[h];
-            // d_head_out_h — reuse s_head_bwd.d_head_out
+            // d_head_out_h — reuse head_bwd.d_head_out
             { dim3 g(seq,(DH+31)/32),b(32);
               attn_dHeadOut_kernel<<<g,b>>>(d_concat.data,blk.W_O[h].data,
-                                            s_head_bwd.d_head_out.data,seq,DH,D); CUDA_KERNEL_CHECK(); }
+                                            head_bwd.d_head_out.data,seq,DH,D); CUDA_KERNEL_CHECK(); }
             { dim3 g(DH,(D+31)/32),b(32);
               attn_dWO_kernel<<<g,b>>>(hc.head_out.data,d_concat.data,
                                        gpu_grads[base+h*4+3]->data,seq,DH,D); CUDA_KERNEL_CHECK(); }
@@ -685,85 +695,85 @@ static void run_backward(
                 float scale_attn = 1.0f / sqrtf((float)DH);
                 // K_T — pre-alloc reuse
                 gpu_transpose_kernel<<<dim3((seq+15)/16,(DH+15)/16),dim3(16,16)>>>(
-                    hc.K.data, s_head_bwd.K_T.data, seq, DH);
+                    hc.K.data, head_bwd.K_T.data, seq, DH);
                 CUDA_KERNEL_CHECK();
                 vedic_gemm_kernel<<<dim3((seq+15)/16,(seq+15)/16),dim3(16,16)>>>(
-                    hc.Q_adv.data, s_head_bwd.K_T.data,
-                    s_head_bwd.d_attn_probs_buf.data, seq, DH, seq);
+                    hc.Q_adv.data, head_bwd.K_T.data,
+                    head_bwd.d_attn_probs_buf.data, seq, DH, seq);
                 CUDA_KERNEL_CHECK();
                 int sz_sc = seq * seq;
                 grad_scale_kernel<<<(sz_sc+255)/256, 256>>>(
-                    s_head_bwd.d_attn_probs_buf.data, scale_attn, sz_sc);
+                    head_bwd.d_attn_probs_buf.data, scale_attn, sz_sc);
                 CUDA_KERNEL_CHECK();
                 causal_mask_kernel<<<dim3(seq,(seq+255)/256),256>>>(
-                    s_head_bwd.d_attn_probs_buf.data, seq);
+                    head_bwd.d_attn_probs_buf.data, seq);
                 CUDA_KERNEL_CHECK();
                 boltzmann_softmax_kernel<<<seq, 256>>>(
-                    s_head_bwd.d_attn_probs_buf.data,
-                    s_head_bwd.d_attn_probs_buf.data,
+                    head_bwd.d_attn_probs_buf.data,
+                    head_bwd.d_attn_probs_buf.data,
                     seq, seq, 1.0f);
                 CUDA_KERNEL_CHECK();
             }
 
             // dV_s — pre-alloc reuse
-            CUDA_CHECK(cudaMemset(s_head_bwd.dV_s.data,0,seq*DH*sizeof(float)));
+            CUDA_CHECK(cudaMemset(head_bwd.dV_s.data,0,seq*DH*sizeof(float)));
             { dim3 g(DH,(seq+31)/32),b(32);
-              attn_dV_kernel<<<g,b>>>(s_head_bwd.d_attn_probs_buf.data,
-                                      s_head_bwd.d_head_out.data,
-                                      s_head_bwd.dV_s.data,seq,DH); CUDA_KERNEL_CHECK(); }
+              attn_dV_kernel<<<g,b>>>(head_bwd.d_attn_probs_buf.data,
+                                      head_bwd.d_head_out.data,
+                                      head_bwd.dV_s.data,seq,DH); CUDA_KERNEL_CHECK(); }
 
             // dV — pre-alloc reuse
             { int qb=(seq*DH+255)/256;
-              ns_diffuse_bwd_kernel<<<qb,256>>>(s_head_bwd.dV_s.data,
-                                                s_head_bwd.dV.data,seq,DH,
+              ns_diffuse_bwd_kernel<<<qb,256>>>(head_bwd.dV_s.data,
+                                                head_bwd.dV.data,seq,DH,
                   gpu_model.phys.ns_nu); CUDA_KERNEL_CHECK(); }
 
             // d_attn_probs — pre-alloc reuse
             { dim3 g(seq,(seq+31)/32),b(32);
-              attn_dAttnProbs_kernel<<<g,b>>>(s_head_bwd.d_head_out.data,hc.V_s.data,
-                                              s_head_bwd.d_attn_probs.data,seq,DH); CUDA_KERNEL_CHECK(); }
+              attn_dAttnProbs_kernel<<<g,b>>>(head_bwd.d_head_out.data,hc.V_s.data,
+                                              head_bwd.d_attn_probs.data,seq,DH); CUDA_KERNEL_CHECK(); }
 
             // d_scores — pre-alloc reuse
             float inv_sqrt_DH=1.0f/sqrtf((float)DH);
-            softmax_bwd_kernel<<<seq,256>>>(s_head_bwd.d_attn_probs_buf.data,
-                                            s_head_bwd.d_attn_probs.data,
-                                            s_head_bwd.d_scores.data,
+            softmax_bwd_kernel<<<seq,256>>>(head_bwd.d_attn_probs_buf.data,
+                                            head_bwd.d_attn_probs.data,
+                                            head_bwd.d_scores.data,
                                             seq,inv_sqrt_DH); CUDA_KERNEL_CHECK();
 
             // dQ_adv — pre-alloc reuse
             { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dQ_kernel<<<g,b>>>(s_head_bwd.d_scores.data,hc.K.data,
-                                      s_head_bwd.dQ_adv.data,seq,DH); CUDA_KERNEL_CHECK(); }
+              attn_dQ_kernel<<<g,b>>>(head_bwd.d_scores.data,hc.K.data,
+                                      head_bwd.dQ_adv.data,seq,DH); CUDA_KERNEL_CHECK(); }
 
             // dQ — pre-alloc reuse
             { int qb=(seq*DH+255)/256;
-              ns_advect_bwd_kernel<<<qb,256>>>(s_head_bwd.dQ_adv.data,
-                                               s_head_bwd.dQ.data,seq,DH,
+              ns_advect_bwd_kernel<<<qb,256>>>(head_bwd.dQ_adv.data,
+                                               head_bwd.dQ.data,seq,DH,
                   gpu_model.phys.ns_eta); CUDA_KERNEL_CHECK(); }
 
             // dK — pre-alloc reuse
             { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dK_kernel<<<g,b>>>(s_head_bwd.d_scores.data,hc.Q_adv.data,
-                                      s_head_bwd.dK.data,seq,DH); CUDA_KERNEL_CHECK(); }
+              attn_dK_kernel<<<g,b>>>(head_bwd.d_scores.data,hc.Q_adv.data,
+                                      head_bwd.dK.data,seq,DH); CUDA_KERNEL_CHECK(); }
 
             { dim3 g(D,(DH+31)/32),b(32);
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,s_head_bwd.dQ.data,
+              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,head_bwd.dQ.data,
                                          gpu_grads[base+h*4+0]->data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,s_head_bwd.dK.data,
+              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,head_bwd.dK.data,
                                          gpu_grads[base+h*4+1]->data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,s_head_bwd.dV.data,
+              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,head_bwd.dV.data,
                                          gpu_grads[base+h*4+2]->data,seq,D,DH); CUDA_KERNEL_CHECK(); }
             { dim3 g(seq,(D+31)/32),b(32);
-              attn_dX_from_QKV_kernel<<<g,b>>>(s_head_bwd.dQ.data,blk.W_Q[h].data,
+              attn_dX_from_QKV_kernel<<<g,b>>>(head_bwd.dQ.data,blk.W_Q[h].data,
                                                d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dX_from_QKV_kernel<<<g,b>>>(s_head_bwd.dK.data,blk.W_K[h].data,
+              attn_dX_from_QKV_kernel<<<g,b>>>(head_bwd.dK.data,blk.W_K[h].data,
                                                d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dX_from_QKV_kernel<<<g,b>>>(s_head_bwd.dV.data,blk.W_V[h].data,
+              attn_dX_from_QKV_kernel<<<g,b>>>(head_bwd.dV.data,blk.W_V[h].data,
                                                d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK(); }
         }
 
         // [v40-BUG1-FIX] d_dX_ln1 — pre-alloc reuse
-        GPUTensor& d_dX_ln1 = s_layer_bwd.d_dX_ln1;
+        GPUTensor& d_dX_ln1 = layer_bwd.d_dX_ln1;
         if (gpu_model.phys.reynolds && cache.ln1_w.valid()) {
             reynolds_bwd_kernel<<<seq,256>>>(
                 cache.block_input.data, blk.ln1_gamma.data,
@@ -974,7 +984,8 @@ void train_gpu(const std::string& dataset_path) {
             cfg.num_heads = 8;
             cfg.num_layers = 6;
             printf("  [v34-T4] T4 detected → 17M config (d=256 L=6 H=8)\n");
-            printf("           219M ke liye set karo: LOGOS_D_MODEL=1024 LOGOS_N_HEADS=16 LOGOS_N_LAYERS=16\n");
+            printf("           219M ke liye LOGOS_D_MODEL=1024 LOGOS_N_HEADS=16 LOGOS_N_LAYERS=16 set karo\n");
+            printf("           (CELL 1C mein ye env vars already set hain)\n");
         }
     }
     std::string cfg_err = validate_model_config(
@@ -1577,10 +1588,14 @@ void train_gpu(const std::string& dataset_path) {
                         GPUTensor t_ln     = gpu_alloc(SEQ, D);
                         GPUTensor t_attn   = gpu_alloc(SEQ, D);
 
+                        // [v41-MULTIGPU-FIX] GPU1 thread ke liye dedicated buffers pass karo
+                        HeadBwdBuffers*  hbuf = (gpu_id == 1) ? &s_head_bwd_gpu1  : nullptr;
+                        LayerBwdBuffers* lbuf = (gpu_id == 1) ? &s_layer_bwd_gpu1 : nullptr;
+
                         run_backward(model, cfg, grads,
                                      logits_grad, t_dX,
                                      t_ffnout, t_ffnA, t_ffnH,
-                                     t_n2, t_ln, t_attn, seq);
+                                     t_n2, t_ln, t_attn, seq, hbuf, lbuf);
                         model.update_norm_stats();
                         model.free_layer_cache();
                     }
