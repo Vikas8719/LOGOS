@@ -1,11 +1,18 @@
 #pragma once
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>   // [BUG1-FIX] __half type ke liye — VedicGEMM line 218-224 undefined
+#include <cuda_fp16.h>
 #include <vector>
 #include <stdexcept>
+#include <string>
 #include <cstdio>
 #include <cmath>
 
+#ifndef LOGOS_USE_CUBLAS
+#define LOGOS_USE_CUBLAS 1
+#endif
+#if !LOGOS_USE_CUBLAS
+#error "LOGOS GPU path requires cuBLAS (LOGOS_USE_CUBLAS=1)."
+#endif
 
 template<typename T>
 struct CudaPtr {
@@ -74,7 +81,6 @@ struct CudaPtr {
 
     bool empty() const { return ptr == nullptr || size == 0; }
 
-    
     T* release() noexcept {
         T* p = ptr;
         ptr  = nullptr;
@@ -88,6 +94,7 @@ private:
     }
 };
 
+#ifndef CUDA_CHECK
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t _e = (call); \
@@ -99,7 +106,9 @@ private:
             throw std::runtime_error(_msg); \
         } \
     } while(0)
+#endif
 
+#ifndef CUDA_KERNEL_CHECK
 #define CUDA_KERNEL_CHECK() \
     do { \
         cudaError_t _e = cudaGetLastError(); \
@@ -111,6 +120,7 @@ private:
             throw std::runtime_error(_msg); \
         } \
     } while(0)
+#endif
 
 struct GPUTensor {
     float* data = nullptr;
@@ -137,13 +147,6 @@ struct GPUTensor {
     bool valid() const { return data != nullptr && size > 0; }
 };
 
-struct VedicVerifyResult {
-    float checksum_C;
-    float checksum_vedic;
-    float relative_error;
-    bool  pass;
-};
-
 struct FreeEnergyResult {
     float cross_entropy;
     float entropy;
@@ -156,17 +159,21 @@ void      gpu_free(GPUTensor& t);
 void      h2d(GPUTensor& dst, const float* src, int size);
 void      d2h(float* dst, const GPUTensor& src, int size);
 
-void  cuda_vedic_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C);
-bool  cuda_vedic_gemm_uses_cublas();
-void  cuda_vedic_gemm_bias(const GPUTensor& A, const GPUTensor& W, const GPUTensor& bias, GPUTensor& C);
+void  cuda_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C);
+
+void cuda_gemm_rm(bool transA, bool transB, int M, int N, int K,
+                  float alpha, const float* A, int lda,
+                  const float* B, int ldb,
+                  float beta,  float* C, int ldc);
+
+void cuda_colsum_accumulate(const float* dY, float* db, int rows, int cols);
+void  cuda_gemm_bias(const GPUTensor& A, const GPUTensor& W, const GPUTensor& bias, GPUTensor& C);
 void  cuda_boltzmann_softmax(const GPUTensor& scores, GPUTensor& probs, int seq_len, int vocab_size, float temperature);
 void  cuda_layernorm(const GPUTensor& X, const GPUTensor& gamma, const GPUTensor& beta, GPUTensor& Y, int seq_len, int d_model, float eps = 1e-5f);
 void  cuda_gelu(GPUTensor& data);
 float cuda_clip_gradients(std::vector<GPUTensor*>& grads, float max_norm);
 
 extern __global__ void add_bias_kernel(float* __restrict__ C, const float* __restrict__ bias, int M, int N);
-
-VedicVerifyResult cuda_vedic_verify(const GPUTensor& A, const GPUTensor& B, const GPUTensor& C, float tolerance = 0.01f);
 
 void cuda_free_energy_loss(
     const float* d_logits,
@@ -191,16 +198,13 @@ __global__ void shm_hybrid_kernel(
 
 std::string validate_model_config(int d_model, int num_heads, int num_layers, int vocab_size, int max_seq_len);
 
-
 void cuda_flash_attention_fwd(
     const float* Q, const float* K, const float* V,
     float* out,
-    float* attn_ptr,    // nullable — if non-null: save attn probs for backward
+    float* attn_ptr,
     int seq, int DH,
     float scale,
-    bool causal,
-    bool shunyam, int window, int stride);
-
+    bool causal);
 
 void cuda_gemm_fp16_fp32out(const __half* A, int M, int K, const __half* B, int N, float* C, float alpha=1.f, float beta=0.f);
 void cuda_gemm_fp16_fp16out(const __half* A, int M, int K, const __half* B, int N, __half* C, float alpha=1.f, float beta=0.f);

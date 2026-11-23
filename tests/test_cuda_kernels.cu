@@ -1,5 +1,5 @@
 
-#include "../cuda/VedicGEMM.cuh"
+#include "../cuda/CublasGemm.cuh"
 #include "../cuda/ModelGPU.cuh"
 #include "../cuda/MixedPrecision.cuh"
 #include "../include/Model.hpp"
@@ -97,7 +97,7 @@ static void test_k1_add_bias_cross_file() {
 }
 
 static void test_k2_bias_equivalence() {
-    SECTION("K2: cuda_vedic_gemm_bias vs GEMM+add_bias equivalence");
+    SECTION("K2: cuda_gemm_bias vs GEMM+add_bias equivalence");
 
     int M=8, K=16, N=12;
     GPUTensor A    = gpu_alloc(M, K);
@@ -114,9 +114,9 @@ static void test_k2_bias_equivalence() {
     h2d(W, h_W.data(), K*N);
     h2d(bias, h_b.data(), N);
 
-    cuda_vedic_gemm_bias(A, W, bias, C1);
+    cuda_gemm_bias(A, W, bias, C1);
 
-    cuda_vedic_gemm(A, W, C2);
+    cuda_gemm(A, W, C2);
     int sz = M*N;
     add_bias_kernel<<<(sz+255)/256, 256>>>(C2.data, bias.data, M, N);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -128,7 +128,7 @@ static void test_k2_bias_equivalence() {
     for (int i=0; i<sz; ++i)
         max_diff = std::max(max_diff, std::abs(h1[i] - h2[i]));
 
-    std::cout << "    Backend: " << (cuda_vedic_gemm_uses_cublas() ? "cuBLAS" : "Vedic tiled") << "\n";
+    std::cout << "    Backend: cuBLAS\n";
     std::cout << "    Max diff between fused and GEMM+bias: " << max_diff << "\n";
     TEST("Bias equivalence: fused == GEMM+add_bias (diff < 1e-4)", max_diff < 1e-4f);
     TEST("Both outputs finite", all_finite(h1) && all_finite(h2));
@@ -503,8 +503,8 @@ static void test_k10_expmap0() {
     TEST("expmap0: max norm < 0.9999", max_norm < 0.9999f);
 }
 
-static void test_k11_vedic_verify_large() {
-    SECTION("K11: Gunitasamuchayah large matrix (Vedic checksum)");
+static void test_k11_cublas_gemm_vs_cpu() {
+    SECTION("K11: cuBLAS GEMM vs CPU reference (large matrices)");
 
     struct Case { int M, K, N; };
     std::vector<Case> cases = {
@@ -526,20 +526,30 @@ static void test_k11_vedic_verify_large() {
         h2d(A, hA.data(), c.M*c.K);
         h2d(B, hB.data(), c.K*c.N);
 
-        cuda_vedic_gemm(A, B, C);
+        cuda_gemm(A, B, C);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        VedicVerifyResult vr = cuda_vedic_verify(A, B, C, 0.05f);
-        if (!vr.pass) {
+        auto hC = read_gpu(C);
+        double worst = 0.0;
+        for (int i=0; i<c.M; ++i) {
+            for (int j=0; j<c.N; ++j) {
+                double acc = 0.0;
+                for (int k=0; k<c.K; ++k)
+                    acc += (double)hA[i*c.K+k] * (double)hB[k*c.N+j];
+                double err = std::abs((double)hC[i*c.N+j] - acc) / (1.0 + std::abs(acc));
+                worst = std::max(worst, err);
+            }
+        }
+        if (!(worst < 1e-4)) {
             all_pass = false;
             std::cerr << "    FAIL: M=" << c.M << " K=" << c.K << " N=" << c.N
-                      << " err=" << vr.relative_error << "\n";
+                      << " err=" << worst << "\n";
         } else {
             std::cout << "    M=" << c.M << " K=" << c.K << " N=" << c.N
-                      << " err=" << vr.relative_error * 100 << "%  ✓\n";
+                      << " err=" << worst * 100 << "%  ✓\n";
         }
     }
-    TEST("Gunitasamuchayah: all cases pass (err < 5%)", all_pass);
+    TEST("cuBLAS GEMM: all cases match CPU reference (err < 1e-4)", all_pass);
 }
 
 static void test_k12_e2e_loss_decrease() {
@@ -622,8 +632,7 @@ int main() {
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop, device);
     std::cout << "\nGPU: " << prop.name
               << "  sm_" << prop.major << prop.minor << "\n";
-    std::cout << "cuBLAS backend: "
-              << (cuda_vedic_gemm_uses_cublas() ? "ON" : "OFF (Vedic fallback)") << "\n\n";
+    std::cout << "cuBLAS backend: ON\n\n";
 
     try {
         test_k1_add_bias_cross_file();
@@ -636,7 +645,7 @@ int main() {
         test_k8_ns_diffuse_adjoint();
         test_k9_free_energy_grad_check();
         test_k10_expmap0();
-        test_k11_vedic_verify_large();
+        test_k11_cublas_gemm_vs_cpu();
         test_k12_e2e_loss_decrease();
     } catch (const std::exception& e) {
         std::cerr << "\n💥 FATAL: " << e.what() << "\n";

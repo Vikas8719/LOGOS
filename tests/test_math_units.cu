@@ -1,5 +1,5 @@
 
-#include "VedicGEMM.cuh"
+#include "CublasGemm.cuh"
 #include "ModelGPU.cuh"
 #include <cstdio>
 #include <cstdlib>
@@ -57,19 +57,13 @@ static std::vector<float> cpu_matmul(const std::vector<float>& A,
     return C;
 }
 
-static float cpu_vedic_checksum(const std::vector<float>& A,
-                                 const std::vector<float>& B,
-                                 int M, int K, int N) {
-    std::vector<float> col_A(K, 0.0f), row_B(K, 0.0f);
-    for (int m=0; m<M; m++)
-        for (int k=0; k<K; k++)
-            col_A[k] += A[m*K+k];
-    for (int k=0; k<K; k++)
-        for (int n=0; n<N; n++)
-            row_B[k] += B[k*N+n];
-    float dot = 0.0f;
-    for (int k=0; k<K; k++) dot += col_A[k] * row_B[k];
-    return dot;
+static float max_rel_err_vs_cpu(const GPUTensor& gC, const std::vector<float>& ref) {
+    std::vector<float> h(ref.size());
+    cudaMemcpy(h.data(), gC.data, ref.size()*sizeof(float), cudaMemcpyDeviceToHost);
+    float worst = 0.0f;
+    for (size_t i=0; i<ref.size(); i++)
+        worst = fmaxf(worst, fabsf(h[i]-ref[i]) / (1.0f + fabsf(ref[i])));
+    return worst;
 }
 
 static float cpu_free_energy(const std::vector<float>& logits,
@@ -86,8 +80,8 @@ static float cpu_free_energy(const std::vector<float>& logits,
     return CE - T*S;
 }
 
-static void test_gunitasamuchayah_identity() {
-    TEST_SECTION("M1: Gunitasamuchayah Identity (Vedic GEMM Checksum)");
+static void test_cublas_gemm_reference() {
+    TEST_SECTION("M1: cuBLAS GEMM vs CPU reference");
 
     const int M=16, K=32, N=16;
     std::vector<float> h_A(M*K), h_B(K*N);
@@ -95,33 +89,16 @@ static void test_gunitasamuchayah_identity() {
     for (int i=0; i<K*N; i++) h_B[i] = cosf((float)i * 0.2f);
 
     auto h_C = cpu_matmul(h_A, h_B, M, K, N);
-    float sum_C = 0.0f;
-    for (float v : h_C) sum_C += v;
-
-    float vedic_cpu = cpu_vedic_checksum(h_A, h_B, M, K, N);
-    printf("  sum(C)=%.6f | vedic_cpu=%.6f | err=%.6f\n",
-           sum_C, vedic_cpu, fabsf(sum_C - vedic_cpu));
-
-    float rel_err_cpu = fabsf(sum_C - vedic_cpu) / (fabsf(sum_C) + 1e-6f);
-    MATH_ASSERT(rel_err_cpu < 0.15f,
-        "Gunitasamuchayah CPU: sum(C) ≈ rowsums(A)·colsums(B)/K (within 15%)");
 
     GPUTensor gA = gpu_alloc(M,K), gB = gpu_alloc(K,N), gC = gpu_alloc(M,N);
     safe_cuda(cudaMemcpy(gA.data, h_A.data(), M*K*sizeof(float), cudaMemcpyHostToDevice), "h2d A");
     safe_cuda(cudaMemcpy(gB.data, h_B.data(), K*N*sizeof(float), cudaMemcpyHostToDevice), "h2d B");
-    cuda_vedic_gemm(gA, gB, gC);
+    cuda_gemm(gA, gB, gC);
     safe_cuda(cudaDeviceSynchronize(), "GEMM sync");
 
-    VedicVerifyResult vr = cuda_vedic_verify(gA, gB, gC, 0.15f);
-    printf("  GPU: checksum_C=%.6f | checksum_vedic=%.6f | rel_err=%.6f | pass=%d\n",
-           vr.checksum_C, vr.checksum_vedic, vr.relative_error, (int)vr.pass);
-
-    MATH_ASSERT(vr.pass,
-        "Gunitasamuchayah GPU: cuda_vedic_verify PASS (tolerance 15%)");
-    MATH_ASSERT(std::isfinite(vr.checksum_C),
-        "Gunitasamuchayah GPU: checksum_C is finite");
-    MATH_ASSERT(std::isfinite(vr.checksum_vedic),
-        "Gunitasamuchayah GPU: checksum_vedic is finite");
+    float err = max_rel_err_vs_cpu(gC, h_C);
+    printf("  GPU vs CPU max rel err = %.3e\n", err);
+    MATH_ASSERT(err < 1e-4f, "cuBLAS GEMM: matches CPU reference (rel err < 1e-4)");
 }
 
 static void test_free_energy_math() {
@@ -282,67 +259,6 @@ static void test_poincare_geometry() {
         "expmap0→logmap0: round-trip error < 1e-4 (inverse functions)");
 }
 
-static void test_nikhilam_complement() {
-    TEST_SECTION("M5: Nikhilam Complement Encoding (INT8 Quantization)");
-
-    const int N = 4096;
-    float *d_src, *d_dst, *d_absmax;
-    int8_t *d_int8;
-    safe_cuda(cudaMalloc(&d_src,    N*sizeof(float)),  "malloc src");
-    safe_cuda(cudaMalloc(&d_dst,    N*sizeof(float)),  "malloc dst");
-    safe_cuda(cudaMalloc(&d_int8,   N*sizeof(int8_t)), "malloc int8");
-    safe_cuda(cudaMalloc(&d_absmax, sizeof(float)),    "malloc absmax");
-    safe_cuda(cudaMemset(d_absmax, 0, sizeof(float)),  "memset absmax");
-
-    std::vector<float> h_src(N);
-    float amplitude = 7.5f;
-    for (int i=0; i<N; i++) h_src[i] = amplitude * sinf(2.0f * 3.14159f * i / 64.0f);
-    safe_cuda(cudaMemcpy(d_src, h_src.data(), N*sizeof(float), cudaMemcpyHostToDevice), "h2d src");
-
-    absmax_kernel<<<(N+255)/256, 256>>>(d_src, d_absmax, N);
-    safe_cuda(cudaDeviceSynchronize(), "absmax");
-    float h_absmax; safe_cuda(cudaMemcpy(&h_absmax, d_absmax, sizeof(float), cudaMemcpyDeviceToHost), "d2h absmax");
-    float scale = h_absmax / 127.0f;
-
-    nikhilam_quantize_kernel<<<(N+255)/256, 256>>>(d_src, d_int8, scale, N);
-    safe_cuda(cudaDeviceSynchronize(), "quant");
-    nikhilam_dequantize_kernel<<<(N+255)/256, 256>>>(d_int8, d_dst, scale, N);
-    safe_cuda(cudaDeviceSynchronize(), "dequant");
-
-    std::vector<float> h_dst(N);
-    std::vector<int8_t> h_int8(N);
-    safe_cuda(cudaMemcpy(h_dst.data(),  d_dst,  N*sizeof(float),  cudaMemcpyDeviceToHost), "d2h dst");
-    safe_cuda(cudaMemcpy(h_int8.data(), d_int8, N*sizeof(int8_t), cudaMemcpyDeviceToHost), "d2h int8");
-
-    bool complement_ok = true;
-    for (int i=0; i<N; i++) {
-        int8_t v    = h_int8[i];
-        int8_t comp = (int8_t)(-(int)v);   // signed additive complement
-        int    sum  = (int)v + (int)comp;
-        if (sum != 0) { complement_ok = false; break; }
-    }
-    MATH_ASSERT(complement_ok,
-        "Nikhilam: v + complement(v) = 127 (base complement property holds)");
-
-    float signal_power = 0.0f, noise_power = 0.0f;
-    for (int i=0; i<N; i++) {
-        signal_power += h_src[i] * h_src[i];
-        float noise = h_dst[i] - h_src[i];
-        noise_power += noise * noise;
-    }
-    signal_power /= N; noise_power /= N;
-    float snr_db = 10.0f * log10f(signal_power / (noise_power + 1e-15f));
-    printf("  Signal power=%.4f | Noise power=%.8f | SNR=%.2f dB\n",
-           signal_power, noise_power, snr_db);
-
-    MATH_ASSERT(snr_db >= 40.0f,
-        "Nikhilam INT8: SNR >= 40 dB (standard INT8 quantization spec)");
-    MATH_ASSERT(fabsf(h_absmax - amplitude) < 0.01f,
-        "Nikhilam: absmax kernel correctly finds signal amplitude");
-
-    cudaFree(d_src); cudaFree(d_dst); cudaFree(d_int8); cudaFree(d_absmax);
-}
-
 static void test_shm_fdt_condition() {
     TEST_SECTION("M6: SHM Hybrid — FDT Condition & Momentum Analysis");
 
@@ -468,75 +384,153 @@ static void test_boltzmann_temperature() {
     MATH_ASSERT(S5 > S1, "Boltzmann: entropy increases with temperature");
 }
 
-static void test_gunitasamuchayah_ffn_shapes() {
-    TEST_SECTION("M8: Gunitasamuchayah for Transformer FFN Shapes");
+static void test_cublas_ffn_shapes() {
+    TEST_SECTION("M8: cuBLAS GEMM for Transformer FFN Shapes");
 
     const int SEQ=16, D=32, D4=128;
 
     std::vector<float> h_A(SEQ*D), h_B(D*D4);
     for (int i=0; i<SEQ*D; i++) h_A[i] = cosf((float)i*0.15f);
     for (int i=0; i<D*D4;  i++) h_B[i] = sinf((float)i*0.07f);
-
-    float sum_C_ref = 0.0f;
     auto h_C = cpu_matmul(h_A, h_B, SEQ, D, D4);
-    for (float v : h_C) sum_C_ref += v;
-
-    float vedic_ref = cpu_vedic_checksum(h_A, h_B, SEQ, D, D4);
-    float rel = fabsf(sum_C_ref - vedic_ref) / (fabsf(sum_C_ref) + 1e-6f);
-
-    printf("  FFN W1 (seq×D)@(D×4D): sum_C=%.4f | vedic=%.4f | rel_err=%.4f\n",
-           sum_C_ref, vedic_ref, rel);
-    MATH_ASSERT(rel < 0.20f,
-        "Gunitasamuchayah: holds for FFN W1 shape (seq×D)@(D×4D) within 20%");
-
-    std::vector<float> h_A2(SEQ*D4), h_B2(D4*D);
-    for (int i=0; i<SEQ*D4; i++) h_A2[i] = sinf((float)i*0.11f);
-    for (int i=0; i<D4*D;   i++) h_B2[i] = cosf((float)i*0.09f);
-
-    auto h_C2 = cpu_matmul(h_A2, h_B2, SEQ, D4, D);
-    float sum_C2 = 0.0f; for (float v : h_C2) sum_C2 += v;
-    float vedic2 = cpu_vedic_checksum(h_A2, h_B2, SEQ, D4, D);
-    float rel2 = fabsf(sum_C2 - vedic2) / (fabsf(sum_C2) + 1e-6f);
-
-    printf("  FFN W2 (seq×4D)@(4D×D): sum_C=%.4f | vedic=%.4f | rel_err=%.4f\n",
-           sum_C2, vedic2, rel2);
-    MATH_ASSERT(rel2 < 0.20f,
-        "Gunitasamuchayah: holds for FFN W2 shape (seq×4D)@(4D×D) within 20%");
 
     GPUTensor gA = gpu_alloc(SEQ,D), gB = gpu_alloc(D,D4), gC = gpu_alloc(SEQ,D4);
     safe_cuda(cudaMemcpy(gA.data, h_A.data(),  SEQ*D*sizeof(float),  cudaMemcpyHostToDevice), "h2d A");
     safe_cuda(cudaMemcpy(gB.data, h_B.data(),  D*D4*sizeof(float),   cudaMemcpyHostToDevice), "h2d B");
-    cuda_vedic_gemm(gA, gB, gC);
+    cuda_gemm(gA, gB, gC);
     safe_cuda(cudaDeviceSynchronize(), "GEMM sync");
-    VedicVerifyResult vr = cuda_vedic_verify(gA, gB, gC, 0.20f);
-    printf("  GPU verify: pass=%d | rel_err=%.4f\n", (int)vr.pass, vr.relative_error);
-    MATH_ASSERT(vr.pass,
-        "Gunitasamuchayah GPU: FFN W1 shape PASS (tolerance 20%)");
+    float err1 = max_rel_err_vs_cpu(gC, h_C);
+    printf("  FFN W1 (seq×D)@(D×4D): max rel err = %.3e\n", err1);
+    MATH_ASSERT(err1 < 1e-4f, "cuBLAS GEMM: FFN W1 shape (seq×D)@(D×4D) matches CPU");
+
+    std::vector<float> h_A2(SEQ*D4), h_B2(D4*D);
+    for (int i=0; i<SEQ*D4; i++) h_A2[i] = sinf((float)i*0.11f);
+    for (int i=0; i<D4*D;   i++) h_B2[i] = cosf((float)i*0.09f);
+    auto h_C2 = cpu_matmul(h_A2, h_B2, SEQ, D4, D);
+
+    GPUTensor gA2 = gpu_alloc(SEQ,D4), gB2 = gpu_alloc(D4,D), gC2 = gpu_alloc(SEQ,D);
+    safe_cuda(cudaMemcpy(gA2.data, h_A2.data(), SEQ*D4*sizeof(float), cudaMemcpyHostToDevice), "h2d A2");
+    safe_cuda(cudaMemcpy(gB2.data, h_B2.data(), D4*D*sizeof(float),   cudaMemcpyHostToDevice), "h2d B2");
+    cuda_gemm(gA2, gB2, gC2);
+    safe_cuda(cudaDeviceSynchronize(), "GEMM2 sync");
+    float err2 = max_rel_err_vs_cpu(gC2, h_C2);
+    printf("  FFN W2 (seq×4D)@(4D×D): max rel err = %.3e\n", err2);
+    MATH_ASSERT(err2 < 1e-4f, "cuBLAS GEMM: FFN W2 shape (seq×4D)@(4D×D) matches CPU");
+}
+
+static void test_layernorm_final() {
+    TEST_SECTION("M9: LayerNorm (cuda_layernorm, used by final LN) vs CPU reference");
+
+    const int SEQ = 6, D = 64;
+    const float eps = 1e-5f;
+
+    // rows with different offset/scale so mean/var normalisation is actually exercised
+    std::vector<float> hx(SEQ * D), hg(D), hb(D);
+    for (int i = 0; i < SEQ * D; i++)
+        hx[i] = 3.0f * sinf((float)i * 0.37f) + (float)(i / D) * 5.0f - 2.0f;
+    for (int d = 0; d < D; d++) {
+        hg[d] = 0.5f + 0.01f * (float)d;
+        hb[d] = 0.1f * cosf((float)d * 0.5f);
+    }
+
+    auto cpu_ln = [&](const std::vector<float>& x, const std::vector<float>& g,
+                      const std::vector<float>& b) {
+        std::vector<float> y(SEQ * D);
+        for (int s = 0; s < SEQ; s++) {
+            double mean = 0.0, var = 0.0;
+            for (int d = 0; d < D; d++) mean += x[s * D + d];
+            mean /= D;
+            for (int d = 0; d < D; d++) { double t = x[s * D + d] - mean; var += t * t; }
+            var /= D;
+            double inv = 1.0 / sqrt(var + (double)eps);
+            for (int d = 0; d < D; d++)
+                y[s * D + d] = (float)((x[s * D + d] - mean) * inv * g[d] + b[d]);
+        }
+        return y;
+    };
+
+    GPUTensor X = gpu_alloc(SEQ, D), G = gpu_alloc(1, D), B = gpu_alloc(1, D), Y = gpu_alloc(SEQ, D);
+    auto run_gpu = [&](const std::vector<float>& x, const std::vector<float>& g,
+                       const std::vector<float>& b) {
+        safe_cuda(cudaMemcpy(X.data, x.data(), SEQ * D * sizeof(float), cudaMemcpyHostToDevice), "h2d X");
+        safe_cuda(cudaMemcpy(G.data, g.data(), D * sizeof(float), cudaMemcpyHostToDevice), "h2d gamma");
+        safe_cuda(cudaMemcpy(B.data, b.data(), D * sizeof(float), cudaMemcpyHostToDevice), "h2d beta");
+        cuda_layernorm(X, G, B, Y, SEQ, D, eps);
+        safe_cuda(cudaDeviceSynchronize(), "layernorm sync");
+        std::vector<float> out(SEQ * D);
+        safe_cuda(cudaMemcpy(out.data(), Y.data, SEQ * D * sizeof(float), cudaMemcpyDeviceToHost), "d2h Y");
+        return out;
+    };
+    auto max_abs_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+        float w = 0.0f;
+        for (size_t i = 0; i < a.size(); i++) w = fmaxf(w, fabsf(a[i] - b[i]));
+        return w;
+    };
+
+    // 1) general gamma/beta vs CPU double-precision reference
+    auto y_gpu = run_gpu(hx, hg, hb);
+    auto y_cpu = cpu_ln(hx, hg, hb);
+    float err = max_abs_diff(y_gpu, y_cpu);
+    printf("  LN (gamma/beta) GPU vs CPU max abs err = %.3e\n", err);
+    MATH_ASSERT(err < 1e-4f, "LayerNorm: matches CPU reference with gamma/beta (err < 1e-4)");
+
+    // 2) gamma=1, beta=0 -> every row has mean ~0, var ~1
+    std::vector<float> ones(D, 1.0f), zeros(D, 0.0f);
+    auto y_id = run_gpu(hx, ones, zeros);
+    float worst_mean = 0.0f, worst_var_dev = 0.0f;
+    for (int s = 0; s < SEQ; s++) {
+        double m = 0.0, v = 0.0;
+        for (int d = 0; d < D; d++) m += y_id[s * D + d];
+        m /= D;
+        for (int d = 0; d < D; d++) { double t = y_id[s * D + d] - m; v += t * t; }
+        v /= D;
+        worst_mean    = fmaxf(worst_mean, (float)fabs(m));
+        worst_var_dev = fmaxf(worst_var_dev, (float)fabs(v - 1.0));
+    }
+    printf("  gamma=1,beta=0: worst |row mean| = %.3e | worst |row var-1| = %.3e\n",
+           worst_mean, worst_var_dev);
+    MATH_ASSERT(worst_mean < 1e-4f, "LayerNorm: row mean ≈ 0 (gamma=1, beta=0)");
+    MATH_ASSERT(worst_var_dev < 1e-3f, "LayerNorm: row variance ≈ 1 (gamma=1, beta=0)");
+
+    // 3) shift + scale invariance of the input
+    std::vector<float> hx2(SEQ * D);
+    for (int i = 0; i < SEQ * D; i++) hx2[i] = 100.0f * hx[i] + 50.0f;
+    auto y_inv = run_gpu(hx2, ones, zeros);
+    float inv_err = max_abs_diff(y_inv, y_id);
+    printf("  LN(100*x+50) vs LN(x): max abs diff = %.3e\n", inv_err);
+    MATH_ASSERT(inv_err < 1e-3f, "LayerNorm: invariant to input shift/scale (err < 1e-3)");
+
+    // 4) constant row -> finite output (var = 0, eps must protect)
+    std::vector<float> hc(SEQ * D, 7.0f);
+    auto y_const = run_gpu(hc, ones, zeros);
+    bool finite = true;
+    for (float v : y_const) if (!std::isfinite(v)) { finite = false; break; }
+    MATH_ASSERT(finite, "LayerNorm: constant row stays finite (eps guard)");
 }
 
 int main() {
     printf("╔═══════════════════════════════════════════════════╗\n");
     printf("║  LOGOS Test 2: Mathematical Unit Tests           ║\n");
-    printf("║  Vedic Formula vs Modern Math Comparison         ║\n");
+    printf("║  CUDA kernels vs CPU reference                   ║\n");
     printf("╚═══════════════════════════════════════════════════╝\n");
 
-    test_gunitasamuchayah_identity();
+    test_cublas_gemm_reference();
     test_free_energy_math();
     test_leapfrog_energy_conservation();
     test_poincare_geometry();
-    test_nikhilam_complement();
     test_shm_fdt_condition();
     test_boltzmann_temperature();
-    test_gunitasamuchayah_ffn_shapes();
+    test_cublas_ffn_shapes();
+    test_layernorm_final();
 
     printf("\n══════════════════════════════════════════════════════\n");
     printf("  Results: %d passed | %d failed\n", g_pass, g_fail);
     printf("══════════════════════════════════════════════════════\n");
 
     if (g_any_fail) {
-        printf("❌ TEST 2 FAILED — formula mismatch detected\n");
+        printf("❌ TEST 2 FAILED — kernel/reference mismatch detected\n");
         return 1;
     }
-    printf("✅ TEST 2 PASSED — Vedic formulas match modern math\n");
+    printf("✅ TEST 2 PASSED — CUDA kernels match reference math\n");
     return 0;
 }

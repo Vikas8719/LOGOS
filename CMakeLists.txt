@@ -1,23 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-project(LOGOS VERSION 0.13.0 LANGUAGES CXX)
-# v0.13.0 — MULL Mutation Testing wired
-#
-#   ASan+UBSan: CPU tests (T2_Math_Unit, T2b_Checkpoint) mein ON
-#     cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug ..
-#     ctest -LE GPU   ← CPU tests run honge sanitizers ke saath
-#
-#   CUDA GPU tests: compute-sanitizer via CTest environment
-#     LOGOS_USE_COMPUTE_SANITIZER=ON set karo
-#     ctest -L GPU   ← compute-sanitizer --tool memcheck se wrap hoga
-#
-#   MULL Mutation Testing: test suite ki weakness dhundta hai
-#     cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_BUILD_TYPE=Debug ..
-#     cmake --build build --target mull-run
-#     ← Automatically mutants banata hai + test_math_unit + test_checkpoint chalata hai
-#     ← Report: build/mull-report/index.html
-#
-#   --use_fast_math sirf production (logos_gpu) mein hai
-#   test targets mein --use_fast_math NAHI — warna sanitizer results galat aate hain
+project(LOGOS VERSION 0.14.0 LANGUAGES CXX)
+
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,34 +9,12 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 include_directories(include)
 
-# ── CPU executable ────────────────────────────────────────────
-add_executable(logos
-    src/main.cpp
-    src/Checkpoint.cpp
-)
-if(APPLE)
-    target_compile_options(logos PRIVATE -O3)
-elseif(MSVC)
-    target_compile_options(logos PRIVATE $<$<CONFIG:Release>:/O2>)
-else()
-    target_compile_options(logos PRIVATE -O3 -march=x86-64)
-endif()
-
-# ── Sanitizer option ─────────────────────────────────────────
-# cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug ..
-# Sirf CPU tests pe kaam karta hai (ASan CUDA ke saath incompatible hai).
-# Debug build zaruri hai — Release mein inlining se stack traces galat aate hain.
+# ── Options ───────────────────────────────────────────────────
 option(LOGOS_SANITIZE "Enable ASan + UBSan on CPU test targets" OFF)
-
-# Compute-sanitizer option (GPU memory checker — cuda-memcheck successor)
-# cmake -DLOGOS_USE_COMPUTE_SANITIZER=ON ..
-# Yeh flag CTest GPU tests ko compute-sanitizer --tool memcheck se wrap karta hai.
-# Requirement: compute-sanitizer PATH mein hona chahiye (CUDA Toolkit 11.1+ ke saath aata hai).
 option(LOGOS_USE_COMPUTE_SANITIZER "Wrap GPU CTest tests with compute-sanitizer" OFF)
 
 function(logos_set_cpu_test_options target)
     if(MSVC)
-        # MSVC: ASan support hai lekin /fsanitize=address sirf VS 2019 16.9+ mein
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
         if(LOGOS_SANITIZE)
             target_compile_options(${target} PRIVATE /fsanitize=address)
@@ -62,39 +23,80 @@ function(logos_set_cpu_test_options target)
     elseif(APPLE)
         target_compile_options(${target} PRIVATE -O1 -g -std=c++20)
         if(LOGOS_SANITIZE)
-            # Apple clang: ASan + UBSan
             target_compile_options(${target} PRIVATE
                 -fsanitize=address,undefined
                 -fno-omit-frame-pointer
                 -fno-optimize-sibling-calls)
-            target_link_options(${target} PRIVATE
-                -fsanitize=address,undefined)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
             message(STATUS "  ${target}: ASan+UBSan ON (Apple clang)")
         endif()
     else()
-        # Linux GCC/Clang
-        # -O1 (not -O2): sanitizers need some optimization but not full
-        # -g: debug symbols for stack traces
-        # -fno-omit-frame-pointer: readable stack traces
         target_compile_options(${target} PRIVATE -O1 -g -march=x86-64 -std=c++20
             -fno-omit-frame-pointer)
         if(LOGOS_SANITIZE)
             target_compile_options(${target} PRIVATE
                 -fsanitize=address,undefined
                 -fsanitize-address-use-after-scope
-                -fno-sanitize-recover=undefined)
-            # UBSan extra checks: integer overflow, null deref, alignment
-            target_compile_options(${target} PRIVATE
+                -fno-sanitize-recover=undefined
                 -fsanitize=signed-integer-overflow
                 -fsanitize=null
                 -fsanitize=alignment
                 -fsanitize=bounds)
-            target_link_options(${target} PRIVATE
-                -fsanitize=address,undefined)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
             message(STATUS "  ${target}: ASan+UBSan ON (GCC/Clang Linux)")
         endif()
     endif()
 endfunction()
+
+set(ASAN_ENV
+    "ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:print_stats=1:check_initialization_order=1:detect_stack_use_after_return=1"
+    "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+)
+
+# ── CPU test: checkpoint roundtrip (host-side weights container) ──
+add_executable(test_checkpoint
+    tests/test_checkpoint.cpp
+    src/Checkpoint.cpp
+)
+target_include_directories(test_checkpoint PRIVATE include)
+logos_set_cpu_test_options(test_checkpoint)
+
+enable_testing()
+add_test(NAME "T2b_Checkpoint" COMMAND test_checkpoint)
+set_tests_properties("T2b_Checkpoint" PROPERTIES TIMEOUT 120 ENVIRONMENT "${ASAN_ENV}")
+
+# ── CPU test suite (no CUDA needed) ───────────────────────────
+#   T20 tokenizer unit | T21 physics (CPU) | T22 fuzz | T23 integration | T24 bench
+#   ctest -L UNIT | -L FUZZ | -L INTEGRATION | -L PHYSICS | -L BENCH
+find_package(Threads REQUIRED)
+option(LOGOS_TSAN "ThreadSanitizer on CPU test targets (Linux only; do not combine with LOGOS_SANITIZE)" OFF)
+set(LOGOS_FUZZ_ITERS "3000" CACHE STRING "Iterations for T22 fuzz tests")
+set(LOGOS_FUZZ_SEED "1337" CACHE STRING "RNG seed for T22 fuzz tests (nightly CI randomises it)")
+set(CPU_TEST_ENV ${ASAN_ENV} "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1"
+    "LOGOS_FUZZ_ITERS=${LOGOS_FUZZ_ITERS}" "LOGOS_FUZZ_SEED=${LOGOS_FUZZ_SEED}")
+
+function(logos_add_cpu_test target src test_name timeout labels)
+    add_executable(${target} ${src})
+    target_include_directories(${target} PRIVATE include tests/cpu)
+    target_link_libraries(${target} PRIVATE Threads::Threads)
+    logos_set_cpu_test_options(${target})
+    if(LOGOS_TSAN AND NOT MSVC AND NOT APPLE AND NOT WIN32)
+        target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=thread)
+    endif()
+    add_test(NAME ${test_name} COMMAND ${target})
+    set_tests_properties(${test_name} PROPERTIES
+        TIMEOUT ${timeout} LABELS "${labels}" ENVIRONMENT "${CPU_TEST_ENV}")
+endfunction()
+
+logos_add_cpu_test(test_tokenizer   tests/cpu/test_tokenizer.cpp   "T20_Tokenizer_Unit" 300 "CPU;UNIT")
+logos_add_cpu_test(test_physics_cpu tests/cpu/test_physics_cpu.cpp "T21_Physics_CPU"    120 "CPU;UNIT;PHYSICS")
+logos_add_cpu_test(test_fuzz        tests/cpu/test_fuzz.cpp        "T22_Fuzz"           900 "CPU;FUZZ")
+logos_add_cpu_test(test_integration tests/cpu/test_integration.cpp "T23_Integration"    600 "CPU;INTEGRATION")
+logos_add_cpu_test(test_bench       tests/cpu/bench_tokenizer.cpp  "T24_Bench"           900 "CPU;BENCH")
+if(NOT MSVC)
+    target_compile_options(test_bench PRIVATE -O2)   # later flag wins over -O1: bench Release-like
+endif()
 
 # ── CUDA detection ────────────────────────────────────────────
 include(CheckLanguage)
@@ -105,26 +107,26 @@ if(CMAKE_CUDA_COMPILER)
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "✅ CUDA found — building GPU targets")
 
-    option(LOGOS_USE_CUBLAS "Use cuBLAS as the primary CUDA GEMM backend" ON)
-    option(LOGOS_CUBLAS_TF32 "Use NVIDIA Tensor Core TF32 math for float GEMM" OFF)
+    # cuBLAS is MANDATORY — every forward/backward GEMM/GEMV goes through cuda_gemm_rm().
+    # (LOGOS_USE_CUBLAS=OFF stays ON.)
+    set(LOGOS_USE_CUBLAS ON CACHE BOOL "cuBLAS is the only CUDA GEMM backend" FORCE)
+    option(LOGOS_CUBLAS_TF32 "Use NVIDIA Tensor Core TF32 math for float GEMM (Ampere+ only)" OFF)
 
-    set(LOGOS_CUDA_LIBRARIES CUDA::cudart)
-    if(LOGOS_USE_CUBLAS)
-        list(APPEND LOGOS_CUDA_LIBRARIES CUDA::cublas)
-    endif()
+    set(LOGOS_CUDA_LIBRARIES CUDA::cudart CUDA::cublas)
 
     # ── CUDA Architecture ─────────────────────────────────────
     set(CUDA_ARCH_MODE "native" CACHE STRING
         "CUDA arch mode: 'native' (auto-detect) or 'release' (all GPUs)")
 
-    if(CUDA_ARCH_MODE STREQUAL "release")
+    if(CUDA_ARCH_MODE MATCHES "^[0-9]+(;[0-9]+)*$")
+        # explicit list, e.g. -DCUDA_ARCH_MODE=75 or "75;86" (compile-only CI runners have no GPU to 'native'-detect)
+        set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCH_MODE}"
+            CACHE STRING "CUDA architectures" FORCE)
+        message(STATUS "CUDA arch: EXPLICIT — ${CMAKE_CUDA_ARCHITECTURES}")
+    elseif(CUDA_ARCH_MODE STREQUAL "release")
         set(CMAKE_CUDA_ARCHITECTURES "60;70;75;80;86;89;90"
             CACHE STRING "CUDA architectures" FORCE)
         message(STATUS "CUDA arch: RELEASE — ${CMAKE_CUDA_ARCHITECTURES}")
-        message(STATUS "  sm_90 = H100 SXM/PCIe (Hopper)")
-        message(STATUS "  sm_89 = RTX 4090 (Ada Lovelace)")
-        message(STATUS "  sm_86 = A10/A30/RTX 3090 (Ampere)")
-        message(STATUS "  sm_80 = A100 (Ampere)")
     else()
         set(CMAKE_CUDA_ARCHITECTURES "native"
             CACHE STRING "CUDA architectures" FORCE)
@@ -132,9 +134,6 @@ if(CMAKE_CUDA_COMPILER)
     endif()
 
     # ── CUDA flags: PRODUCTION (logos_gpu, logos_core) ───────
-    # --use_fast_math: training speed ke liye zaroori hai
-    #   lekin issse NaN/Inf quiet ho jaate hain aur tests galat pass karte hain.
-    #   ISLIYE: sirf logos_gpu aur logos_core mein. Test targets mein NAHI.
     set(LOGOS_CUDA_FLAGS_PROD
         $<$<COMPILE_LANGUAGE:CUDA>:
             -O3
@@ -147,10 +146,7 @@ if(CMAKE_CUDA_COMPILER)
         $<$<COMPILE_LANGUAGE:CXX>:-O3>
     )
 
-    # ── CUDA flags: TEST targets ──────────────────────────────
-    # --use_fast_math NAHI: warna inf/nan tests bypass ho jaate hain
-    # -O1 -g: stack traces readable honge compute-sanitizer output mein
-    # --generate-line-info: CUDA kernel line numbers compute-sanitizer mein
+    # ── CUDA flags: TEST targets (no --use_fast_math) ─────────
     set(LOGOS_CUDA_FLAGS_TEST
         $<$<COMPILE_LANGUAGE:CUDA>:
             -O1
@@ -164,19 +160,9 @@ if(CMAKE_CUDA_COMPILER)
         $<$<COMPILE_LANGUAGE:CXX>:-O1 -g>
     )
 
-    # ── [v27-ODR-FIX] logos_core STATIC LIBRARY ──────────────
-    # ROOT CAUSE of "multiple definition" linker errors:
-    #   VedicGEMM.cu + ModelGPU.cu har executable mein alag compile ho rahe the.
-    #   Anonymous namespace kernels (MixedPrecision.cuh) ODR se safe hain,
-    #   lekin NVCC __device_stub__ wrappers (cast_fp32_to_fp16_kernel etc.)
-    #   tab bhi global scope mein emit hote hain jab VedicGEMM.cu + ModelGPU.cu
-    #   dono ek hi executable mein linked hote hain — ek TU se aaya stub
-    #   doosre TU ka stub se collide karta hai.
-    # FIX: VedicGEMM.cu + ModelGPU.cu ek baar compile karo (static library),
-    #   phir har executable sirf apni test .cu file + logos_core link kare.
-    #   Ek hi .o file = zero duplicate symbols = no linker error.
+    # ── logos_core STATIC LIBRARY (ODR fix) ───────────────────
     add_library(logos_core STATIC
-        cuda/VedicGEMM.cu
+        cuda/CublasGemm.cu
         cuda/ModelGPU.cu
         src/Checkpoint.cpp
     )
@@ -191,9 +177,7 @@ if(CMAKE_CUDA_COMPILER)
         POSITION_INDEPENDENT_CODE ON)
 
     # ── GPU Training executable ───────────────────────────────
-    add_executable(logos_gpu
-        cuda/train_gpu.cu
-    )
+    add_executable(logos_gpu cuda/train_gpu.cu)
     target_include_directories(logos_gpu PRIVATE include cuda)
     target_compile_options(logos_gpu PRIVATE ${LOGOS_CUDA_FLAGS_PROD})
     target_link_libraries(logos_gpu PRIVATE logos_core)
@@ -201,924 +185,88 @@ if(CMAKE_CUDA_COMPILER)
         LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
         LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
 
-    # ── TEST 1: Syntax & Build Test ───────────────────────────
-    add_executable(test_syntax_build
-        tests/test_syntax_build.cu
-    )
-    target_include_directories(test_syntax_build PRIVATE include cuda tests)
-    target_compile_options(test_syntax_build PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
-    target_link_libraries(test_syntax_build PRIVATE logos_core)
-    target_compile_definitions(test_syntax_build PRIVATE
-        LOGOS_TEST_BUILD=1
-        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
-        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
+    # ── GPU test targets ──────────────────────────────────────
+    function(logos_add_gpu_test target src)
+        add_executable(${target} ${src})
+        target_include_directories(${target} PRIVATE include cuda tests)
+        target_compile_options(${target} PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
+        target_link_libraries(${target} PRIVATE logos_core)
+        target_compile_definitions(${target} PRIVATE
+            LOGOS_TEST_BUILD=1
+            LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
+            LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
+    endfunction()
 
-    # ── TEST 2: CUDA Mathematical Unit Test ────────────────────
-    add_executable(test_math_units_gpu
-        tests/test_math_units.cu
-    )
-    target_include_directories(test_math_units_gpu PRIVATE include cuda tests)
-    target_compile_options(test_math_units_gpu PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
-    target_link_libraries(test_math_units_gpu PRIVATE logos_core)
+    logos_add_gpu_test(test_syntax_build    tests/test_syntax_build.cu)     # T1
+    logos_add_gpu_test(test_math_units_gpu  tests/test_math_units.cu)       # T2
+    logos_add_gpu_test(test_memory_stress   tests/test_memory_stress.cu)    # T3
+    logos_add_gpu_test(test_large_data_scale tests/test_large_data_scale.cu)# T4
+    logos_add_gpu_test(test_cuda_kernels    tests/test_cuda_kernels.cu)     # T5
+    logos_add_gpu_test(test_cublas_gemm     tests/test_cublas_gemm.cu)      # T10
 
-    # ── TEST 2: Mathematical Unit Test (CPU-only) ─────────────
-    add_executable(test_math_unit
-        tests/test_math_unit.cpp
-    )
-    target_include_directories(test_math_unit PRIVATE include tests)
-    logos_set_cpu_test_options(test_math_unit)
-
-    # ── RapidCheck — C++ Property-Based Testing ──────────────
-    # cmake -DLOGOS_RAPIDCHECK=ON ..
-    # cmake --build build --target test_rapidcheck
-    # RC1: VedicGEMM == reference, RC2: VEDIC_BLOCK boundaries,
-    # RC3: gemm_bias, RC4: Free Energy, RC5: reshape, RC6: Riemannian,
-    # RC7: checkpoint size, RC8: leapfrog vs euler
-    option(LOGOS_RAPIDCHECK "Enable RapidCheck C++ property-based tests" OFF)
-    if(LOGOS_RAPIDCHECK)
-        find_package(rapidcheck QUIET)
-        if(NOT rapidcheck_FOUND)
-            include(FetchContent)
-            FetchContent_Declare(
-                rapidcheck
-                GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
-                GIT_TAG        master
-            )
-            FetchContent_MakeAvailable(rapidcheck)
-        endif()
-
-        add_executable(test_rapidcheck
-            tests/test_rapidcheck.cpp
-            src/VedicGEMM.cpp
-            src/Checkpoint.cpp
-        )
-        target_include_directories(test_rapidcheck PRIVATE include tests)
-        logos_set_cpu_test_options(test_rapidcheck)
-        target_link_libraries(test_rapidcheck PRIVATE rapidcheck)
-
-        enable_testing()
-        add_test(NAME "T7_RapidCheck" COMMAND test_rapidcheck)
-        set_tests_properties("T7_RapidCheck" PROPERTIES
-            TIMEOUT 1200
-            LABELS "PROPERTY"
-            # RC_PARAMS: RapidCheck runtime config (semicolon-separated key=value)
-            # max_success=1000 : 1000 random cases per rc::check (was 500 — too lenient)
-            # max_discard_ratio=10 : RC_PRE rejections 10x se zyada ho toh fail
-            # noshrink=0         : counterexample shrinking ON (default) — important!
-            # seed=<N>           : reproducible run ke liye (CI mein unset = random)
-            ENVIRONMENT "RC_PARAMS=max_success=1000;max_discard_ratio=10")
-        message(STATUS "✅ RapidCheck ENABLED — target: test_rapidcheck")
-        message(STATUS "   Run: cmake --build build --target test_rapidcheck")
-        message(STATUS "   CTest: ctest -L PROPERTY --output-on-failure")
-        message(STATUS "   Strict: RC_PARAMS=max_success=1000;max_discard_ratio=10")
-    endif()
-
-    # ── TEST 2b: Checkpoint roundtrip ────────────────────────
-    add_executable(test_checkpoint
-        tests/test_checkpoint.cpp
-        src/Checkpoint.cpp
-    )
-    target_include_directories(test_checkpoint PRIVATE include)
-    logos_set_cpu_test_options(test_checkpoint)
-
-    # ── TEST 3: Memory & Bounds Stress Test ───────────────────
-    add_executable(test_memory_stress
-        tests/test_memory_stress.cu
-    )
-    target_include_directories(test_memory_stress PRIVATE include cuda tests)
-    target_compile_options(test_memory_stress PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
-    target_link_libraries(test_memory_stress PRIVATE logos_core)
-    target_compile_definitions(test_memory_stress PRIVATE
-        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
-        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
-
-    # ── TEST 4: Large Data Scale & Production Test ────────────
-    add_executable(test_large_data_scale
-        tests/test_large_data_scale.cu
-    )
-    target_include_directories(test_large_data_scale PRIVATE include cuda tests)
-    target_compile_options(test_large_data_scale PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
-    target_link_libraries(test_large_data_scale PRIVATE logos_core)
-    target_compile_definitions(test_large_data_scale PRIVATE
-        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
-        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
-
-    # ── TEST 5: CUDA Kernel Correctness ──────────────────────
-    # add_bias_kernel cross-file launch verify (the VedicGEMM.cuh fix),
-    # AMP bias path, training/validation forward modes, SHM optimizer,
-    # adjoint gradient checks, FP16 cast, free_energy grad, E2E step.
-    add_executable(test_cuda_kernels
-        tests/test_cuda_kernels.cu
-    )
-    target_include_directories(test_cuda_kernels PRIVATE include cuda tests)
-    target_compile_options(test_cuda_kernels PRIVATE ${LOGOS_CUDA_FLAGS_TEST})
-    target_link_libraries(test_cuda_kernels PRIVATE logos_core)
-    target_compile_definitions(test_cuda_kernels PRIVATE
-        LOGOS_USE_CUBLAS=$<BOOL:${LOGOS_USE_CUBLAS}>
-        LOGOS_CUBLAS_TF32=$<BOOL:${LOGOS_CUBLAS_TF32}>)
-
-    # ── CTest integration ─────────────────────────────────────
-    enable_testing()
-
-    # ── CPU tests: ASan+UBSan environment ────────────────────
-    # ASAN_OPTIONS / UBSAN_OPTIONS runtime behavior set karo:
-    #   halt_on_error=1    → pehli error pe abort (warna continue karta hai silently)
-    #   detect_leaks=1     → LeakSanitizer ON (ASan ke saath bundled)
-    #   print_stats=1      → end mein memory stats print ho
-    #   suppressions       → false positives filter karne ke liye (future use)
-    # NOTE: LOGOS_SANITIZE=OFF hone par bhi yeh env vars harmless hain
-    #       (runtime sanitizer absent hoga, vars ignore honge)
-    set(ASAN_ENV
-        "ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:print_stats=1:check_initialization_order=1:detect_stack_use_after_return=1"
-        "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+    # ── GPU CTest registration ────────────────────────────────
+    set(LOGOS_GPU_TESTS
+        "T1_Syntax_Build:test_syntax_build:300"
+        "T2_Math_Unit_GPU:test_math_units_gpu:300"
+        "T3_Memory_Stress:test_memory_stress:600"
+        "T4_Large_Data_Scale:test_large_data_scale:900"
+        "T5_CUDA_Kernels:test_cuda_kernels:300"
+        "T10_CuBLAS_GEMM:test_cublas_gemm:300"
     )
 
-    add_test(NAME "T2_Math_Unit"   COMMAND test_math_unit)
-    add_test(NAME "T2b_Checkpoint" COMMAND test_checkpoint)
-    set_tests_properties("T2_Math_Unit"   PROPERTIES TIMEOUT 120 ENVIRONMENT "${ASAN_ENV}")
-    set_tests_properties("T2b_Checkpoint" PROPERTIES TIMEOUT 120 ENVIRONMENT "${ASAN_ENV}")
-
-    if(LOGOS_SANITIZE)
-        message(STATUS "  ASan+UBSan: CPU tests T2/T2b mein ACTIVE")
-        message(STATUS "  Build karo: cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug ..")
-        message(STATUS "  Run:        ctest -LE GPU --output-on-failure")
-    endif()
-
-    # ── GPU tests ─────────────────────────────────────────────
-    # compute-sanitizer wrap: LOGOS_USE_COMPUTE_SANITIZER=ON
-    #   cmake -DLOGOS_USE_COMPUTE_SANITIZER=ON ..
-    #   Requires: compute-sanitizer in PATH (CUDA Toolkit 11.1+)
-    #   Kaggle: /usr/local/cuda/bin/compute-sanitizer available hai
-    #
-    # compute-sanitizer --tool memcheck:
-    #   - Out-of-bounds GPU memory read/write detect karta hai
-    #   - Uninitialized memory read detect karta hai
-    #   - Device malloc/free errors detect karta hai
-    #
-    # Bina sanitizer ke normal GPU test (default):
-    #   add_test(COMMAND test_memory_stress) — seedha binary chalti hai
-    # Sanitizer ke saath:
-    #   add_test(COMMAND compute-sanitizer --tool memcheck test_memory_stress)
-
+    set(_SANITIZER_OK OFF)
     if(LOGOS_USE_COMPUTE_SANITIZER)
         find_program(COMPUTE_SANITIZER_EXE
             NAMES compute-sanitizer
             PATHS /usr/local/cuda/bin $ENV{CUDA_PATH}/bin)
-
         if(COMPUTE_SANITIZER_EXE)
+            set(_SANITIZER_OK ON)
             message(STATUS "  compute-sanitizer: ${COMPUTE_SANITIZER_EXE}")
-            message(STATUS "  GPU tests compute-sanitizer --tool memcheck se wrapped honge")
-
-            add_test(NAME "T1_Syntax_Build"
-                COMMAND ${COMPUTE_SANITIZER_EXE}
-                    --tool memcheck
-                    --error-exitcode 1
-                    --log-file sanitizer_t1.log
-                    $<TARGET_FILE:test_syntax_build>)
-
-            add_test(NAME "T2_Math_Unit_GPU"
-                COMMAND ${COMPUTE_SANITIZER_EXE}
-                    --tool memcheck
-                    --error-exitcode 1
-                    --log-file sanitizer_t2_gpu.log
-                    $<TARGET_FILE:test_math_units_gpu>)
-
-            add_test(NAME "T3_Memory_Stress"
-                COMMAND ${COMPUTE_SANITIZER_EXE}
-                    --tool memcheck
-                    --error-exitcode 1
-                    --log-file sanitizer_t3.log
-                    $<TARGET_FILE:test_memory_stress>)
-
-            add_test(NAME "T4_Large_Data_Scale"
-                COMMAND ${COMPUTE_SANITIZER_EXE}
-                    --tool memcheck
-                    --error-exitcode 1
-                    --log-file sanitizer_t4.log
-                    $<TARGET_FILE:test_large_data_scale>)
-
-            add_test(NAME "T5_CUDA_Kernels"
-                COMMAND ${COMPUTE_SANITIZER_EXE}
-                    --tool memcheck
-                    --error-exitcode 1
-                    --log-file sanitizer_t5.log
-                    $<TARGET_FILE:test_cuda_kernels>)
         else()
-            message(WARNING "  compute-sanitizer not found — GPU tests bina sanitizer ke chalenge")
-            message(WARNING "  PATH mein add karo: export PATH=/usr/local/cuda/bin:$PATH")
-            # Fallback: bina sanitizer ke
-            add_test(NAME "T1_Syntax_Build"     COMMAND test_syntax_build)
-            add_test(NAME "T2_Math_Unit_GPU"    COMMAND test_math_units_gpu)
-            add_test(NAME "T3_Memory_Stress"    COMMAND test_memory_stress)
-            add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
-            add_test(NAME "T5_CUDA_Kernels"     COMMAND test_cuda_kernels)
+            message(WARNING "  compute-sanitizer not found — GPU tests will run unwrapped")
         endif()
-    else()
-        # Default: bina compute-sanitizer (fast, CI default)
-        add_test(NAME "T1_Syntax_Build"     COMMAND test_syntax_build)
-        add_test(NAME "T2_Math_Unit_GPU"    COMMAND test_math_units_gpu)
-        add_test(NAME "T3_Memory_Stress"    COMMAND test_memory_stress)
-        add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
-        add_test(NAME "T5_CUDA_Kernels"     COMMAND test_cuda_kernels)
     endif()
 
-    set_tests_properties("T1_Syntax_Build"     PROPERTIES TIMEOUT 300  LABELS "GPU")
-    set_tests_properties("T2_Math_Unit_GPU"    PROPERTIES TIMEOUT 300  LABELS "GPU")
-    set_tests_properties("T3_Memory_Stress"    PROPERTIES TIMEOUT 600  LABELS "GPU")
-    set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 900  LABELS "GPU")
-    set_tests_properties("T5_CUDA_Kernels"     PROPERTIES TIMEOUT 300  LABELS "GPU")
-
-    # ── CTest resource guard: GPU tests serialize on device 0 ──
-    set_tests_properties(
-        "T1_Syntax_Build"
-        "T2_Math_Unit_GPU"
-        "T3_Memory_Stress"
-        "T4_Large_Data_Scale"
-        "T5_CUDA_Kernels"
-        PROPERTIES RESOURCE_LOCK "GPU_DEVICE_0"
-    )
+    foreach(entry ${LOGOS_GPU_TESTS})
+        string(REPLACE ":" ";" parts "${entry}")
+        list(GET parts 0 tname)
+        list(GET parts 1 texe)
+        list(GET parts 2 ttimeout)
+        if(_SANITIZER_OK)
+            add_test(NAME ${tname}
+                COMMAND ${COMPUTE_SANITIZER_EXE} --tool memcheck --error-exitcode 1
+                        --log-file sanitizer_${texe}.log $<TARGET_FILE:${texe}>)
+        else()
+            add_test(NAME ${tname} COMMAND ${texe})
+        endif()
+        set_tests_properties(${tname} PROPERTIES
+            TIMEOUT ${ttimeout} LABELS "GPU" RESOURCE_LOCK "GPU_DEVICE_0")
+    endforeach()
 
     message(STATUS "")
     message(STATUS "CTest targets:")
-    message(STATUS "  CPU+sanitizer: ctest -LE GPU -DLOGOS_SANITIZE=ON --output-on-failure")
+    message(STATUS "  CPU+sanitizer: ctest -LE GPU --output-on-failure (cmake -DLOGOS_SANITIZE=ON)")
     message(STATUS "  GPU normal:    ctest -L GPU --output-on-failure")
     message(STATUS "  GPU+memcheck:  cmake -DLOGOS_USE_COMPUTE_SANITIZER=ON .. && ctest -L GPU")
-    message(STATUS "  All:           ctest --output-on-failure")
     message(STATUS "")
-
 else()
-    message(STATUS "⚠️  CUDA not found — CPU-only build")
-
-    # CPU-only targets
-    add_executable(test_math_unit
-        tests/test_math_unit.cpp
-    )
-    target_include_directories(test_math_unit PRIVATE include tests)
-    logos_set_cpu_test_options(test_math_unit)
-
-    add_executable(test_checkpoint
-        tests/test_checkpoint.cpp
-        src/Checkpoint.cpp
-    )
-    target_include_directories(test_checkpoint PRIVATE include)
-    logos_set_cpu_test_options(test_checkpoint)
-
-    # test_large_data_scale compiles as CXX in CPU-only mode
-    add_executable(test_large_data_scale
-        tests/test_large_data_scale.cu
-        src/Checkpoint.cpp
-    )
-    target_include_directories(test_large_data_scale PRIVATE include tests)
-    set_source_files_properties(
-        tests/test_large_data_scale.cu
-        PROPERTIES LANGUAGE CXX
-    )
-    logos_set_cpu_test_options(test_large_data_scale)
-
-    # ── RapidCheck — CPU-only mode mein bhi support ──────────
-    # cmake -DLOGOS_RAPIDCHECK=ON ..
-    # cmake --build build_rc --target test_rapidcheck
-    option(LOGOS_RAPIDCHECK "Enable RapidCheck C++ property-based tests" OFF)
-    if(LOGOS_RAPIDCHECK)
-        find_package(rapidcheck QUIET)
-        if(NOT rapidcheck_FOUND)
-            include(FetchContent)
-            FetchContent_Declare(
-                rapidcheck
-                GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
-                GIT_TAG        master
-            )
-            FetchContent_MakeAvailable(rapidcheck)
-        endif()
-
-        add_executable(test_rapidcheck
-            tests/test_rapidcheck.cpp
-            src/VedicGEMM.cpp
-            src/Checkpoint.cpp
-        )
-        target_include_directories(test_rapidcheck PRIVATE include tests)
-        logos_set_cpu_test_options(test_rapidcheck)
-        target_link_libraries(test_rapidcheck PRIVATE rapidcheck)
-
-        enable_testing()
-        add_test(NAME "T7_RapidCheck" COMMAND test_rapidcheck)
-        set_tests_properties("T7_RapidCheck" PROPERTIES
-            TIMEOUT 1200
-            LABELS "PROPERTY"
-            ENVIRONMENT "RC_PARAMS=max_success=1000;max_discard_ratio=10")
-        message(STATUS "✅ RapidCheck ENABLED (CPU-only mode) — target: test_rapidcheck")
-        message(STATUS "   Run: cmake --build build_rc --target test_rapidcheck")
-        message(STATUS "   Strict: RC_PARAMS=max_success=1000;max_discard_ratio=10")
-    else()
-        # ── CPU-only mode: ASan+UBSan env vars ───────────────────
-        set(ASAN_ENV
-            "ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:print_stats=1:check_initialization_order=1:detect_stack_use_after_return=1"
-            "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
-        )
-
-        enable_testing()
-        add_test(NAME "T2_Math_Unit"        COMMAND test_math_unit)
-        add_test(NAME "T2b_Checkpoint"      COMMAND test_checkpoint)
-        add_test(NAME "T4_Large_Data_Scale" COMMAND test_large_data_scale)
-        set_tests_properties("T2_Math_Unit"   PROPERTIES TIMEOUT 60
-            ENVIRONMENT "${ASAN_ENV}")
-        set_tests_properties("T2b_Checkpoint" PROPERTIES TIMEOUT 60
-            ENVIRONMENT "${ASAN_ENV}")
-        set_tests_properties("T4_Large_Data_Scale" PROPERTIES TIMEOUT 600
-            ENVIRONMENT "${ASAN_ENV}")
-    endif()
-
-    if(NOT LOGOS_RAPIDCHECK)
-        message(STATUS "CPU-only tests: T2_Math_Unit, T2b_Checkpoint, T4_Large_Data_Scale")
-    endif()
+    message(STATUS "⚠️  CUDA not found — only the CPU checkpoint test is built")
 endif()
 
-install(TARGETS logos DESTINATION bin)
 if(CMAKE_CUDA_COMPILER)
     install(TARGETS logos_gpu DESTINATION bin)
 endif()
 
-# ═══════════════════════════════════════════════════════════════
-# T8 — BENCHMARK SUITE (bench.cpp)
-# cmake --build build --target logos_bench
-# ./build/logos_bench          : all benchmarks
-# ./build/logos_bench --all    : include slow benchmarks
-# ═══════════════════════════════════════════════════════════════
-add_executable(logos_bench
-    tests/bench.cpp
-    src/VedicGEMM.cpp
-    src/Checkpoint.cpp
-)
-target_include_directories(logos_bench PRIVATE include tests)
-if(APPLE)
-    target_compile_options(logos_bench PRIVATE -O3 -std=c++20)
-elseif(MSVC)
-    target_compile_options(logos_bench PRIVATE $<$<CONFIG:Release>:/O2>)
-else()
-    target_compile_options(logos_bench PRIVATE -O3 -march=x86-64 -std=c++20)
-endif()
-
-enable_testing()
-add_test(NAME "T8_Bench_Smoke" COMMAND logos_bench)
-set_tests_properties("T8_Bench_Smoke" PROPERTIES
-    TIMEOUT 300
-    LABELS "BENCH"
-    PASS_REGULAR_EXPRESSION "Above threshold \\(FAIL\\): 0"
-    FAIL_REGULAR_EXPRESSION "Above threshold \\(FAIL\\): [1-9]")
-
-message(STATUS "✅ Benchmark target: logos_bench  (T8_Bench_Smoke)")
-message(STATUS "   Run:   cmake --build build --target logos_bench && ./build/logos_bench")
-message(STATUS "   CTest: ctest -L BENCH --output-on-failure")
-
-# ═══════════════════════════════════════════════════════════════
-# T9 — FUZZ TEST (test_fuzz.cpp)
-# Mode A: LibFuzzer (clang++ -fsanitize=fuzzer)
-#   cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ ..
-#   cmake --build build --target logos_fuzz
-#   ./build/logos_fuzz -max_total_time=60 corpus/
-#
-# Mode B: Selftest (any compiler, no LibFuzzer)
-#   cmake --build build --target logos_fuzz_selftest
-#   ./build/logos_fuzz_selftest --selftest
-# ═══════════════════════════════════════════════════════════════
-option(LOGOS_FUZZ "Build fuzz target with -fsanitize=fuzzer (requires clang++)" OFF)
-
-add_executable(logos_fuzz_selftest
-    tests/test_fuzz.cpp
-    src/VedicGEMM.cpp
-    src/Checkpoint.cpp
-)
-target_include_directories(logos_fuzz_selftest PRIVATE include tests)
-if(APPLE)
-    target_compile_options(logos_fuzz_selftest PRIVATE -O1 -g -std=c++20)
-elseif(MSVC)
-    target_compile_options(logos_fuzz_selftest PRIVATE /Od /Zi)
-else()
-    target_compile_options(logos_fuzz_selftest PRIVATE -O1 -g -march=x86-64 -std=c++20)
-endif()
-
-enable_testing()
-add_test(NAME "T9_Fuzz_Selftest" COMMAND logos_fuzz_selftest --selftest)
-set_tests_properties("T9_Fuzz_Selftest" PROPERTIES
-    TIMEOUT 120
-    LABELS "FUZZ"
-    PASS_REGULAR_EXPRESSION "All 13 fuzz targets smoke-tested OK"
-    DISABLED TRUE)
-
-if(LOGOS_FUZZ)
-    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        message(FATAL_ERROR
-            "[FUZZ] LibFuzzer ke liye clang++ chahiye.\n"
-            "       cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ ..")
-    endif()
-
-    add_executable(logos_fuzz
-        tests/test_fuzz.cpp
-        src/VedicGEMM.cpp
-        src/Checkpoint.cpp
-    )
-    target_include_directories(logos_fuzz PRIVATE include tests)
-    target_compile_definitions(logos_fuzz PRIVATE LOGOS_LIBFUZZER_ONLY=1)
-    target_compile_options(logos_fuzz PRIVATE
-        -O1 -g -std=c++20
-        -fsanitize=fuzzer,address,undefined
-        -fno-omit-frame-pointer
-    )
-    target_link_options(logos_fuzz PRIVATE
-        -fsanitize=fuzzer,address,undefined
-    )
-
-    add_test(NAME "T9_Fuzz_LibFuzzer_30s"
-        COMMAND logos_fuzz
-            -max_total_time=30
-            -max_len=1024
-            -rss_limit_mb=512
-    )
-    set_tests_properties("T9_Fuzz_LibFuzzer_30s" PROPERTIES
-        TIMEOUT 60
-        LABELS "FUZZ;LIBFUZZER")
-
-    message(STATUS "✅ LibFuzzer target: logos_fuzz  (LOGOS_FUZZ=ON)")
-    message(STATUS "   Build: cmake --build build --target logos_fuzz")
-    message(STATUS "   Run:   ./build/logos_fuzz -max_total_time=300 corpus/")
-else()
-    message(STATUS "ℹ️  Fuzz selftest only (LOGOS_FUZZ=OFF)")
-    message(STATUS "   Full fuzzer: cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ ..")
-endif()
-
-message(STATUS "✅ Fuzz selftest target: logos_fuzz_selftest  (T9_Fuzz_Selftest)")
-message(STATUS "   CTest: ctest -L FUZZ --output-on-failure")
-
-# ═══════════════════════════════════════════════════════════════
-# MULL — Mutation Testing
-# ═══════════════════════════════════════════════════════════════
-#
-# Kya karta hai:
-#   test_math_unit.cpp aur test_checkpoint.cpp pe MULL mutations chalata hai.
-#   Target source files jo mutate hote hain:
-#     src/VedicGEMM.cpp      ← Vedic GEMM formulas (M1, M2, M9)
-#     src/Checkpoint.cpp     ← checkpoint save/load roundtrip (T2b)
-#     include/VedicGEMM.hpp  ← tiling logic
-#     include/Tensor.hpp     ← tensor ops (free energy, softmax)
-#     include/PhysicsOpt.hpp ← optimizer physics (M11, M14, M15, M16)
-#     include/LayerNorm.hpp  ← LayerNorm stats (M8, M13)
-#     include/Attention.hpp  ← NS attention (M12)
-#
-# Kaise use karein:
-#   # Step 1: MULL install karo (Linux/macOS)
-#   #   Ubuntu:  sudo apt-get install mull  (LLVM apt repo se)
-#   #   macOS:   brew install mull
-#   #   Manual:  https://github.com/mull-project/mull/releases
-#   #
-#   # Step 2: Build karo
-#   cmake -B build -DLOGOS_MUTATION_TEST=ON -DCMAKE_BUILD_TYPE=Debug \
-#         -DCMAKE_CXX_COMPILER=clang++ ..
-#   cmake --build build --target mull-run
-#   #
-#   # Step 3: Report dekho
-#   open build/mull-report/index.html   (macOS)
-#   xdg-open build/mull-report/index.html  (Linux)
-#   #
-#   # Expected output:
-#   #   Mutation score: XX%  (target: > 80%)
-#   #   Killed:   N   ← good (tests ne pakad liya)
-#   #   Survived: M   ← bad  (test gap hai)
-#   #   Timeout:  K
-#   #
-#   # NOTE: MULL ko clang++ chahiye (GCC se kaam nahi karta)
-#   #       Debug build zaruri hai (Release mein LLVM IR alag hota hai)
-#
-# Mutation operators (MULL default set):
-#   cxx_add_to_sub     : a + b  → a - b  (e.g., CE + T*S badal CE - T*S)
-#   cxx_mul_to_div     : a * b  → a / b  (e.g., T*S → T/S)
-#   cxx_sub_to_add     : a - b  → a + b
-#   cxx_gt_to_ge       : >  → >=         (loop boundary off-by-one)
-#   cxx_lt_to_le       : <  → <=         (tiling loop ka edge case)
-#   cxx_logical_and_to_or: &&  → ||      (condition flip)
-#   cxx_remove_void_call : function call hata deta hai
-#   cxx_negate_mutator : !cond → cond    (condition negate)
-#
-# ── MULL option ─────────────────────────────────────────────────
-option(LOGOS_MUTATION_TEST "Enable MULL mutation testing (requires clang++ + mull-runner)" OFF)
-
-if(LOGOS_MUTATION_TEST)
-    # ── Requirement checks ──────────────────────────────────────
-    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        message(FATAL_ERROR
-            "[MULL] clang++ chahiye, ${CMAKE_CXX_COMPILER_ID} nahi.\n"
-            "       Dobara configure karo:\n"
-            "       cmake -DLOGOS_MUTATION_TEST=ON "
-            "-DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug ..")
-    endif()
-
-    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-        message(WARNING
-            "[MULL] Debug build recommended (current: ${CMAKE_BUILD_TYPE}).\n"
-            "       Release mein LLVM IR optimized hota hai aur mutations miss ho sakte hain.\n"
-            "       Sahi command:\n"
-            "       cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_BUILD_TYPE=Debug ..")
-    endif()
-
-    find_program(MULL_RUNNER_EXE
-        NAMES mull-runner mull-runner-15 mull-runner-14 mull-runner-16 mull-runner-17
-        PATHS
-            /usr/bin
-            /usr/local/bin
-            /opt/homebrew/bin
-            /usr/lib/mull
-            $ENV{MULL_PATH}
-    )
-
-    if(NOT MULL_RUNNER_EXE)
-        message(FATAL_ERROR
-            "[MULL] mull-runner nahi mila.\n"
-            "       Install karo:\n"
-            "         Ubuntu 22.04:\n"
-            "           wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -\n"
-            "           sudo add-apt-repository 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main'\n"
-            "           sudo apt-get update && sudo apt-get install mull-17\n"
-            "         macOS:\n"
-            "           brew install mull\n"
-            "         Manual:\n"
-            "           https://github.com/mull-project/mull/releases\n"
-            "       Ya MULL_PATH env var set karo.")
-    endif()
-
-    find_program(MULL_LLVM_PROFDATA_EXE
-        NAMES llvm-profdata-15 llvm-profdata-14 llvm-profdata-16 llvm-profdata
-        PATHS /usr/bin /usr/local/bin /opt/homebrew/bin)
-    if(NOT MULL_LLVM_PROFDATA_EXE)
-        message(FATAL_ERROR
-            "[MULL] llvm-profdata nahi mila. Raw .profraw coverage ko Mull-15 ke "
-            "compatible .profdata mein merge karne ke liye LLVM tools install karo.")
-    endif()
-
-    message(STATUS "✅ MULL found: ${MULL_RUNNER_EXE}")
-
-    # ── Mutation target: test_math_unit (M1-M16 sab) ───────────
-    # -femit-all-decls    : dead code eliminate na ho (mutations miss ho sakte hain)
-    # -fprofile-instr-generate: LLVM instrumentation for mull
-    # -fcoverage-mapping  : line coverage data
-    # -g -O0              : debug symbols, no optimization (mutations readable hote hain)
-    # ── GCC-12 toolchain path (clang ABI fix ke liye) ──────────────
-    # Problem: ubuntu-22.04 pe clang-15 default GCC-14 ka libstdc++ use karta hai.
-    # GCC-14 mein std::__shared_ptr<_Dir>::operator bool() inline ho gaya —
-    # yeh symbol .so mein nahi hota, isliye undefined reference linker error aata hai.
-    # Fix: clang ko explicitly GCC-12 ka toolchain use karwao.
-    #
-    # --gcc-toolchain=/usr : clang /usr/lib/gcc/x86_64-linux-gnu/12/ se
-    #   crtbeginS.o, libstdc++.a, libstdc++.so sab dhundta hai.
-    # Ubuntu pe GCC prefix hamesha /usr hota hai — dirname chain se
-    #   kabhi kabhi /usr/lib aa jata hai jo galat hai.
-    find_program(GCC12_EXE NAMES g++-12 PATHS /usr/bin)
-    if(GCC12_EXE)
-        # GCC-12 ka actual multilib dir verify karo
-        execute_process(
-            COMMAND ${GCC12_EXE} -print-file-name=crtbeginS.o
-            OUTPUT_VARIABLE _GCC12_CRTPATH OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(EXISTS "${_GCC12_CRTPATH}")
-            # crtbeginS.o mila — GCC-12 sahi se installed hai
-            # clang ka --gcc-toolchain hamesha GCC install PREFIX hota hai (/usr)
-            set(_GCC12_TOOLCHAIN "/usr")
-            message(STATUS "[MULL] GCC-12 toolchain prefix: ${_GCC12_TOOLCHAIN}")
-            message(STATUS "[MULL] crtbeginS.o: ${_GCC12_CRTPATH}")
-            set(MULL_GCC_TOOLCHAIN_FLAG "--gcc-toolchain=${_GCC12_TOOLCHAIN}")
-        else()
-            message(WARNING "[MULL] GCC-12 crtbeginS.o nahi mila (${_GCC12_CRTPATH}) — toolchain flag skip")
-            set(MULL_GCC_TOOLCHAIN_FLAG "")
-        endif()
-    else()
-        message(STATUS "[MULL] g++-12 nahi mila — system default GCC use hoga")
-        set(MULL_GCC_TOOLCHAIN_FLAG "")
-    endif()
-
-    # ── MULL IR Frontend Plugin ─────────────────────────────────
-    # mull-runner binary mein mutations inject karne ke liye
-    # clang ko mull ka LLVM IR pass plugin load karna hota hai at compile time.
-    # Plugin path: /usr/lib/mull-15/libmull-ir-frontend-15.so (ya similar)
-    set(MULL_PASS_PLUGIN "" CACHE STRING "Path to mull IR frontend .so plugin")
-
-    if(MULL_PASS_PLUGIN AND EXISTS "${MULL_PASS_PLUGIN}")
-        message(STATUS "[MULL] IR frontend plugin: ${MULL_PASS_PLUGIN}")
-        set(MULL_PLUGIN_FLAGS
-            -fpass-plugin=${MULL_PASS_PLUGIN}
-            -g
-            -fdebug-info-for-profiling
-        )
-    else()
-        message(STATUS "[MULL] IR frontend plugin not found: '${MULL_PASS_PLUGIN}'")
-        message(STATUS "[MULL] Trying bitcode embed approach (-fembed-bitcode)")
-        # Fallback: bitcode embedding (older mull versions)
-        set(MULL_PLUGIN_FLAGS
-            -fembed-bitcode
-            -g
-        )
-    endif()
-
-    add_executable(mull_math_unit
-        tests/test_math_unit.cpp
-        src/VedicGEMM.cpp
-        src/Checkpoint.cpp
-        src/PhysicsTestDriver.cpp   # Physics headers force-compile for MULL mutations
-    )
-    target_include_directories(mull_math_unit PRIVATE include tests)
-    target_compile_options(mull_math_unit PRIVATE
-        -O0
-        -g
-        -grecord-gcc-switches
-        -fprofile-instr-generate
-        -fcoverage-mapping
-        -femit-all-decls
-        -fno-omit-frame-pointer
-        -std=c++20
-        ${MULL_PLUGIN_FLAGS}
-        # NOTE: -fexperimental-new-pass-manager clang-15 mein DEPRECATED hai
-        # Hatane se LLVM new pass manager automatically enable hota hai (clang-15 default)
-        # Yahi MULL ko mutation metadata embed karne deta hai
-        ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
-    )
-    target_link_options(mull_math_unit PRIVATE
-        -fprofile-instr-generate
-        -Wl,--no-as-needed
-        ${MULL_GCC_TOOLCHAIN_FLAG}        # link time bhi GCC-12 toolchain
-    )
-    # stdc++fs pehle, phir stdc++ (dependency order correct rakhna zaroori hai)
-    target_link_libraries(mull_math_unit PRIVATE stdc++fs stdc++)
-
-    # ── Mutation target: test_checkpoint (T2b roundtrip) ────────
-    # GCC-14 ABI FIX: std::filesystem::directory_iterator ke internals
-    # (std::__shared_ptr<_Dir>::operator bool) GCC-14 mein fully inline ho gaye.
-    # Clang-15 + GCC-14 headers = undefined reference at link time.
-    # Solution: GCC-12 ka libstdc++.a statically link karo taaki symbol present ho.
-    #
-    # Find GCC-12 libstdc++.a path
-    if(_GCC12_TOOLCHAIN)
-        # GCC-12 multilib dir dhundho
-        execute_process(
-            COMMAND ${GCC12_EXE} -print-file-name=libstdc++.a
-            OUTPUT_VARIABLE _GCC12_LIBSTDCXX_A OUTPUT_STRIP_TRAILING_WHITESPACE)
-        execute_process(
-            COMMAND ${GCC12_EXE} -print-file-name=libstdc++fs.a
-            OUTPUT_VARIABLE _GCC12_LIBSTDCXXFS_A OUTPUT_STRIP_TRAILING_WHITESPACE)
-        message(STATUS "[MULL] GCC-12 libstdc++.a   : ${_GCC12_LIBSTDCXX_A}")
-        message(STATUS "[MULL] GCC-12 libstdc++fs.a : ${_GCC12_LIBSTDCXXFS_A}")
-    endif()
-
-    add_executable(mull_checkpoint
-        tests/test_checkpoint.cpp
-        src/Checkpoint.cpp
-    )
-    target_include_directories(mull_checkpoint PRIVATE include)
-    target_compile_options(mull_checkpoint PRIVATE
-        -O0
-        -g
-        -grecord-gcc-switches
-        -fprofile-instr-generate
-        -fcoverage-mapping
-        -femit-all-decls
-        -fno-omit-frame-pointer
-        -std=c++20
-        ${MULL_PLUGIN_FLAGS}
-        # NOTE: -fexperimental-new-pass-manager clang-15 mein DEPRECATED hai — hata diya
-        ${MULL_GCC_TOOLCHAIN_FLAG}        # clang ko GCC-12 libstdc++ use karwao
-    )
-    target_link_options(mull_checkpoint PRIVATE
-        -fprofile-instr-generate
-        -Wl,--no-as-needed
-        ${MULL_GCC_TOOLCHAIN_FLAG}        # link time bhi GCC-12 toolchain
-    )
-    # GCC-14 ABI fix: GCC-12 ke static archives directly link karo.
-    # stdc++fs pehle (filesystem symbols), phir stdc++ (base runtime) — order critical hai.
-    # Agar GCC-12 archives mile toh unhe use karo, warna dynamic fallback.
-    if(EXISTS "${_GCC12_LIBSTDCXXFS_A}" AND EXISTS "${_GCC12_LIBSTDCXX_A}")
-        target_link_libraries(mull_checkpoint PRIVATE
-            ${_GCC12_LIBSTDCXXFS_A}
-            ${_GCC12_LIBSTDCXX_A}
-        )
-        message(STATUS "[MULL] mull_checkpoint: GCC-12 static libstdc++fs + libstdc++ linked")
-    else()
-        # Fallback: dynamic linking (GCC-12 toolchain flag se sahi version milna chahiye)
-        target_link_libraries(mull_checkpoint PRIVATE stdc++fs stdc++)
-        message(STATUS "[MULL] mull_checkpoint: dynamic stdc++fs + stdc++ (GCC-12 archive not found)")
-    endif()
-
-    # ── MULL config file ────────────────────────────────────────
-    # mull.yml: kaunse operators chalein, kaunsi files mutate hon,
-    #           timeout, parallel workers, report format
-    set(MULL_MATH_CONFIG_PATH "${CMAKE_BINARY_DIR}/mull_math.yml")
-    set(MULL_CHECKPOINT_CONFIG_PATH "${CMAKE_BINARY_DIR}/mull_checkpoint.yml")
-    set(MULL_REPORT_DIR  "${CMAKE_BINARY_DIR}/mull-report")
-    set(MULL_MATH_RUN_DIR "${MULL_REPORT_DIR}/math-run")
-    set(MULL_CHECKPOINT_RUN_DIR "${MULL_REPORT_DIR}/checkpoint-run")
-    set(MULL_MATH_PROFILE_RAW "${MULL_MATH_RUN_DIR}/coverage.profraw")
-    set(MULL_MATH_PROFILE_DATA "${MULL_MATH_RUN_DIR}/coverage.profdata")
-    set(MULL_CHECKPOINT_PROFILE_RAW "${MULL_CHECKPOINT_RUN_DIR}/coverage.profraw")
-    set(MULL_CHECKPOINT_PROFILE_DATA "${MULL_CHECKPOINT_RUN_DIR}/coverage.profdata")
-
-    # Source files jo MULL mutate karega (sirf yeh files, test files nahi)
-    # Relative to project source dir
-    # mull.yml banao (configure_file se — build time pe generate hota hai)
-    # Yeh file mull-runner ko batata hai:
-    #   - kaunse mutation operators use karo
-    #   - kaunsi source files mutate karo
-    #   - timeout per mutant
-    #   - output format
-    set(MULL_COMMON_CONFIG "# LOGOS MULL Mutation Testing Config
-# Auto-generated by CMakeLists.txt (LOGOS_MUTATION_TEST=ON)
-
-mutators:
-  - cxx_add_to_sub
-  - cxx_sub_to_add
-  - cxx_mul_to_div
-  - cxx_div_to_mul
-  - cxx_gt_to_ge
-  - cxx_lt_to_le
-  - cxx_ge_to_gt
-  - cxx_le_to_lt
-  - cxx_eq_to_ne
-  - cxx_ne_to_eq
-  - cxx_logical_and_to_or
-  - cxx_logical_or_to_and
-  - cxx_negate_mutator
-  - cxx_remove_void_call
-
-includePaths:
-__MULL_INCLUDE_PATHS__
-excludePaths:
-  - \"${CMAKE_SOURCE_DIR}/tests/.*\"
-  - \"${CMAKE_SOURCE_DIR}/cuda/.*\"
-")
-    set(MULL_MATH_INCLUDE_PATHS "  - \"${CMAKE_SOURCE_DIR}/src/VedicGEMM.cpp\"
-  - \"${CMAKE_SOURCE_DIR}/src/PhysicsTestDriver.cpp\"
-  - \"${CMAKE_SOURCE_DIR}/include/PhysicsOpt.hpp\"
-  - \"${CMAKE_SOURCE_DIR}/include/LayerNorm.hpp\"
-  - \"${CMAKE_SOURCE_DIR}/include/FeedForward.hpp\"
-  - \"${CMAKE_SOURCE_DIR}/include/Attention.hpp\"
-  - \"${CMAKE_SOURCE_DIR}/include/VedicGEMM.hpp\"
-  - \"${CMAKE_SOURCE_DIR}/include/Tensor.hpp\"")
-    string(REPLACE "__MULL_INCLUDE_PATHS__" "${MULL_MATH_INCLUDE_PATHS}" MULL_MATH_CONFIG "${MULL_COMMON_CONFIG}")
-    file(WRITE "${MULL_MATH_CONFIG_PATH}" "${MULL_MATH_CONFIG}")
-
-    set(MULL_CHECKPOINT_INCLUDE_PATHS "  - \"${CMAKE_SOURCE_DIR}/src/Checkpoint.cpp\"")
-    string(REPLACE "__MULL_INCLUDE_PATHS__" "${MULL_CHECKPOINT_INCLUDE_PATHS}" MULL_CHECKPOINT_CONFIG "${MULL_COMMON_CONFIG}")
-    file(WRITE "${MULL_CHECKPOINT_CONFIG_PATH}" "${MULL_CHECKPOINT_CONFIG}")
-    file(MAKE_DIRECTORY "${MULL_MATH_RUN_DIR}" "${MULL_CHECKPOINT_RUN_DIR}")
-    file(WRITE "${MULL_MATH_RUN_DIR}/mull.yml" "${MULL_MATH_CONFIG}")
-    file(WRITE "${MULL_CHECKPOINT_RUN_DIR}/mull.yml" "${MULL_CHECKPOINT_CONFIG}")
-
-    # ── mull-run custom target ──────────────────────────────────
-    # cmake --build build --target mull-run
-    # Do steps:
-    #   1. mull_math_unit + mull_checkpoint build karo
-    #   2. mull-runner dono binaries pe chalao
-    #   3. HTML report generate karo
-
-    add_custom_target(mull-run
-        # Step 1: report dir banao
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${MULL_REPORT_DIR}"
-
-        # Step 2: raw coverage ko LLVM profdata mein convert karo (Mull-15 raw nahi padhta)
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
-            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_MATH_PROFILE_RAW}"
-            "$<TARGET_FILE:mull_math_unit>"
-        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
-            "${MULL_MATH_PROFILE_RAW}" -o "${MULL_MATH_PROFILE_DATA}"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
-            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_CHECKPOINT_PROFILE_RAW}"
-            "$<TARGET_FILE:mull_checkpoint>"
-        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
-            "${MULL_CHECKPOINT_PROFILE_RAW}" -o "${MULL_CHECKPOINT_PROFILE_DATA}"
-
-        # Step 3: mull_math_unit pe mull-runner chalao (M1-M16 tests)
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
-            ${MULL_RUNNER_EXE}
-            --report-dir "${MULL_REPORT_DIR}/math"
-            --coverage-info "${MULL_MATH_PROFILE_DATA}"
-            --ld-search-path "${CMAKE_BINARY_DIR}"
-            "$<TARGET_FILE:mull_math_unit>"
-        COMMENT "[MULL 1/2] Mutation testing: test_math_unit (M1-M16)"
-
-        # Step 4: mull_checkpoint pe mull-runner chalao (T2b checkpoint)
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
-            ${MULL_RUNNER_EXE}
-            --report-dir "${MULL_REPORT_DIR}/checkpoint"
-            --coverage-info "${MULL_CHECKPOINT_PROFILE_DATA}"
-            --ld-search-path "${CMAKE_BINARY_DIR}"
-            "$<TARGET_FILE:mull_checkpoint>"
-        COMMENT "[MULL 2/2] Mutation testing: test_checkpoint (T2b)"
-
-        # Step 5: summary print karo
-        COMMAND ${CMAKE_COMMAND} -E echo ""
-        COMMAND ${CMAKE_COMMAND} -E echo "══════════════════════════════════════════"
-        COMMAND ${CMAKE_COMMAND} -E echo "  MULL Mutation Testing Complete"
-        COMMAND ${CMAKE_COMMAND} -E echo "  Reports:"
-        COMMAND ${CMAKE_COMMAND} -E echo "    Math:       ${MULL_REPORT_DIR}/math/index.html"
-        COMMAND ${CMAKE_COMMAND} -E echo "    Checkpoint: ${MULL_REPORT_DIR}/checkpoint/index.html"
-        COMMAND ${CMAKE_COMMAND} -E echo "══════════════════════════════════════════"
-
-        DEPENDS mull_math_unit mull_checkpoint
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        VERBATIM
-    )
-
-    # ── CTest integration: mull-run ko CTest mein bhi add karo ─
-    # ctest -L MUTATION se chalega
-    # Note: mull lamba chalta hai (sabhi mutants × tests) → timeout 1800s
-    enable_testing()
-    add_test(NAME "T6_Coverage_Math"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
-            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_MATH_PROFILE_RAW}"
-            "$<TARGET_FILE:mull_math_unit>"
-    )
-    add_test(NAME "T6_Coverage_Math_Merge"
-        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
-            "${MULL_MATH_PROFILE_RAW}" -o "${MULL_MATH_PROFILE_DATA}"
-    )
-    set_tests_properties("T6_Coverage_Math" PROPERTIES
-        FIXTURES_SETUP MULL_MATH_PROFILE LABELS "MUTATION_SETUP")
-    set_tests_properties("T6_Coverage_Math_Merge" PROPERTIES
-        FIXTURES_REQUIRED MULL_MATH_PROFILE
-        FIXTURES_SETUP MULL_MATH_PROFILE_READY
-        LABELS "MUTATION_SETUP")
-
-    add_test(NAME "T6_Coverage_Checkpoint"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
-            ${CMAKE_COMMAND} -E env "LLVM_PROFILE_FILE=${MULL_CHECKPOINT_PROFILE_RAW}"
-            "$<TARGET_FILE:mull_checkpoint>"
-    )
-    add_test(NAME "T6_Coverage_Checkpoint_Merge"
-        COMMAND "${MULL_LLVM_PROFDATA_EXE}" merge -sparse
-            "${MULL_CHECKPOINT_PROFILE_RAW}" -o "${MULL_CHECKPOINT_PROFILE_DATA}"
-    )
-    set_tests_properties("T6_Coverage_Checkpoint" PROPERTIES
-        FIXTURES_SETUP MULL_CHECKPOINT_PROFILE LABELS "MUTATION_SETUP")
-    set_tests_properties("T6_Coverage_Checkpoint_Merge" PROPERTIES
-        FIXTURES_REQUIRED MULL_CHECKPOINT_PROFILE
-        FIXTURES_SETUP MULL_CHECKPOINT_PROFILE_READY
-        LABELS "MUTATION_SETUP")
-
-    add_test(NAME "T6_Mutation_Math"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_MATH_RUN_DIR}"
-            ${MULL_RUNNER_EXE}
-            --report-dir "${MULL_REPORT_DIR}/math"
-            --coverage-info "${MULL_MATH_PROFILE_DATA}"
-            --ld-search-path "${CMAKE_BINARY_DIR}"
-            "$<TARGET_FILE:mull_math_unit>"
-    )
-    add_test(NAME "T6_Mutation_Checkpoint"
-        COMMAND ${CMAKE_COMMAND} -E chdir "${MULL_CHECKPOINT_RUN_DIR}"
-            ${MULL_RUNNER_EXE}
-            --report-dir "${MULL_REPORT_DIR}/checkpoint"
-            --coverage-info "${MULL_CHECKPOINT_PROFILE_DATA}"
-            --ld-search-path "${CMAKE_BINARY_DIR}"
-            "$<TARGET_FILE:mull_checkpoint>"
-    )
-    set_tests_properties("T6_Mutation_Math"
-        PROPERTIES
-            TIMEOUT 1800
-            LABELS "MUTATION"
-            FIXTURES_REQUIRED MULL_MATH_PROFILE_READY
-            PASS_REGULAR_EXPRESSION "Mutation score: [89][0-9]\\.[0-9]+%|Mutation score: 100"
-    )
-    set_tests_properties("T6_Mutation_Checkpoint"
-        PROPERTIES
-            TIMEOUT 600
-            LABELS "MUTATION"
-            FIXTURES_REQUIRED MULL_CHECKPOINT_PROFILE_READY
-            PASS_REGULAR_EXPRESSION "Mutation score: [89][0-9]\\.[0-9]+%|Mutation score: 100"
-    )
-
-    message(STATUS "")
-    message(STATUS "✅ MULL Mutation Testing ENABLED")
-    message(STATUS "   Runner  : ${MULL_RUNNER_EXE}")
-    message(STATUS "   Targets : mull_math_unit, mull_checkpoint")
-    message(STATUS "   Configs : ${MULL_MATH_CONFIG_PATH}, ${MULL_CHECKPOINT_CONFIG_PATH}")
-    message(STATUS "   Report  : ${MULL_REPORT_DIR}/*/index.html")
-    message(STATUS "")
-    message(STATUS "   Run:    cmake --build build --target mull-run")
-    message(STATUS "   CTest:  ctest -L MUTATION --output-on-failure")
-    message(STATUS "   Goal:   Mutation score > 80% (90%+ excellent)")
-    message(STATUS "")
-    message(STATUS "   Operators (${CMAKE_SOURCE_DIR}/src + include):")
-    message(STATUS "     cxx_add_to_sub / cxx_sub_to_add  ← Free Energy formula")
-    message(STATUS "     cxx_mul_to_div / cxx_div_to_mul  ← GEMM scaling")
-    message(STATUS "     cxx_gt_to_ge / cxx_lt_to_le      ← loop boundary")
-    message(STATUS "     cxx_logical_and_to_or             ← guard conditions")
-    message(STATUS "     cxx_remove_void_call              ← checkpoint write skip")
-    message(STATUS "")
-
-endif() # LOGOS_MUTATION_TEST
-
 message(STATUS "")
 message(STATUS "Build targets:")
-message(STATUS "  logos                  — CPU training")
-if(CMAKE_CUDA_COMPILER)
-message(STATUS "  logos_gpu              — GPU training (Phase 1+2)")
-message(STATUS "  test_syntax_build      — T1: CUDA syntax + GPU kernels")
-message(STATUS "  test_math_unit         — T2: Vedic math formulas (CPU)")
 message(STATUS "  test_checkpoint        — T2b: checkpoint roundtrip (CPU)")
+if(CMAKE_CUDA_COMPILER)
+message(STATUS "  logos_gpu              — GPU training/inference (cuBLAS)")
+message(STATUS "  test_syntax_build      — T1: CUDA syntax + GPU kernels")
+message(STATUS "  test_math_units_gpu    — T2: physics math (GPU vs CPU reference)")
 message(STATUS "  test_memory_stress     — T3: 1M+ data, VRAM leak, bounds")
 message(STATUS "  test_large_data_scale  — T4: 1TB scale, production CI/CD")
 message(STATUS "  test_cuda_kernels      — T5: kernel correctness + cross-file")
+message(STATUS "  test_cublas_gemm       — T10: cuBLAS wrapper vs CPU")
 endif()
 message(STATUS "")

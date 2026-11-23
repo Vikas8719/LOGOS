@@ -1,92 +1,23 @@
-
-
-#include "VedicGEMM.cuh"
+#include "CublasGemm.cuh"
 #include "MixedPrecision.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <stdio.h>
 #include <vector>
 #include <cmath>
 #include <string>
 #include <stdexcept>
 #include <climits>
-
-#ifndef LOGOS_USE_CUBLAS
-#define LOGOS_USE_CUBLAS 0
-#endif
+#include <mutex>
 
 #ifndef LOGOS_CUBLAS_TF32
 #define LOGOS_CUBLAS_TF32 0
 #endif
 
-#if LOGOS_USE_CUBLAS
-#include <cublas_v2.h>
-#endif
-
-#define TILE_SIZE 16
-
-// hash32: GPU-side fast integer hash (needed by SHM/Langevin kernels)
 __device__ __forceinline__ unsigned int hash32(unsigned int x) {
     x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
     return x;
-}
-
-
-__global__ void vedic_gemm_kernel(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    float*       __restrict__ C,
-    int M, int K, int N)
-{
-    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
-    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
-
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    float acc = 0.0f;
-
-    int num_tiles = (K + TILE_SIZE - 1) / TILE_SIZE;
-    for (int t = 0; t < num_tiles; ++t) {
-        int a_col = t * TILE_SIZE + threadIdx.x;
-        int b_row = t * TILE_SIZE + threadIdx.y;
-        tileA[threadIdx.y][threadIdx.x] =
-            (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
-        tileB[threadIdx.y][threadIdx.x] =
-            (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
-        __syncthreads();
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; ++k)
-            acc += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
-        __syncthreads();
-    }
-    if (row < M && col < N) C[row * N + col] = acc;
-}
-
-__global__ void vedic_gemm_bias_kernel(
-    const float* __restrict__ A, const float* __restrict__ W,
-    const float* __restrict__ bias, float* __restrict__ C,
-    int M, int K, int N)
-{
-    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
-    __shared__ float tileW[TILE_SIZE][TILE_SIZE];
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    float acc = 0.0f;
-    int num_tiles = (K + TILE_SIZE - 1) / TILE_SIZE;
-    for (int t = 0; t < num_tiles; ++t) {
-        int a_col = t * TILE_SIZE + threadIdx.x;
-        int w_row = t * TILE_SIZE + threadIdx.y;
-        tileA[threadIdx.y][threadIdx.x] =
-            (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
-        tileW[threadIdx.y][threadIdx.x] =
-            (w_row < K && col < N) ? W[w_row * N + col] : 0.0f;
-        __syncthreads();
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; ++k)
-            acc += tileA[threadIdx.y][k] * tileW[k][threadIdx.x];
-        __syncthreads();
-    }
-    if (row < M && col < N) C[row * N + col] = acc + bias[col];
 }
 
 __global__ void add_bias_kernel(float* __restrict__ C,
@@ -96,7 +27,6 @@ __global__ void add_bias_kernel(float* __restrict__ C,
     int size = M * N;
     if (idx < size) C[idx] += bias[idx % N];
 }
-
 
 __global__ void boltzmann_softmax_kernel(
     const float* __restrict__ input, float* __restrict__ output,
@@ -143,7 +73,6 @@ __global__ void boltzmann_softmax_kernel(
     for (int i=threadIdx.x;i<vocab_size;i+=blockDim.x) out_row[i]/=ssum;
 }
 
-
 __global__ void layernorm_kernel(
     const float* __restrict__ X, const float* __restrict__ gamma,
     const float* __restrict__ beta, float* __restrict__ Y,
@@ -185,7 +114,6 @@ __global__ void layernorm_kernel(
         y[j]=gamma[j]*(x[j]-smean)*sinv_std+beta[j];
 }
 
-
 __global__ void gelu_kernel(float* data, int size) {
     int idx=blockIdx.x*blockDim.x+threadIdx.x;
     if (idx<size) {
@@ -193,7 +121,6 @@ __global__ void gelu_kernel(float* data, int size) {
         data[idx]=0.5f*x*(1.0f+tanhf(0.7978845608f*(x+0.044715f*x*x*x)));
     }
 }
-
 
 __global__ void grad_norm_kernel(const float* __restrict__ grad,
                                   float* __restrict__ accum, int size) {
@@ -214,87 +141,13 @@ __global__ void grad_scale_kernel(float* grad, float scale, int size) {
     if (idx<size) grad[idx]*=scale;
 }
 
-__global__ void row_sum_kernel(
-    const float* __restrict__ A, float* __restrict__ row_sums,
-    int M, int K)
-{
-    int row = blockIdx.x;
-    if (row >= M) return;
-    float acc = 0.0f;
-    for (int k = threadIdx.x; k < K; k += blockDim.x)
-        acc += A[row * K + k];
-    
-    for (int off=16;off>0;off>>=1) acc+=__shfl_down_sync(0xffffffff,acc,off);
-    __shared__ float s[8];
-    if (threadIdx.x%32==0) s[threadIdx.x/32]=acc;
-    __syncthreads();
-    float t=0.0f;
-    if (threadIdx.x<8) t=s[threadIdx.x];
-    for (int off=4;off>0;off>>=1) t+=__shfl_down_sync(0xffffffff,t,off);
-    if (threadIdx.x==0) row_sums[row]=t;
-}
-
-__global__ void col_sum_kernel(
-    const float* __restrict__ B, float* __restrict__ col_sums,
-    int K, int N)
-{
-    int col = blockIdx.x;
-    if (col >= N) return;
-    float acc = 0.0f;
-    for (int k = threadIdx.x; k < K; k += blockDim.x)
-        acc += B[k * N + col];
-    for (int off=16;off>0;off>>=1) acc+=__shfl_down_sync(0xffffffff,acc,off);
-    __shared__ float s[8];
-    if (threadIdx.x%32==0) s[threadIdx.x/32]=acc;
-    __syncthreads();
-    float t=0.0f;
-    if (threadIdx.x<8) t=s[threadIdx.x];
-    for (int off=4;off>0;off>>=1) t+=__shfl_down_sync(0xffffffff,t,off);
-    if (threadIdx.x==0) col_sums[col]=t;
-}
-
-__global__ void col_sum_A_kernel(
-    const float* __restrict__ A, float* __restrict__ col_sums,
-    int M, int K)
-{
-    int col = blockIdx.x;
-    if (col >= K) return;
-    float acc = 0.0f;
-    for (int m = threadIdx.x; m < M; m += blockDim.x)
-        acc += A[m * K + col];
-    for (int off=16;off>0;off>>=1) acc+=__shfl_down_sync(0xffffffff,acc,off);
-    __shared__ float s[8];
-    if (threadIdx.x%32==0) s[threadIdx.x/32]=acc;
-    __syncthreads();
-    float t=0.0f;
-    if (threadIdx.x<8) t=s[threadIdx.x];
-    for (int off=4;off>0;off>>=1) t+=__shfl_down_sync(0xffffffff,t,off);
-    if (threadIdx.x==0) col_sums[col]=t;
-}
-
-
-__global__ void array_sum_kernel(
-    const float* __restrict__ arr, float* __restrict__ out, int n)
-{
-    __shared__ float sdata[256];
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    sdata[threadIdx.x] = (idx < n) ? arr[idx] : 0.0f;
-    __syncthreads();
-    for (int s=blockDim.x/2;s>0;s>>=1) {
-        if (threadIdx.x<s) sdata[threadIdx.x]+=sdata[threadIdx.x+s];
-        __syncthreads();
-    }
-    if (threadIdx.x==0) atomicAdd(out, sdata[0]);
-}
-
-
 __global__ void free_energy_loss_kernel(
-    const float* __restrict__ logits,  // (seq × vocab)
-    const int*   __restrict__ targets, // (seq,)
-    float*       __restrict__ loss_out,// (seq,) — per-token F
-    float*       __restrict__ grad_out,// (seq × vocab) — dF/dlogit
-    float*       __restrict__ ce_buf,  // (seq,) — per-token CE (for monitoring)
-    float*       __restrict__ S_buf,   // (seq,) — per-token entropy S
+    const float* __restrict__ logits,
+    const int*   __restrict__ targets,
+    float*       __restrict__ loss_out,
+    float*       __restrict__ grad_out,
+    float*       __restrict__ ce_buf,
+    float*       __restrict__ S_buf,
     int seq_len, int vocab_size,
     float temperature)
 {
@@ -324,7 +177,7 @@ __global__ void free_energy_loss_kernel(
     float thread_sum=0.0f;
     for (int v=threadIdx.x;v<vocab_size;v+=blockDim.x) {
         float e=expf(logit_row[v]-smax);
-        grad_row[v]=e;  // reuse grad buffer to store exp(logit)
+        grad_row[v]=e;
         thread_sum+=e;
     }
     for (int off=16;off>0;off>>=1)
@@ -341,7 +194,8 @@ __global__ void free_energy_loss_kernel(
     __syncthreads();
 
     for (int v=threadIdx.x;v<vocab_size;v+=blockDim.x)
-        grad_row[v] /= ssum;  // grad_row now = softmax probs p[v]
+        grad_row[v] /= ssum;
+    __syncthreads();
 
     __shared__ float sce;
     if (threadIdx.x == 0) {
@@ -371,14 +225,13 @@ __global__ void free_energy_loss_kernel(
 
     if (threadIdx.x == 0) {
         float F = sce - temperature * sS;
-        if (!isfinite(F)) F = sce;  // fallback: NaN guard
+        if (!isfinite(F)) F = sce;
         loss_out[i] = F;
         ce_buf[i]   = sce;
         S_buf[i]    = sS;
     }
     __syncthreads();
 
-    
     float inv_seq = 1.0f / seq_len;
     for (int v=threadIdx.x;v<vocab_size;v+=blockDim.x) {
         float pv   = grad_row[v];
@@ -391,17 +244,16 @@ __global__ void free_energy_loss_kernel(
     }
 }
 
-
 __global__ void shm_hybrid_kernel(
     float* __restrict__       weights,
     float* __restrict__       velocity,
     const float* __restrict__ gradients,
     float lr,
-    float mom_decay,      
-    float friction,       
-    float alpha_H,        
-    float alpha_L,        
-    float noise_scale,    
+    float mom_decay,
+    float friction,
+    float alpha_H,
+    float alpha_L,
+    float noise_scale,
     unsigned int seed,
     int size)
 {
@@ -418,27 +270,20 @@ __global__ void shm_hybrid_kernel(
     float v = velocity[idx];
     float w = weights[idx];
 
-    
     if (!isfinite(g)) g = 0.0f;
 
-    
     float ham_kick      = -(alpha_H * 0.5f) * g;
-    
     float lang_friction = (alpha_L > 1e-7f) ? (-(alpha_L * 0.5f) * friction * v) : 0.0f;
     float thermal_noise = (alpha_L > 1e-7f) ? thermal : 0.0f;
 
     float v_half = mom_decay * v + ham_kick + lang_friction + thermal_noise;
-
-   
     float w_new = w + lr * v_half;
 
- 
     if (!isfinite(w_new)) w_new = w;
 
     velocity[idx] = v_half;
     weights[idx]  = w_new;
 }
-
 
 __global__ void leapfrog_langevin_kernel(
     float* __restrict__       weights,
@@ -463,29 +308,22 @@ __global__ void leapfrog_langevin_kernel(
     float v  = velocity[idx];
     float w  = weights[idx];
 
-    
     if (!isfinite(g)) g = 0.0f;
 
-    
     float v_half = friction * v - (lr * 0.5f) * g + thermal;
-
-    
     float w_new = w + lr * v_half;
 
-    
     if (!isfinite(w_new)) w_new = w;
 
-    velocity[idx] = v_half;  // store v_{t+½} → becomes v_t for next step
-    weights[idx]  = w_new;   // W_{t+1}
+    velocity[idx] = v_half;
+    weights[idx]  = w_new;
 }
-
-
 
 GPUTensor gpu_alloc(int rows, int cols) {
     GPUTensor t;
     t.rows=rows; t.cols=cols; t.size=rows*cols;
-    CUDA_CHECK(cudaMalloc(&t.data, t.size*sizeof(float)));
-    CUDA_CHECK(cudaMemset(t.data, 0, t.size*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&t.data, (size_t)t.size*sizeof(float)));
+    CUDA_CHECK(cudaMemset(t.data, 0, (size_t)t.size*sizeof(float)));
     return t;
 }
 
@@ -494,14 +332,15 @@ void gpu_free(GPUTensor& t) {
 }
 
 void h2d(GPUTensor& dst, const float* src, int size) {
-    CUDA_CHECK(cudaMemcpy(dst.data, src, size*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dst.data, src, (size_t)size*sizeof(float), cudaMemcpyHostToDevice));
 }
 
 void d2h(float* dst, const GPUTensor& src, int size) {
-    CUDA_CHECK(cudaMemcpy(dst, src.data, size*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dst, src.data, (size_t)size*sizeof(float), cudaMemcpyDeviceToHost));
 }
 
-#if LOGOS_USE_CUBLAS
+static constexpr int LOGOS_MAX_DEVICES = 16;
+
 static void cublas_check(cublasStatus_t status, const char* operation) {
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(std::string("cuBLAS error in ") + operation +
@@ -510,72 +349,98 @@ static void cublas_check(cublasStatus_t status, const char* operation) {
 }
 
 static cublasHandle_t logos_cublas_handle() {
-    struct HandleOwner {
-        cublasHandle_t h = nullptr;
-        HandleOwner() {
-            cublas_check(cublasCreate(&h), "cublasCreate");
-            cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
+    struct Registry {
+        cublasHandle_t handles[LOGOS_MAX_DEVICES] = {};
+        std::mutex mu;
+        ~Registry() {
+            for (auto& h : handles) if (h) { cublasDestroy(h); h = nullptr; }
         }
-        ~HandleOwner() { if (h) { cublasDestroy(h); h = nullptr; } }
     };
-    static HandleOwner owner;
-    return owner.h;
-}
-#endif
+    static Registry reg;
 
-bool cuda_vedic_gemm_uses_cublas() {
-#if LOGOS_USE_CUBLAS
-    return true;
-#else
-    return false;
-#endif
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= LOGOS_MAX_DEVICES)
+        throw std::runtime_error("cuBLAS: device index " + std::to_string(dev) +
+                                 " >= LOGOS_MAX_DEVICES");
+    std::lock_guard<std::mutex> lk(reg.mu);
+    if (!reg.handles[dev]) {
+        cublas_check(cublasCreate(&reg.handles[dev]), "cublasCreate");
+        cublas_check(cublasSetMathMode(reg.handles[dev], CUBLAS_DEFAULT_MATH),
+                     "cublasSetMathMode");
+    }
+    return reg.handles[dev];
 }
 
-void cuda_vedic_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C) {
-    int M=A.rows, K=A.cols, N=B.cols;
-#if LOGOS_USE_CUBLAS
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasHandle_t handle = logos_cublas_handle();
+static const float* logos_ones_buffer(int n) {
+    struct Slot { float* p = nullptr; int n = 0; };
+    struct Registry {
+        Slot slots[LOGOS_MAX_DEVICES];
+        std::mutex mu;
+        ~Registry() { for (auto& s : slots) if (s.p) { cudaFree(s.p); s.p = nullptr; } }
+    };
+    static Registry reg;
+
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= LOGOS_MAX_DEVICES)
+        throw std::runtime_error("ones buffer: device index out of range");
+    std::lock_guard<std::mutex> lk(reg.mu);
+    Slot& s = reg.slots[dev];
+    if (s.n < n) {
+        if (s.p) { cudaFree(s.p); s.p = nullptr; s.n = 0; }
+        CUDA_CHECK(cudaMalloc(&s.p, (size_t)n * sizeof(float)));
+        std::vector<float> h((size_t)n, 1.0f);
+        CUDA_CHECK(cudaMemcpy(s.p, h.data(), (size_t)n * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        s.n = n;
+    }
+    return s.p;
+}
+
+void cuda_gemm_rm(bool transA, bool transB, int M, int N, int K,
+                  float alpha, const float* A, int lda,
+                  const float* B, int ldb,
+                  float beta,  float* C, int ldc)
+{
+    const cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
 #if LOGOS_CUBLAS_TF32
-    
-    cublas_check(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                               N, M, K, &alpha,
-                               B.data, CUDA_R_32F, N,
-                               A.data, CUDA_R_32F, K,
-                               &beta, C.data, CUDA_R_32F, N,
-                               CUBLAS_COMPUTE_32F_FAST_TF32,
-                               CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "cublasGemmEx");
+    const cublasComputeType_t ctype = CUBLAS_COMPUTE_32F_FAST_TF32;
 #else
-    cublas_check(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                              N, M, K, &alpha, B.data, N,
-                              A.data, K, &beta, C.data, N),
-                "cublasSgemm");
+    const cublasComputeType_t ctype = CUBLAS_COMPUTE_32F;
 #endif
-#else
-    dim3 block(TILE_SIZE,TILE_SIZE);
-    dim3 grid((N+TILE_SIZE-1)/TILE_SIZE,(M+TILE_SIZE-1)/TILE_SIZE);
-    vedic_gemm_kernel<<<grid,block>>>(A.data,B.data,C.data,M,K,N);
-    CUDA_KERNEL_CHECK();
-#endif
+    cublas_check(cublasGemmEx(logos_cublas_handle(), opB, opA,
+                              N, M, K, &alpha,
+                              B, CUDA_R_32F, ldb,
+                              A, CUDA_R_32F, lda,
+                              &beta, C, CUDA_R_32F, ldc,
+                              ctype, CUBLAS_GEMM_DEFAULT),
+                 "cublasGemmEx(fp32)");
 }
 
-void cuda_vedic_gemm_bias(const GPUTensor& A, const GPUTensor& W,
-                           const GPUTensor& bias, GPUTensor& C) {
+void cuda_colsum_accumulate(const float* dY, float* db, int rows, int cols)
+{
+    const float* ones = logos_ones_buffer(rows);
+    const float alpha = 1.0f, beta = 1.0f;
+    cublas_check(cublasSgemv(logos_cublas_handle(), CUBLAS_OP_N,
+                             cols, rows, &alpha, dY, cols,
+                             ones, 1, &beta, db, 1),
+                 "cublasSgemv(colsum)");
+}
+
+void cuda_gemm(const GPUTensor& A, const GPUTensor& B, GPUTensor& C) {
+    int M=A.rows, K=A.cols, N=B.cols;
+    cuda_gemm_rm(false, false, M, N, K, 1.0f, A.data, K, B.data, N, 0.0f, C.data, N);
+}
+
+void cuda_gemm_bias(const GPUTensor& A, const GPUTensor& W,
+                    const GPUTensor& bias, GPUTensor& C) {
     int M=A.rows, N=W.cols;
-#if LOGOS_USE_CUBLAS
-    cuda_vedic_gemm(A, W, C);
+    cuda_gemm(A, W, C);
     int size = M * N;
     add_bias_kernel<<<(size + 255) / 256, 256>>>(C.data, bias.data, M, N);
     CUDA_KERNEL_CHECK();
-#else
-    int K=A.cols;
-    dim3 block(TILE_SIZE,TILE_SIZE);
-    dim3 grid((N+TILE_SIZE-1)/TILE_SIZE,(M+TILE_SIZE-1)/TILE_SIZE);
-    vedic_gemm_bias_kernel<<<grid,block>>>(A.data,W.data,bias.data,C.data,M,K,N);
-    CUDA_KERNEL_CHECK();
-#endif
 }
 
 void cuda_boltzmann_softmax(const GPUTensor& scores, GPUTensor& probs,
@@ -624,57 +489,6 @@ float cuda_clip_gradients(std::vector<GPUTensor*>& grads, float max_norm) {
     return total_norm;
 }
 
-
-VedicVerifyResult cuda_vedic_verify(const GPUTensor& A,
-                                     const GPUTensor& B,
-                                     const GPUTensor& C,
-                                     float tolerance)
-{
-    int M=A.rows, K=A.cols, N=B.cols;
-
-    CudaPtr<float> d_col_sums_A(K);
-    CudaPtr<float> d_row_sums_B(K);
-    CudaPtr<float> d_sum_C(1);
-
-    col_sum_A_kernel<<<K, 256>>>(A.data, d_col_sums_A.get(), M, K);
-    CUDA_KERNEL_CHECK();
-
-    row_sum_kernel<<<K, 256>>>(B.data, d_row_sums_B.get(), K, N);
-    CUDA_KERNEL_CHECK();
-
-
-
-   
-    {
-        int sz = C.size, blk = (sz + 255) / 256;
-        array_sum_kernel<<<blk, 256>>>(C.data, d_sum_C.get(), sz);
-        CUDA_KERNEL_CHECK();
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(0));
-
-    std::vector<float> h_col_A(K), h_row_B(K);
-    d_col_sums_A.to_host(h_col_A.data(), K);
-    d_row_sums_B.to_host(h_row_B.data(), K);
-
-    
-    double checksum_vedic = 0.0;
-    for (int k = 0; k < K; ++k)
-        checksum_vedic += (double)h_col_A[k] * (double)h_row_B[k];
-
-    float h_sum_C = d_sum_C.scalar();
-    
-
-    VedicVerifyResult res;
-    res.checksum_C     = h_sum_C;
-    res.checksum_vedic = (float)checksum_vedic;
-    float denom        = fabsf(res.checksum_vedic) + 1e-6f;
-    res.relative_error = fabsf(h_sum_C - res.checksum_vedic) / denom;
-    res.pass           = res.relative_error < tolerance;
-    return res;
-}
-
-
 void cuda_free_energy_loss(
     const float* d_logits,
     const int*   d_targets,
@@ -684,16 +498,11 @@ void cuda_free_energy_loss(
     float temperature,
     FreeEnergyResult& out_result)
 {
-    
-    float *d_ce_buf = nullptr, *d_S_buf = nullptr;
     CudaPtr<float> d_ce_raii(seq_len);
     CudaPtr<float> d_S_raii(seq_len);
-    d_ce_buf = d_ce_raii.get();
-    d_S_buf  = d_S_raii.get();
-    CUDA_CHECK(cudaMemset(d_ce_buf, 0, seq_len*sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_S_buf,  0, seq_len*sizeof(float)));
+    float* d_ce_buf = d_ce_raii.get();
+    float* d_S_buf  = d_S_raii.get();
 
-    
     free_energy_loss_kernel<<<seq_len, 256>>>(
         d_logits, d_targets,
         d_loss_buf, d_grad_out,
@@ -721,38 +530,33 @@ void cuda_free_energy_loss(
     }
 }
 
-
-#define FA_TILE     16     
-#define FA_DH_MAX   64     // [v44-FIX] T4 pe DH=64 (d=1024/H=16) — 128 se ghata ke smem half kiya
+#define FA_TILE     16
+#define FA_DH_MAX   64
 
 __global__ void flash_attention_kernel(
-    const float* __restrict__ Q,     
-    const float* __restrict__ K,     
-    const float* __restrict__ V,     
-    float*       __restrict__ Out,   
-    float*       __restrict__ Aptr,  
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float*       __restrict__ Out,
+    float*       __restrict__ Aptr,
     int seq, int DH,
     float scale,
-    bool causal,
-    bool shunyam, int window, int stride)
+    bool causal)
 {
-    
     int q_start = blockIdx.x * FA_TILE;
-    int tid      = threadIdx.x;   
+    int tid      = threadIdx.x;
 
-    
     extern __shared__ float smem[];
     float* sQ = smem;
     float* sK = sQ + FA_TILE * FA_DH_MAX;
     float* sV = sK + FA_TILE * FA_DH_MAX;
     float* sO = sV + FA_TILE * FA_DH_MAX;
-    float* sm = sO + FA_TILE * FA_DH_MAX;  
-    float* sl = sm + FA_TILE;              
+    float* sm = sO + FA_TILE * FA_DH_MAX;
+    float* sl = sm + FA_TILE;
 
     int q_row   = q_start + tid;
     bool q_valid = (q_row < seq);
 
-    
     if (q_valid) {
         const float* qptr = Q + q_row * DH;
         for (int d = 0; d < DH; ++d)
@@ -762,7 +566,6 @@ __global__ void flash_attention_kernel(
             sQ[tid * FA_DH_MAX + d] = 0.0f;
     }
 
-    
     sm[tid] = -1e30f;
     sl[tid] = 0.0f;
     for (int d = 0; d < DH; ++d)
@@ -797,7 +600,6 @@ __global__ void flash_attention_kernel(
         __syncthreads();
 
         if (q_valid) {
-            
             float scores_local[FA_TILE];
             float tile_max = -1e30f;
 
@@ -805,17 +607,8 @@ __global__ void flash_attention_kernel(
                 int k_abs = kv_start + kj;
                 if (k_abs >= seq) { scores_local[kj] = -1e30f; continue; }
 
-                
                 if (causal && k_abs > q_row) { scores_local[kj] = -1e30f; continue; }
 
-                
-                if (shunyam && seq > window) {
-                    bool in_window  = (k_abs >= q_row - window) && (k_abs <= q_row);
-                    bool is_global  = (k_abs % stride == 0);
-                    if (!in_window && !is_global) { scores_local[kj] = -1e30f; continue; }
-                }
-
-                
                 float dot = 0.0f;
                 const float* qi = sQ + tid * FA_DH_MAX;
                 const float* ki = sK + kj  * FA_DH_MAX;
@@ -825,35 +618,30 @@ __global__ void flash_attention_kernel(
                 tile_max = fmaxf(tile_max, scores_local[kj]);
             }
 
-            
             float m_new     = fmaxf(sm[tid], tile_max);
-            float exp_shift = expf(sm[tid] - m_new);  
+            float exp_shift = expf(sm[tid] - m_new);
 
-            
             for (int d = 0; d < DH; ++d)
                 sO[tid * FA_DH_MAX + d] *= exp_shift;
             float l_new = sl[tid] * exp_shift;
 
-            
             for (int kj = 0; kj < FA_TILE; ++kj) {
                 float s = scores_local[kj];
-                if (s <= -1e29f) continue;  
+                if (s <= -1e29f) continue;
 
                 float e = expf(s - m_new);
                 l_new += e;
 
-                
                 const float* vi = sV + kj * FA_DH_MAX;
                 float*       oi = sO + tid * FA_DH_MAX;
                 #pragma unroll 8
                 for (int d = 0; d < DH; ++d)
                     oi[d] += e * vi[d];
 
-                
                 if (Aptr != nullptr) {
                     int k_abs = kv_start + kj;
                     if (k_abs < seq)
-                        Aptr[q_row * seq + k_abs] = e;  
+                        Aptr[q_row * seq + k_abs] = e;
                 }
             }
 
@@ -871,7 +659,6 @@ __global__ void flash_attention_kernel(
         for (int d = 0; d < DH; ++d)
             out_row[d] = oi[d] * inv_l;
 
-        
         if (Aptr != nullptr) {
             float* arow = Aptr + q_row * seq;
             for (int k_abs = 0; k_abs < seq; ++k_abs)
@@ -883,32 +670,28 @@ __global__ void flash_attention_kernel(
 void cuda_flash_attention_fwd(
     const float* Q, const float* K, const float* V,
     float* out,
-    float* attn_ptr,      // nullable
+    float* attn_ptr,
     int seq, int DH,
     float scale,
-    bool causal,
-    bool shunyam, int window, int stride)
+    bool causal)
 {
     if (DH > FA_DH_MAX) {
         throw std::runtime_error(
-            "[v31-FLASH] DH=" + std::to_string(DH) +
+            "Flash attention: DH=" + std::to_string(DH) +
             " exceeds FA_DH_MAX=" + std::to_string(FA_DH_MAX) +
             ". Increase FA_DH_MAX or reduce num_heads.");
     }
-    // [v44-FIX] FA_DH_MAX=64 (T4 DH=64), smem exact calculate karo
     size_t smem_bytes = sizeof(float) * (4 * FA_TILE * FA_DH_MAX + 2 * FA_TILE);
 
-    // T4 shared memory limit: 48KB. Check karo
     {
         int dev; cudaGetDevice(&dev);
         cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
         size_t max_smem = prop.sharedMemPerBlockOptin;
         if (smem_bytes > max_smem) {
-            // fallback: FA_DH_MAX ke bajaay exact DH use karo
             smem_bytes = sizeof(float) * (4 * FA_TILE * DH + 2 * FA_TILE);
             if (smem_bytes > max_smem) {
                 throw std::runtime_error(
-                    "[v31-FLASH] smem " + std::to_string(smem_bytes) +
+                    "Flash attention: smem " + std::to_string(smem_bytes) +
                     " > GPU max " + std::to_string(max_smem) +
                     " bytes. DH=" + std::to_string(DH));
             }
@@ -917,19 +700,17 @@ void cuda_flash_attention_fwd(
 
     cudaError_t attr_err = cudaFuncSetAttribute(flash_attention_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_bytes);
+                         (int)smem_bytes);
     if (attr_err != cudaSuccess) {
-        // attribute set fail hone par bhi proceed karo — kernel already launched nahi
-        fprintf(stderr, "[v31-FLASH] cudaFuncSetAttribute warning: %s\n",
+        fprintf(stderr, "Flash attention: cudaFuncSetAttribute warning: %s\n",
                 cudaGetErrorString(attr_err));
-        cudaGetLastError(); // clear error
+        cudaGetLastError();
     }
 
     int q_tiles = (seq + FA_TILE - 1) / FA_TILE;
     flash_attention_kernel<<<q_tiles, FA_TILE, smem_bytes>>>(
         Q, K, V, out, attn_ptr,
-        seq, DH, scale, causal,
-        shunyam, window, stride);
+        seq, DH, scale, causal);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -968,36 +749,15 @@ std::string validate_model_config(int d_model, int num_heads, int num_layers,
     return "";
 }
 
-
 void cuda_gemm_fp16_fp32out(
     const __half* A, int M, int K,
     const __half* B, int N,
     float* C,
     float alpha, float beta)
 {
-#if LOGOS_USE_CUBLAS
     h100_hgemm_fp32_acc(logos_cublas_handle(), A, M, K, B, N, C, alpha, beta);
     CUDA_KERNEL_CHECK();
-#else
-    
-    fprintf(stderr, "[v23-AMP] WARNING: FP16 GEMM called without cuBLAS — "
-                    "falling back to FP32 conversion (slow)\n");
-    
-    float *d_A32, *d_B32;
-    cudaMalloc(&d_A32, M * K * sizeof(float));
-    cudaMalloc(&d_B32, K * N * sizeof(float));
-    cast_fp16_to_fp32_kernel<<<(M*K+255)/256, 256>>>(A, d_A32, M*K);
-    cast_fp16_to_fp32_kernel<<<(K*N+255)/256, 256>>>(B, d_B32, K*N);
-    
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((N+TILE_SIZE-1)/TILE_SIZE, (M+TILE_SIZE-1)/TILE_SIZE);
-    vedic_gemm_kernel<<<grid, block>>>(d_A32, d_B32, C, M, K, N);
-    CUDA_KERNEL_CHECK();
-    cudaFree(d_A32);
-    cudaFree(d_B32);
-#endif
 }
-
 
 void cuda_gemm_fp16_fp16out(
     const __half* A, int M, int K,
@@ -1005,17 +765,9 @@ void cuda_gemm_fp16_fp16out(
     __half* C,
     float alpha, float beta)
 {
-#if LOGOS_USE_CUBLAS
     h100_hgemm_half_out(logos_cublas_handle(), A, M, K, B, N, C, alpha, beta);
     CUDA_KERNEL_CHECK();
-#else
-    
-    (void)A; (void)M; (void)K; (void)B; (void)N; (void)C;
-    (void)alpha; (void)beta;
-    throw std::runtime_error("[v23-AMP] FP16→FP16 GEMM requires cuBLAS");
-#endif
 }
-
 
 void cuda_layernorm_fp16(
     const __half* X, const float* gamma, const float* beta,
@@ -1024,7 +776,6 @@ void cuda_layernorm_fp16(
     layernorm_fp16_kernel<<<seq, 256>>>(X, gamma, beta, Y, seq, d, eps);
     CUDA_KERNEL_CHECK();
 }
-
 
 void cuda_embedding_lookup_fp16(
     const int* token_ids, const float* embedding_fp32,
@@ -1037,13 +788,11 @@ void cuda_embedding_lookup_fp16(
     CUDA_KERNEL_CHECK();
 }
 
-
 void cuda_logits_fp16_to_fp32(const __half* logits_fp16, float* logits_fp32, int n) {
     int blocks = (n + 255) / 256;
     logits_fp16_to_fp32_kernel<<<blocks, 256>>>(logits_fp16, logits_fp32, n);
     CUDA_KERNEL_CHECK();
 }
-
 
 void cuda_scale_tensor(float* data, float scale, int n) {
     scale_tensor(data, scale, n);

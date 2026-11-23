@@ -1,14 +1,18 @@
 
-#include "VedicGEMM.cuh"
+#include "CublasGemm.cuh"
 #include "ModelGPU.cuh"
 #include "MixedPrecision.cuh"
 #include "../include/Tokenizer.hpp"
 #include "../include/StreamingDataLoader.hpp"
+#include "../include/TokenBin.hpp"
+#include <memory>
 #include "../include/Checkpoint.hpp"
-#include "../include/PhysicsOpt.hpp"    
-#include "../include/TrainingState.hpp" 
+#include "../include/PathIntegral.hpp"
+#include "../include/TrainingState.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdio>
+#include <exception>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -26,9 +30,8 @@
 
 
 
-extern __global__ void gpu_transpose_kernel(const float*, float*, int, int);
-extern __global__ void grad_scale_kernel(float*, float, int);
-extern __global__ void vedic_gemm_kernel(const float*, const float*, float*, int, int, int);
+// [cuBLAS-MIGRATION] gpu_transpose_kernel / grad_scale_kernel / vedic_gemm_kernel externs hata diye —
+// backward ke saare matmul ab cuda_gemm_rm() (cuBLAS) se hote hain.
 extern __global__ void boltzmann_softmax_kernel(const float*, float*, int, int, float);
 extern __global__ void causal_mask_kernel(float*, int);
 extern __global__ void shm_hybrid_kernel(float*, float*, const float*, float, float, float, float, float, float, unsigned int, int);
@@ -170,27 +173,9 @@ public:
 
 
 
-__global__ void lmhead_grad_dw_kernel(
-    const float* __restrict__ X, const float* __restrict__ dY,
-    float* __restrict__ dW, int seq, int d, int vocab)
-{
-    int di=blockIdx.x, vi=blockIdx.y*blockDim.x+threadIdx.x;
-    if (di>=d||vi>=vocab) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=X[s*d+di]*dY[s*vocab+vi];
-    atomicAdd(&dW[di*vocab+vi],acc);
-}
-
-__global__ void lmhead_grad_dx_kernel(
-    const float* __restrict__ dY, const float* __restrict__ W,
-    float* __restrict__ dX, int seq, int d, int vocab)
-{
-    int s=blockIdx.x, di=blockIdx.y*blockDim.x+threadIdx.x;
-    if (s>=seq||di>=d) return;
-    float acc=0.0f;
-    for (int v=0;v<vocab;++v) acc+=dY[s*vocab+v]*W[di*vocab+v];
-    dX[s*d+di]=acc;
-}
+// [cuBLAS-MIGRATION] Backward ke hand-written GEMM kernels (lmhead_*, ffn_*_grad, ffn_da/dx,
+// attn_dV/dAttnProbs/dQ/dK/dWQKV/dX_from_QKV/dWO/dHeadOut/dWproj/dConcat, bias_grad) hata diye gaye.
+// Sab cuda_gemm_rm() / cuda_colsum_accumulate() (VedicGEMM.cu, cuBLAS) se replace hue.
 
 __global__ void embedding_bwd_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ dX,
@@ -223,15 +208,7 @@ __global__ void vec_mul_kernel(float* dst, const float* src, int size) {
 }
 
 
-__global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict__ db,
-                                 int seq, int cols)
-{
-    int j=blockIdx.x*blockDim.x+threadIdx.x;
-    if (j>=cols) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=dY[s*cols+j];
-    atomicAdd(&db[j],acc);
-}
+
 
 
 __global__ void sumsq_accum_kernel(const float* __restrict__ g, float* __restrict__ out, int n)
@@ -263,27 +240,7 @@ __global__ void sumsq_accum_kernel(const float* __restrict__ g, float* __restric
     
 }
 
-__global__ void ffn_w2_grad_kernel(
-    const float* __restrict__ ffn_A, const float* __restrict__ d_out,
-    float* __restrict__ dW2, int seq, int d4, int d)
-{
-    int fi=blockIdx.x, di=blockIdx.y*blockDim.x+threadIdx.x;
-    if (fi>=d4||di>=d) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=ffn_A[s*d4+fi]*d_out[s*d+di];
-    atomicAdd(&dW2[fi*d+di],acc);
-}
 
-__global__ void ffn_da_kernel(
-    const float* __restrict__ d_out, const float* __restrict__ W2,
-    float* __restrict__ d_ffn_A, int seq, int d4, int d)
-{
-    int s=blockIdx.x, fi=blockIdx.y*blockDim.x+threadIdx.x;
-    if (s>=seq||fi>=d4) return;
-    float acc=0.0f;
-    for (int di=0;di<d;++di) acc+=d_out[s*d+di]*W2[fi*d+di];
-    d_ffn_A[s*d4+fi]=acc;
-}
 
 __global__ void gelu_bwd_kernel(
     const float* __restrict__ ffn_H, const float* __restrict__ d_ffn_A,
@@ -298,27 +255,7 @@ __global__ void gelu_bwd_kernel(
     d_ffn_H[idx]=d_ffn_A[idx]*gp;
 }
 
-__global__ void ffn_w1_grad_kernel(
-    const float* __restrict__ normed2, const float* __restrict__ d_ffn_H,
-    float* __restrict__ dW1, int seq, int d, int d4)
-{
-    int di=blockIdx.x, fi=blockIdx.y*blockDim.x+threadIdx.x;
-    if (di>=d||fi>=d4) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=normed2[s*d+di]*d_ffn_H[s*d4+fi];
-    atomicAdd(&dW1[di*d4+fi],acc);
-}
 
-__global__ void ffn_dx_kernel(
-    const float* __restrict__ d_ffn_H, const float* __restrict__ W1,
-    float* __restrict__ d_normed2, int seq, int d, int d4)
-{
-    int s=blockIdx.x, di=blockIdx.y*blockDim.x+threadIdx.x;
-    if (s>=seq||di>=d) return;
-    float acc=0.0f;
-    for (int fi=0;fi<d4;++fi) acc+=d_ffn_H[s*d4+fi]*W1[di*d4+fi];
-    d_normed2[s*d+di]=acc;
-}
 
 __global__ void layernorm_bwd_kernel(
     const float* __restrict__ X, const float* __restrict__ gamma,
@@ -370,27 +307,7 @@ __global__ void layernorm_bwd_kernel(
 }
 
 
-__global__ void attn_dV_kernel(
-    const float* __restrict__ attn_probs, const float* __restrict__ d_head_out,
-    float* __restrict__ dV, int seq, int DH)
-{
-    int j=blockIdx.x, ki=blockIdx.y*blockDim.x+threadIdx.x;
-    if (j>=DH||ki>=seq) return;
-    float acc=0.0f;
-    for (int i=0;i<seq;++i) acc+=attn_probs[i*seq+ki]*d_head_out[i*DH+j];
-    atomicAdd(&dV[ki*DH+j],acc);
-}
 
-__global__ void attn_dAttnProbs_kernel(
-    const float* __restrict__ d_head_out, const float* __restrict__ V,
-    float* __restrict__ d_attn_probs, int seq, int DH)
-{
-    int i=blockIdx.x, k=blockIdx.y*blockDim.x+threadIdx.x;
-    if (i>=seq||k>=seq) return;
-    float acc=0.0f;
-    for (int j=0;j<DH;++j) acc+=d_head_out[i*DH+j]*V[k*DH+j];
-    d_attn_probs[i*seq+k]=acc;
-}
 
 __global__ void softmax_bwd_kernel(
     const float* __restrict__ attn_probs, const float* __restrict__ d_attn_probs,
@@ -407,93 +324,7 @@ __global__ void softmax_bwd_kernel(
         ds[j]=p[j]*(dp[j]-dot)*inv_sqrt_DH;
 }
 
-__global__ void attn_dQ_kernel(
-    const float* __restrict__ d_scores, const float* __restrict__ K,
-    float* __restrict__ dQ, int seq, int DH)
-{
-    int i=blockIdx.x, j=blockIdx.y*blockDim.x+threadIdx.x;
-    if (i>=seq||j>=DH) return;
-    float acc=0.0f;
-    for (int k=0;k<seq;++k) acc+=d_scores[i*seq+k]*K[k*DH+j];
-    dQ[i*DH+j]=acc;
-}
 
-__global__ void attn_dK_kernel(
-    const float* __restrict__ d_scores, const float* __restrict__ Q,
-    float* __restrict__ dK, int seq, int DH)
-{
-    int k=blockIdx.x, j=blockIdx.y*blockDim.x+threadIdx.x;
-    if (k>=seq||j>=DH) return;
-    float acc=0.0f;
-    for (int i=0;i<seq;++i) acc+=d_scores[i*seq+k]*Q[i*DH+j];
-    dK[k*DH+j]=acc;
-}
-
-__global__ void attn_dWQKV_kernel(
-    const float* __restrict__ normed1, const float* __restrict__ dQKV,
-    float* __restrict__ dW, int seq, int D, int DH)
-{
-    int di=blockIdx.x, dhi=blockIdx.y*blockDim.x+threadIdx.x;
-    if (di>=D||dhi>=DH) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=normed1[s*D+di]*dQKV[s*DH+dhi];
-    atomicAdd(&dW[di*DH+dhi],acc);
-}
-
-__global__ void attn_dX_from_QKV_kernel(
-    const float* __restrict__ dQKV, const float* __restrict__ W,
-    float* __restrict__ dN1, int seq, int D, int DH)
-{
-    int s=blockIdx.x, di=blockIdx.y*blockDim.x+threadIdx.x;
-    if (s>=seq||di>=D) return;
-    float acc=0.0f;
-    for (int dhi=0;dhi<DH;++dhi) acc+=dQKV[s*DH+dhi]*W[di*DH+dhi];
-    atomicAdd(&dN1[s*D+di],acc);
-}
-
-__global__ void attn_dWO_kernel(
-    const float* __restrict__ head_out, const float* __restrict__ d_concat,
-    float* __restrict__ dWO, int seq, int DH, int D)
-{
-    int dhi=blockIdx.x, di=blockIdx.y*blockDim.x+threadIdx.x;
-    if (dhi>=DH||di>=D) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=head_out[s*DH+dhi]*d_concat[s*D+di];
-    atomicAdd(&dWO[dhi*D+di],acc);
-}
-
-__global__ void attn_dHeadOut_kernel(
-    const float* __restrict__ d_concat, const float* __restrict__ W_O,
-    float* __restrict__ d_head_out, int seq, int DH, int D)
-{
-    int s=blockIdx.x, dhi=blockIdx.y*blockDim.x+threadIdx.x;
-    if (s>=seq||dhi>=DH) return;
-    float acc=0.0f;
-    for (int di=0;di<D;++di) acc+=d_concat[s*D+di]*W_O[dhi*D+di];
-    d_head_out[s*DH+dhi]=acc;
-}
-
-__global__ void attn_dWproj_kernel(
-    const float* __restrict__ concat, const float* __restrict__ d_mha_out,
-    float* __restrict__ dW_proj, int seq, int D)
-{
-    int i=blockIdx.x, j=blockIdx.y*blockDim.x+threadIdx.x;
-    if (i>=D||j>=D) return;
-    float acc=0.0f;
-    for (int s=0;s<seq;++s) acc+=concat[s*D+i]*d_mha_out[s*D+j];
-    atomicAdd(&dW_proj[i*D+j],acc);
-}
-
-__global__ void attn_dConcat_kernel(
-    const float* __restrict__ d_mha_out, const float* __restrict__ W_proj,
-    float* __restrict__ d_concat, int seq, int D)
-{
-    int s=blockIdx.x, j=blockIdx.y*blockDim.x+threadIdx.x;
-    if (s>=seq||j>=D) return;
-    float acc=0.0f;
-    for (int k=0;k<D;++k) acc+=d_mha_out[s*D+k]*W_proj[j*D+k];
-    d_concat[s*D+j]=acc;
-}
 
 
 // [v40-BUG1-FIX] Per-head backward buffers — ek baar allocate, har call reuse karo
@@ -507,21 +338,14 @@ struct HeadBwdBuffers {
     GPUTensor dQ_adv;          // (seq, DH)
     GPUTensor dQ;              // (seq, DH)
     GPUTensor dK;              // (seq, DH)
-    GPUTensor K_T;             // (DH, seq)
 
     bool allocated = false;
     int  alloc_seq = 0, alloc_DH = 0;
 
     void ensure(int seq_, int DH_) {
         if (allocated && alloc_seq == seq_ && alloc_DH == DH_) return;
-        // Free purane buffers agar size change hua
-        if (allocated) {
-            cudaFree(d_head_out.data);      cudaFree(d_attn_probs_buf.data);
-            cudaFree(dV_s.data);            cudaFree(dV.data);
-            cudaFree(d_attn_probs.data);    cudaFree(d_scores.data);
-            cudaFree(dQ_adv.data);          cudaFree(dQ.data);
-            cudaFree(dK.data);              cudaFree(K_T.data);
-        }
+        // [cuBLAS-MIGRATION] Size change pe purana buffer GPUTensor move-assign (RAII) khud free
+        // karta hai — manual cudaFree se double-free hota tha, isliye hata diya.
         d_head_out       = gpu_alloc(seq_, DH_);
         d_attn_probs_buf = gpu_alloc(seq_, seq_);
         dV_s             = gpu_alloc(seq_, DH_);
@@ -531,17 +355,7 @@ struct HeadBwdBuffers {
         dQ_adv           = gpu_alloc(seq_, DH_);
         dQ               = gpu_alloc(seq_, DH_);
         dK               = gpu_alloc(seq_, DH_);
-        K_T              = gpu_alloc(DH_, seq_);
         allocated = true; alloc_seq = seq_; alloc_DH = DH_;
-    }
-
-    ~HeadBwdBuffers() {
-        if (!allocated) return;
-        cudaFree(d_head_out.data);      cudaFree(d_attn_probs_buf.data);
-        cudaFree(dV_s.data);            cudaFree(dV.data);
-        cudaFree(d_attn_probs.data);    cudaFree(d_scores.data);
-        cudaFree(dQ_adv.data);          cudaFree(dQ.data);
-        cudaFree(dK.data);              cudaFree(K_T.data);
     }
 };
 
@@ -554,15 +368,9 @@ struct LayerBwdBuffers {
 
     void ensure(int seq_, int D_) {
         if (allocated && alloc_seq == seq_ && alloc_D == D_) return;
-        if (allocated) { cudaFree(d_concat.data); cudaFree(d_dX_ln1.data); }
-        d_concat  = gpu_alloc(seq_, D_);
+        d_concat  = gpu_alloc(seq_, D_);   // purana buffer RAII se free (double-free fix)
         d_dX_ln1  = gpu_alloc(seq_, D_);
         allocated = true; alloc_seq = seq_; alloc_D = D_;
-    }
-
-    ~LayerBwdBuffers() {
-        if (!allocated) return;
-        cudaFree(d_concat.data); cudaFree(d_dX_ln1.data);
     }
 };
 
@@ -596,16 +404,32 @@ static void run_backward(
     HeadBwdBuffers&  head_bwd  = head_bwd_override  ? *head_bwd_override  : s_head_bwd;
     LayerBwdBuffers& layer_bwd = layer_bwd_override ? *layer_bwd_override : s_layer_bwd;
 
-    { dim3 blk(32),grd(D,(V+31)/32);
-      lmhead_grad_dw_kernel<<<grd,blk>>>(
-          gpu_model.last_hidden.data,d_logits_grad.data,
-          gpu_grads[2]->data,seq,D,V); CUDA_KERNEL_CHECK(); }
+    // dW_lm[D×V] += Xᵀ[D×seq] · dY[seq×V]
+    cuda_gemm_rm(true, false, D, V, seq,
+                 1.f, gpu_model.last_hidden.data, D,
+                      d_logits_grad.data,         V,
+                 1.f, gpu_grads[2]->data,         V);
 
     CUDA_CHECK(cudaMemset(d_dX_out.data,0,seq*D*sizeof(float)));
-    { dim3 blk(32),grd(seq,(D+31)/32);
-      lmhead_grad_dx_kernel<<<grd,blk>>>(
-          d_logits_grad.data,gpu_model.gpu_lm_head.data,
-          d_dX_out.data,seq,D,V); CUDA_KERNEL_CHECK(); }
+    // dX[seq×D] = dY[seq×V] · W_lmᵀ   (W_lm: D×V)
+    cuda_gemm_rm(false, true, seq, D, V,
+                 1.f, d_logits_grad.data,            V,
+                      gpu_model.gpu_lm_head.data,    V,
+                 0.f, d_dX_out.data,                 D);
+
+    // [FINAL-LN] d_dX_out abhi final-LN ke OUTPUT ka grad hai. LN backward se residual-stream grad
+    // banao (d_dX_ln scratch me likh ke wapas d_dX_out me copy; d_dX_ln layer loop me overwrite hota hai).
+    {
+        const int lnf_off = 3 + cfg.num_layers * PPL;   // ln_f_gamma grad slot; beta = +1
+        layernorm_bwd_kernel<<<seq,256>>>(
+            gpu_model.final_in.data, gpu_model.ln_f_gamma.data,
+            d_dX_out.data, d_dX_ln.data,
+            gpu_grads[lnf_off]->data, gpu_grads[lnf_off+1]->data,
+            seq, D, 1e-5f);
+        CUDA_KERNEL_CHECK();
+        CUDA_CHECK(cudaMemcpy(d_dX_out.data, d_dX_ln.data,
+                              seq*D*sizeof(float), cudaMemcpyDeviceToDevice));
+    }
 
     for (int l=cfg.num_layers-1;l>=0;--l) {
         auto& blk=gpu_model.gpu_blocks[l];
@@ -614,14 +438,18 @@ static void run_backward(
 
         CUDA_CHECK(cudaMemcpy(d_d_ffn_out.data,d_dX_out.data,
                    seq*D*sizeof(float),cudaMemcpyDeviceToDevice));
-        { dim3 g(D4,(D+31)/32),b(32);
-          ffn_w2_grad_kernel<<<g,b>>>(cache.ffn_A.data,d_d_ffn_out.data,
-                                      gpu_grads[base+w2_off]->data,seq,D4,D); CUDA_KERNEL_CHECK(); }
-        { bias_grad_kernel<<<(D+127)/128,128>>>(d_d_ffn_out.data,
-                                                gpu_grads[base+w2_off+1]->data,seq,D); CUDA_KERNEL_CHECK(); }
-        { dim3 g(seq,(D4+31)/32),b(32);
-          ffn_da_kernel<<<g,b>>>(d_d_ffn_out.data,blk.W2.data,
-                                 d_d_ffn_A.data,seq,D4,D); CUDA_KERNEL_CHECK(); }
+        // dW2[D4×D] += ffn_Aᵀ[D4×seq] · dOut[seq×D]
+        cuda_gemm_rm(true, false, D4, D, seq,
+                     1.f, cache.ffn_A.data,                D4,
+                          d_d_ffn_out.data,                D,
+                     1.f, gpu_grads[base+w2_off]->data,    D);
+        // db2[D] += Σ_seq dOut
+        cuda_colsum_accumulate(d_d_ffn_out.data, gpu_grads[base+w2_off+1]->data, seq, D);
+        // dA[seq×D4] = dOut[seq×D] · W2ᵀ   (W2: D4×D)
+        cuda_gemm_rm(false, true, seq, D4, D,
+                     1.f, d_d_ffn_out.data,  D,
+                          blk.W2.data,       D,
+                     0.f, d_d_ffn_A.data,    D4);
         { int tot=seq*D4;
           gelu_bwd_kernel<<<(tot+255)/256,256>>>(cache.ffn_H.data,d_d_ffn_A.data,
                                                   d_d_ffn_H.data,tot); CUDA_KERNEL_CHECK(); }
@@ -635,15 +463,19 @@ static void run_backward(
             CUDA_KERNEL_CHECK();
         }
 
-        { dim3 g(D,(D4+31)/32),b(32);
-          ffn_w1_grad_kernel<<<g,b>>>(cache.normed2.data,d_d_ffn_H.data,
-                                      gpu_grads[base+w1_off]->data,seq,D,D4); CUDA_KERNEL_CHECK(); }
+        // dW1[D×D4] += normed2ᵀ[D×seq] · dH[seq×D4]
+        cuda_gemm_rm(true, false, D, D4, seq,
+                     1.f, cache.normed2.data,               D,
+                          d_d_ffn_H.data,                   D4,
+                     1.f, gpu_grads[base+w1_off]->data,     D4);
         
-        { bias_grad_kernel<<<(D4+127)/128,128>>>(d_d_ffn_H.data,
-                                                 gpu_grads[base+w1_off+1]->data,seq,D4); CUDA_KERNEL_CHECK(); }
-        { dim3 g(seq,(D+31)/32),b(32);
-          ffn_dx_kernel<<<g,b>>>(d_d_ffn_H.data,blk.W1.data,
-                                 d_d_normed2.data,seq,D,D4); CUDA_KERNEL_CHECK(); }
+        // db1[D4] += Σ_seq dH
+        cuda_colsum_accumulate(d_d_ffn_H.data, gpu_grads[base+w1_off+1]->data, seq, D4);
+        // dN2[seq×D] = dH[seq×D4] · W1ᵀ   (W1: D×D4)
+        cuda_gemm_rm(false, true, seq, D, D4,
+                     1.f, d_d_ffn_H.data,   D4,
+                          blk.W1.data,      D4,
+                     0.f, d_d_normed2.data, D);
 
         
         if (gpu_model.phys.reynolds && cache.ln2_w.valid()) {
@@ -667,44 +499,47 @@ static void run_backward(
           vec_add_kernel<<<(sz+255)/256,256>>>(d_dX_out.data,d_dX_ln.data,sz); CUDA_KERNEL_CHECK(); }
 
         // [v40-BUG1-FIX] d_concat — pre-alloc reuse (layer_bwd.d_concat)
-        GPUTensor& d_concat = layer_bwd.d_concat;
-        { dim3 g(D,(D+31)/32),b(32);
-          attn_dWproj_kernel<<<g,b>>>(cache.concat.data,d_dX_out.data,
-                                      gpu_grads[base+wproj_off]->data,seq,D); CUDA_KERNEL_CHECK(); }
-        { dim3 g(seq,(D+31)/32),b(32);
-          attn_dConcat_kernel<<<g,b>>>(d_dX_out.data,blk.W_proj.data,
-                                       d_concat.data,seq,D); CUDA_KERNEL_CHECK(); }
-
-        // [v40-BUG1-FIX] Pre-allocated buffers use karo — har head loop mein alloc nahi
+        // [cuBLAS-MIGRATION][BUGFIX] ensure() ab d_concat use hone se PEHLE hota hai. Pehle yeh baad
+        // mein call hota tha, to pehle backward pe d_concat.data == nullptr pe kernel write karta tha.
         head_bwd.ensure(seq, DH);
         layer_bwd.ensure(seq, D);
+        GPUTensor& d_concat = layer_bwd.d_concat;
+        // dWproj[D×D] += concatᵀ[D×seq] · dMha[seq×D]
+        cuda_gemm_rm(true, false, D, D, seq,
+                     1.f, cache.concat.data,                 D,
+                          d_dX_out.data,                     D,
+                     1.f, gpu_grads[base+wproj_off]->data,   D);
+        // dConcat[seq×D] = dMha[seq×D] · Wprojᵀ
+        cuda_gemm_rm(false, true, seq, D, D,
+                     1.f, d_dX_out.data,      D,
+                          blk.W_proj.data,    D,
+                     0.f, d_concat.data,      D);
 
+        // [v40-BUG1-FIX] Pre-allocated buffers use karo — har head loop mein alloc nahi
         CUDA_CHECK(cudaMemset(d_dX_attn_in.data,0,seq*D*sizeof(float)));
         for (int h=0;h<H;++h) {
             auto& hc=cache.heads[h];
             // d_head_out_h — reuse head_bwd.d_head_out
-            { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dHeadOut_kernel<<<g,b>>>(d_concat.data,blk.W_O[h].data,
-                                            head_bwd.d_head_out.data,seq,DH,D); CUDA_KERNEL_CHECK(); }
-            { dim3 g(DH,(D+31)/32),b(32);
-              attn_dWO_kernel<<<g,b>>>(hc.head_out.data,d_concat.data,
-                                       gpu_grads[base+h*4+3]->data,seq,DH,D); CUDA_KERNEL_CHECK(); }
+            // dHeadOut[seq×DH] = dConcat[seq×D] · W_Oᵀ   (W_O: DH×D)
+            cuda_gemm_rm(false, true, seq, DH, D,
+                         1.f, d_concat.data,                D,
+                              blk.W_O[h].data,              D,
+                         0.f, head_bwd.d_head_out.data,     DH);
+            // dW_O[DH×D] += head_outᵀ[DH×seq] · dConcat[seq×D]
+            cuda_gemm_rm(true, false, DH, D, seq,
+                         1.f, hc.head_out.data,             DH,
+                              d_concat.data,                D,
+                         1.f, gpu_grads[base+h*4+3]->data,  D);
 
             // [v40-BUG1-FIX] recomputed_attn_probs — pre-alloc buf reuse
             {
                 float scale_attn = 1.0f / sqrtf((float)DH);
-                // K_T — pre-alloc reuse
-                gpu_transpose_kernel<<<dim3((seq+15)/16,(DH+15)/16),dim3(16,16)>>>(
-                    hc.K.data, head_bwd.K_T.data, seq, DH);
-                CUDA_KERNEL_CHECK();
-                vedic_gemm_kernel<<<dim3((seq+15)/16,(seq+15)/16),dim3(16,16)>>>(
-                    hc.Q_adv.data, head_bwd.K_T.data,
-                    head_bwd.d_attn_probs_buf.data, seq, DH, seq);
-                CUDA_KERNEL_CHECK();
-                int sz_sc = seq * seq;
-                grad_scale_kernel<<<(sz_sc+255)/256, 256>>>(
-                    head_bwd.d_attn_probs_buf.data, scale_attn, sz_sc);
-                CUDA_KERNEL_CHECK();
+                
+                cuda_gemm_rm(false, true, seq, seq, DH,
+                             scale_attn, hc.Q_adv.data, DH,
+                                         hc.K.data,     DH,
+                             0.f, head_bwd.d_attn_probs_buf.data, seq);
+                
                 causal_mask_kernel<<<dim3(seq,(seq+255)/256),256>>>(
                     head_bwd.d_attn_probs_buf.data, seq);
                 CUDA_KERNEL_CHECK();
@@ -716,11 +551,11 @@ static void run_backward(
             }
 
             // dV_s — pre-alloc reuse
-            CUDA_CHECK(cudaMemset(head_bwd.dV_s.data,0,seq*DH*sizeof(float)));
-            { dim3 g(DH,(seq+31)/32),b(32);
-              attn_dV_kernel<<<g,b>>>(head_bwd.d_attn_probs_buf.data,
-                                      head_bwd.d_head_out.data,
-                                      head_bwd.dV_s.data,seq,DH); CUDA_KERNEL_CHECK(); }
+            // dV_s[seq×DH] = Pᵀ[seq×seq] · dHeadOut[seq×DH]   (beta=0 ⇒ memset ki zaroorat nahi)
+            cuda_gemm_rm(true, false, seq, DH, seq,
+                         1.f, head_bwd.d_attn_probs_buf.data, seq,
+                              head_bwd.d_head_out.data,       DH,
+                         0.f, head_bwd.dV_s.data,             DH);
 
             // dV — pre-alloc reuse
             { int qb=(seq*DH+255)/256;
@@ -729,9 +564,11 @@ static void run_backward(
                   gpu_model.phys.ns_nu); CUDA_KERNEL_CHECK(); }
 
             // d_attn_probs — pre-alloc reuse
-            { dim3 g(seq,(seq+31)/32),b(32);
-              attn_dAttnProbs_kernel<<<g,b>>>(head_bwd.d_head_out.data,hc.V_s.data,
-                                              head_bwd.d_attn_probs.data,seq,DH); CUDA_KERNEL_CHECK(); }
+            // dP[seq×seq] = dHeadOut[seq×DH] · V_sᵀ   (V_s: seq×DH)
+            cuda_gemm_rm(false, true, seq, seq, DH,
+                         1.f, head_bwd.d_head_out.data,   DH,
+                              hc.V_s.data,                DH,
+                         0.f, head_bwd.d_attn_probs.data, seq);
 
             // d_scores — pre-alloc reuse
             float inv_sqrt_DH=1.0f/sqrtf((float)DH);
@@ -741,9 +578,11 @@ static void run_backward(
                                             seq,inv_sqrt_DH); CUDA_KERNEL_CHECK();
 
             // dQ_adv — pre-alloc reuse
-            { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dQ_kernel<<<g,b>>>(head_bwd.d_scores.data,hc.K.data,
-                                      head_bwd.dQ_adv.data,seq,DH); CUDA_KERNEL_CHECK(); }
+            // dQ_adv[seq×DH] = dS[seq×seq] · K[seq×DH]
+            cuda_gemm_rm(false, false, seq, DH, seq,
+                         1.f, head_bwd.d_scores.data, seq,
+                              hc.K.data,              DH,
+                         0.f, head_bwd.dQ_adv.data,   DH);
 
             // dQ — pre-alloc reuse
             { int qb=(seq*DH+255)/256;
@@ -752,24 +591,29 @@ static void run_backward(
                   gpu_model.phys.ns_eta); CUDA_KERNEL_CHECK(); }
 
             // dK — pre-alloc reuse
-            { dim3 g(seq,(DH+31)/32),b(32);
-              attn_dK_kernel<<<g,b>>>(head_bwd.d_scores.data,hc.Q_adv.data,
-                                      head_bwd.dK.data,seq,DH); CUDA_KERNEL_CHECK(); }
+            // dK[seq×DH] = dSᵀ[seq×seq] · Q_adv[seq×DH]
+            cuda_gemm_rm(true, false, seq, DH, seq,
+                         1.f, head_bwd.d_scores.data, seq,
+                              hc.Q_adv.data,          DH,
+                         0.f, head_bwd.dK.data,       DH);
 
-            { dim3 g(D,(DH+31)/32),b(32);
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,head_bwd.dQ.data,
-                                         gpu_grads[base+h*4+0]->data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,head_bwd.dK.data,
-                                         gpu_grads[base+h*4+1]->data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dWQKV_kernel<<<g,b>>>(cache.normed1.data,head_bwd.dV.data,
-                                         gpu_grads[base+h*4+2]->data,seq,D,DH); CUDA_KERNEL_CHECK(); }
-            { dim3 g(seq,(D+31)/32),b(32);
-              attn_dX_from_QKV_kernel<<<g,b>>>(head_bwd.dQ.data,blk.W_Q[h].data,
-                                               d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dX_from_QKV_kernel<<<g,b>>>(head_bwd.dK.data,blk.W_K[h].data,
-                                               d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK();
-              attn_dX_from_QKV_kernel<<<g,b>>>(head_bwd.dV.data,blk.W_V[h].data,
-                                               d_dX_attn_in.data,seq,D,DH); CUDA_KERNEL_CHECK(); }
+            {
+                // t = 0:Q  1:K  2:V  (grads slot base+h*4+t, same order as all_parameters())
+                const float* dQKV[3] = { head_bwd.dQ.data, head_bwd.dK.data, head_bwd.dV.data };
+                const float* Wqkv[3] = { blk.W_Q[h].data,  blk.W_K[h].data,  blk.W_V[h].data  };
+                for (int t = 0; t < 3; ++t) {
+                    // dW[D×DH] += normed1ᵀ[D×seq] · dQKV[seq×DH]
+                    cuda_gemm_rm(true, false, D, DH, seq,
+                                 1.f, cache.normed1.data,           D,
+                                      dQKV[t],                      DH,
+                                 1.f, gpu_grads[base+h*4+t]->data,  DH);
+                    // dN1[seq×D] += dQKV[seq×DH] · Wᵀ   (W: D×DH) — heads/QKV ka sum beta=1 se
+                    cuda_gemm_rm(false, true, seq, D, DH,
+                                 1.f, dQKV[t],          DH,
+                                      Wqkv[t],          DH,
+                                 1.f, d_dX_attn_in.data, D);
+                }
+            }
         }
 
         // [v40-BUG1-FIX] d_dX_ln1 — pre-alloc reuse
@@ -832,7 +676,7 @@ void train_gpu(const std::string& dataset_path) {
     printf("║  ✦ [v24] Manual loss scaling WIRED      ║\n");
     printf("║  ✦ [v25] d_A16/d_acc RAII leak fix     ║\n");
     printf("║  ✦ [v27] d_targets RAII leak fix       ║\n");
-    printf("║  ✦ [v27] NikhilamTensor safe alloc     ║\n");
+    printf("║  ✦ GEMM: cuBLAS (no PyTorch)           ║\n");
     printf("║  ✦ [v27] Adaptive chunk: H100=64MB     ║\n");
     printf("║  ✦ [v27] Adaptive ckpt: H100=5000 steps║\n");
     printf("║  ✦ [v27] Prefetch thread exception-safe║\n");
@@ -953,9 +797,38 @@ void train_gpu(const std::string& dataset_path) {
             int64_t sample_size=std::min(actual_size, TOKENIZER_SAMPLE);
             std::ifstream f(dataset_path_resolved,std::ios::binary);
             if (!f) { fprintf(stderr,"❌ Cannot open: %s\n",dataset_path_resolved.c_str()); return; }
-            std::string sample; sample.resize((size_t)sample_size);
-            f.read(sample.data(),sample_size);
-            sample.resize((size_t)f.gcount());
+            std::string sample;
+            if (actual_size <= TOKENIZER_SAMPLE) {
+                sample.resize((size_t)sample_size);
+                f.read(sample.data(),sample_size);
+                sample.resize((size_t)f.gcount());
+            } else {
+                // [TOKENIZER] Sirf pehle N MB nahi: poori file me barabar spread 64 blocks
+                // (Hindi/English mix ya sorted data me pehla hissa unrepresentative hota hai).
+                const int     N_BLOCKS = 64;
+                const int64_t block    = TOKENIZER_SAMPLE / N_BLOCKS;
+                sample.reserve((size_t)TOKENIZER_SAMPLE + N_BLOCKS);
+                std::string blk;
+                for (int b = 0; b < N_BLOCKS; ++b) {
+                    int64_t off = (int64_t)((double)(actual_size - block) * (double)b / (double)(N_BLOCKS - 1));
+                    f.clear();
+                    f.seekg(off, std::ios::beg);
+                    blk.assign((size_t)block, '\0');
+                    f.read(blk.data(), block);
+                    blk.resize((size_t)f.gcount());
+                    size_t s0 = 0, e0 = blk.size();
+                    if (off > 0) {                                   // block line ke beech se shuru ho sakta hai
+                        size_t nl = blk.find('\n');
+                        if (nl != std::string::npos) s0 = nl + 1;
+                    }
+                    while (s0 < e0 && ((unsigned char)blk[s0] & 0xC0) == 0x80) ++s0;   // UTF-8 continuation skip
+                    size_t last_nl = blk.rfind('\n');
+                    if (last_nl != std::string::npos && last_nl > s0) e0 = last_nl + 1;
+                    if (e0 > s0) sample.append(blk, s0, e0 - s0);
+                }
+                printf("  [TOKENIZER] BPE sample spread: %d blocks across %lld MB file -> %.1f MB\n",
+                       N_BLOCKS, (long long)(actual_size/1024/1024), (float)sample.size()/1024.f/1024.f);
+            }
             tok.build(sample,vocab_target);
             tok.save("vocab.bin");
             printf("Vocab: %d tokens\n\n",tok.vocab_size);
@@ -1015,11 +888,6 @@ void train_gpu(const std::string& dataset_path) {
                 printf("            Override with LOGOS_SEQ_LEN=8192 to force 8192 (may OOM)\n");
                 cfg.max_seq_len = 4096;
             }
-        }
-        
-        if (cfg.max_seq_len <= 4096) {
-            printf("  [v32-SEQ] Shunyam params adjusted for seq=%d: window=32 stride=8\n",
-                   cfg.max_seq_len);
         }
     }
 
@@ -1141,14 +1009,19 @@ void train_gpu(const std::string& dataset_path) {
         }
     }
 
-    ModelGPU   gpu_model(cfg);
+    // Hyperbolic expmap default OFF (LOGOS_HYPERBOLIC=1 se on; generate me bhi same set karo)
+    HyperConfig hyper_run;
+    hyper_run.enabled = (logos_env_f("LOGOS_HYPERBOLIC", 0.f) > 0.5f);
+    printf("  [FINAL-LN] final LayerNorm before lm_head: ON | Hyperbolic expmap: %s\n",
+           hyper_run.enabled ? "ON" : "OFF (default)");
+    ModelGPU   gpu_model(cfg, hyper_run);
     gpu_model.load_from_cpu(cpu_model);
 
     // [v37-MULTIGPU] GPU1 pe replica banao
     ModelGPU* gpu_model1 = nullptr;
     if (use_multi_gpu) {
         cudaSetDevice(1);
-        gpu_model1 = new ModelGPU(cfg);
+        gpu_model1 = new ModelGPU(cfg, hyper_run);
         gpu_model1->load_from_cpu(cpu_model);
         cudaSetDevice(0);  // wapas GPU0 pe
         printf("  [v37-MULTIGPU] GPU1 model replica ready\n");
@@ -1156,10 +1029,6 @@ void train_gpu(const std::string& dataset_path) {
 
     
     gpu_model.phys.training        = true;
-    gpu_model.phys.nikhilam_kv     = true;
-    gpu_model.phys.shunyam         = true;
-    gpu_model.phys.window          = (cfg.max_seq_len >= 8192) ? 64 : 32;
-    gpu_model.phys.stride          = (cfg.max_seq_len >= 8192) ? 16 : 8;
     gpu_model.phys.navier_stokes   = true;
     gpu_model.phys.ns_eta          = 0.1f;
     gpu_model.phys.ns_nu           = 0.05f;
@@ -1177,8 +1046,7 @@ void train_gpu(const std::string& dataset_path) {
         gpu_model1->phys.drop_hbar     = 1.0f;
     }
     printf("  ✦ phys.training=true  → Feynman dropout ACTIVE\n");
-    printf("  ✦ Nikhilam KV INT8    → 4x KV compression\n");
-    printf("  ✦ Shunyam sparse attn → window=%d stride=%d (8192 ctx)\n", gpu_model.phys.window, gpu_model.phys.stride);
+    printf("  ✦ Attention           → dense causal (flash kernel)\n");
     printf("  ✦ Navier-Stokes       → eta=%.2f nu=%.2f\n", gpu_model.phys.ns_eta, gpu_model.phys.ns_nu);
     printf("  ✦ Reynolds norm       → re_crit=%.1f k=%.1f\n", gpu_model.phys.re_crit, gpu_model.phys.re_k);
     printf("  ✦ Feynman dropout     → p=%.2f hbar=%.1f\n", gpu_model.phys.drop_p, gpu_model.phys.drop_hbar);
@@ -1202,11 +1070,49 @@ void train_gpu(const std::string& dataset_path) {
     printf("  Train: %.1f MB | Val: %.1f MB (5%% held out)\n",
            (float)val_start_byte/1024/1024, (float)val_bytes/1024/1024);
 
-    StreamingDataLoader loader(dataset_path_resolved, tok, SEQ, grad_accum, CHUNK_BYTES,
-                               /*start_byte=*/0, /*end_byte=*/val_start_byte);
+    // [PRETOK] Data ek baar tokenize hoke uint16 .bin me (LOGOS_PRETOK=0 se disable -> text streaming).
+    // .bin tab reuse hota hai jab tokenizer + source size same ho, warna rebuild.
+    std::unique_ptr<IBatchLoader> loader_p, val_loader_p;
+    bool    use_bin       = false;
+    int64_t val_start_tok = 0;
+    const std::string bin_path = dataset_path_resolved + ".tok.bin";
+    if (logos_env_f("LOGOS_PRETOK", 1.f) > 0.5f && tok.vocab_size > 0 && tok.vocab_size <= 65535) {
+        if (token_bin_matches(bin_path, tok, actual_size)) {
+            printf("  [PRETOK] cache hit: %s\n", bin_path.c_str());
+        } else {
+            printf("  [PRETOK] pre-tokenizing %lld MB -> %s (ek baar)\n",
+                   (long long)(actual_size/1024/1024), bin_path.c_str());
+            if (!pretokenize_file(dataset_path_resolved, tok, bin_path))
+                printf("  ⚠️  [PRETOK] fail — text streaming fallback\n");
+        }
+        if (token_bin_matches(bin_path, tok, actual_size)) {
+            TokenBinInfo bi = read_token_bin_header(bin_path);
+            int64_t vst = (int64_t)((double)bi.n_tokens * 0.95);
+            if (vst >= (int64_t)SEQ + 2 && bi.n_tokens - vst >= (int64_t)SEQ + 2) {
+                use_bin = true;
+                val_start_tok = vst;
+                printf("  [PRETOK] %lld tokens | train=%lld val=%lld (token-based 95/5 split)\n",
+                       (long long)bi.n_tokens, (long long)val_start_tok,
+                       (long long)(bi.n_tokens - val_start_tok));
+            } else {
+                printf("  ⚠️  [PRETOK] dataset seq_len=%d ke hisaab se bahut chhota — text streaming fallback\n", SEQ);
+            }
+        }
+    }
+    if (use_bin)
+        loader_p = std::make_unique<TokenBinLoader>(bin_path, SEQ, grad_accum, (int64_t)0, val_start_tok);
+    else
+        loader_p = std::make_unique<StreamingDataLoader>(dataset_path_resolved, tok, SEQ, grad_accum,
+                                                         CHUNK_BYTES, (int64_t)0, val_start_byte);
+    IBatchLoader& loader = *loader_p;
     
-    StreamingDataLoader val_loader(dataset_path_resolved, tok, SEQ, 1, 1LL*1024*1024,
-                                   /*start_byte=*/val_start_byte, /*end_byte=*/actual_size);
+    if (use_bin)
+        val_loader_p = std::make_unique<TokenBinLoader>(bin_path, SEQ, 1, val_start_tok, (int64_t)0);
+    else
+        val_loader_p = std::make_unique<StreamingDataLoader>(dataset_path_resolved, tok, SEQ, 1,
+                                                             (int64_t)(1LL*1024*1024),
+                                                             val_start_byte, actual_size);
+    IBatchLoader& val_loader = *val_loader_p;
     std::vector<std::pair<std::vector<int>,std::vector<int>>> fixed_val;
     {
         std::vector<std::pair<std::vector<int>,std::vector<int>>> tmp;
@@ -1257,10 +1163,8 @@ void train_gpu(const std::string& dataset_path) {
         std::vector<GPUTensor*>& grads;
         GradGuard(std::vector<GPUTensor*>& g) : grads(g) {}
         ~GradGuard() {
-            for (auto* g : grads) {
-                if (g->data) cudaFree(g->data);  // [v40-BUG5] cudaFree missing tha — leak fix
-                delete g;
-            }
+            // GPUTensor ka destructor khud cudaFree karta hai — manual cudaFree se double free hota tha
+            for (auto* g : grads) { delete g; }
         }
     } grad_guard(gpu_grads);
 
@@ -1270,7 +1174,7 @@ void train_gpu(const std::string& dataset_path) {
         std::vector<GPUTensor*>& grads;
         bool active;
         GradGuard1(std::vector<GPUTensor*>& g, bool a) : grads(g), active(a) {}
-        ~GradGuard1() { if (active) for (auto* g : grads) { cudaFree(g->data); delete g; } }
+        ~GradGuard1() { if (active) for (auto* g : grads) delete g; }
     };
     if (use_multi_gpu && gpu_model1) {
         cudaSetDevice(1);
@@ -1297,7 +1201,7 @@ void train_gpu(const std::string& dataset_path) {
     } grad_reduce_guard(d_grad_reduce_tmp);
 
     
-    WeightPathIntegral gpu_path_integral(/*hbar=*/1.0f, /*history=*/500);
+    WeightPathIntegral gpu_path_integral(1.0f);
     
     ManualLossScaler loss_scaler;
     {
@@ -1481,9 +1385,6 @@ void train_gpu(const std::string& dataset_path) {
         printf("     Ya LOGOS_START_STEP check karo agar resume kar rahe ho.\n");
         return;
     }
-
-    int     vedic_checks=0, vedic_pass=0;
-    char    vedic_status[8]="N/A";
 
     // [v40-BUG7] loop ke bahar ek baar calculate karo — env read har step nahi
     int64_t ckpt_freq_default = is_h100 ? 5000LL : is_a100 ? 3000LL : 50LL;
@@ -1750,27 +1651,6 @@ void train_gpu(const std::string& dataset_path) {
 
             // [v40-BUG7] ckpt_freq aur log_freq ab loop ke bahar define hain
 
-            if (step % ckpt_freq == 0 && step > 0) {
-                GPUTensor C_proxy = gpu_alloc(gpu_model.last_hidden.rows,
-                                              gpu_model.gpu_lm_head.cols);
-                cuda_vedic_gemm(gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy);
-
-                bool using_cublas = cuda_vedic_gemm_uses_cublas();
-                float vedic_tol = 0.05f;
-
-                VedicVerifyResult vr = cuda_vedic_verify(
-                    gpu_model.last_hidden, gpu_model.gpu_lm_head, C_proxy, vedic_tol);
-                ++vedic_checks;
-                if (vr.pass) {
-                    ++vedic_pass;
-                    snprintf(vedic_status, 8, "PASS");
-                } else {
-                    snprintf(vedic_status, 8, "WARN");
-                    printf("\n[Gunitasamuchayah] WARN @ step %lld err=%.4f (tol=%.2f)\n",
-                           (long long)step, vr.relative_error, vedic_tol);
-                }
-            }  // end: if (step % ckpt_freq == 0 && step > 0)
-
             // [v40-BUG7] log_freq aur val_batches ab loop ke bahar define hain
             if (step % log_freq == 0) {
                 float cur_T, cur_aH, cur_aL;
@@ -1920,14 +1800,10 @@ void train_gpu(const std::string& dataset_path) {
                 }
                 
                 loss_scaler.print_status(step);
-                
-                const char* gemm_backend = cuda_vedic_gemm_uses_cublas()
-                                           ? "cuBLAS(tol=5%)" : "CustomCUDA(tol=5%)";
                 float lr_x = gpu_path_integral.lr_scale_ema(0.5f);
                 
-                printf("Ckpt @ step %lld | best_F=%.4f | Train_CE≈%.4f | Val_CE≈%.4f | Vedic: %d/%d [%s] | LRx=%.3f\n",
-                       (long long)step, best_loss, prev_train_ce, prev_val_ce,
-                       vedic_pass, vedic_checks, gemm_backend, lr_x);
+                printf("Ckpt @ step %lld | best_F=%.4f | Train_CE≈%.4f | Val_CE≈%.4f | LRx=%.3f\n",
+                       (long long)step, best_loss, prev_train_ce, prev_val_ce, lr_x);
                 fflush(stdout);
             }
             ++step;
@@ -2001,13 +1877,7 @@ void train_gpu(const std::string& dataset_path) {
            loss_scaler.scale, loss_scaler.total_overflows);
     printf("║  [AMP] scale_ups=%d scale_downs=%d        ║\n",
            loss_scaler.total_scale_ups, loss_scaler.total_scale_downs);
-    if (cuda_vedic_gemm_uses_cublas()) {
-        printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
-        printf("║  (cuBLAS tol=5%% — correct formula)       ║\n");
-    } else {
-        printf("║  Gunitasamuchayah: %3d / %3d PASS        ║\n",vedic_pass,vedic_checks);
-        printf("║  (Custom CUDA tol=5%% — strict verify)    ║\n");
-    }
+    printf("║  [cuBLAS] all fwd+bwd GEMM via cuBLAS     ║\n");
     printf("║  ALL Physics 100%% wired fwd+bwd:         ║\n");
     printf("║    Feynman dropout bwd ✅ (mask chain)    ║\n");
     printf("║    Hyperbolic expmap bwd ✅ (Jacobian)    ║\n");
@@ -2039,7 +1909,7 @@ std::vector<FeynmanBeam> generate_feynman(
     std::vector<FeynmanBeam> beams(1);
     beams[0].tokens={prompt_ids.begin(),prompt_ids.end()};
     beams[0].log_amplitude=0.0f; beams[0].action=0.0f;
-    int eos_token=1;
+    int eos_token = TOKEN_EOS;   // pehle 1 tha, jo BOS hai
 
     for (int s=0;s<max_new;++s) {
         std::vector<FeynmanBeam> candidates;
@@ -2119,18 +1989,32 @@ void generate_gpu(const std::string& ckpt_path, const std::string& prompt_text,
     printf("  Config: d=%d L=%d H=%d seq=%d vocab=%d\n",
            cfg.d_model, cfg.num_layers, cfg.num_heads, cfg.max_seq_len, cfg.vocab_size);
     LOGOSModel cpu_model(cfg);
-    if (ckpt_path!="none"&&!ckpt_path.empty()) load_checkpoint(cpu_model,ckpt_path);
-    HyperConfig hyper_cfg; hyper_cfg.enabled=true; hyper_cfg.curvature=1.0f;
+    if (ckpt_path!="none" && !ckpt_path.empty()) {
+        if (!load_checkpoint(cpu_model, ckpt_path)) {
+            fprintf(stderr, "❌ checkpoint load fail (config mismatch?) — abort\n");
+            return;
+        }
+    }
+    HyperConfig hyper_cfg;
+    hyper_cfg.enabled   = (logos_env_f("LOGOS_HYPERBOLIC", 0.f) > 0.5f);  // train ke saath match karna chahiye
+    hyper_cfg.curvature = 1.0f;
     ModelGPU gpu_model(cfg,hyper_cfg);
     gpu_model.load_from_cpu(cpu_model);
 
     
     gpu_model.phys.training        = false;  
     gpu_model.phys.feynman_dropout = false;  
-    gpu_model.phys.reynolds        = false;  
-    printf("  [v26] Inference mode: training=false (dropout OFF, Reynolds OFF)\n");
+    // [PHASE0] Training Reynolds norm ke saath hui thi, isliye inference me bhi ON (default) —
+    // ab running stats checkpoint me save/load hote hain. Purane checkpoints ke liye A/B test karo:
+    // LOGOS_INFER_REYNOLDS=0 se plain LayerNorm.
+    gpu_model.phys.reynolds        = (logos_env_f("LOGOS_INFER_REYNOLDS", 1.f) > 0.5f);  
+    printf("  [v26] Inference mode: training=false (dropout OFF, Reynolds %s)\n",
+           gpu_model.phys.reynolds ? "ON" : "OFF");
 
-    auto prompt_ids=tok.encode(prompt_text,cfg.max_seq_len/2);
+    // [TOKENIZER] Training stream me BOS/EOS nahi hota => prompt bhi raw (bina BOS/EOS) encode karo
+    auto prompt_ids=tok.encode_raw(prompt_text,cfg.max_seq_len/2);
+    if (prompt_ids.empty()) prompt_ids.push_back(TOKEN_BOS);   // khaali prompt: forward ko kam se kam 1 token chahiye
+    if (!prompt_ids.empty() && prompt_ids.back() == TOKEN_EOS) prompt_ids.pop_back();
     auto beams=generate_feynman(gpu_model,prompt_ids,max_new,beam_width,hbar,top_k);
     for (int i=0;i<(int)beams.size();++i) {
         std::vector<int> gen(beams[i].tokens.begin()+(int)prompt_ids.size(),beams[i].tokens.end());
@@ -2143,7 +2027,7 @@ int main(int argc, char* argv[]) {
     printf("╔══════════════════════════════════════════╗\n"
            "║  LOGOS GPU v30                           ║\n"
            "║  MEM1: d_targets RAII FIXED              ║\n"
-           "║  MEM2: NikhilamTensor safe alloc FIXED   ║\n"
+           "║  GEMM: cuBLAS                            ║\n"
            "║  H100: chunk/ckpt/prefetch optimized     ║\n"
            "║  v29: Full resume (DataState+TrainStats) ║\n"
            "║  v30: Dataset auto-resolve + vocab cache ║\n"

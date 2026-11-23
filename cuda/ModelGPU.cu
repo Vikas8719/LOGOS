@@ -1,7 +1,7 @@
 
 #include "ModelGPU.cuh"
-#include "VedicGEMM.cuh"
-#include "MixedPrecision.cuh"   
+#include "CublasGemm.cuh"
+#include "MixedPrecision.cuh"
 
 #if defined(__has_include)
   #if __has_include(<cuda_runtime.h>)
@@ -16,6 +16,8 @@
 #endif
 
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #if defined(__has_include)
   #if __has_include(<cstring>)
@@ -78,17 +80,6 @@ __global__ void ce_loss_kernel(
         float sm=expf(lr[v]-mx)/s;
         gr[v]=(sm-(v==target?1.f:0.f))*inv;
     }
-}
-
-__global__ void gpu_transpose_kernel(
-    const float* __restrict__ A, float* __restrict__ AT, int rows, int cols)
-{
-    __shared__ float tile[16][17];
-    int ri=blockIdx.y*16+threadIdx.y, ci=blockIdx.x*16+threadIdx.x;
-    if (ri<rows&&ci<cols) tile[threadIdx.y][threadIdx.x]=A[ri*cols+ci];
-    __syncthreads();
-    int ro=blockIdx.x*16+threadIdx.y, co=blockIdx.y*16+threadIdx.x;
-    if (ro<cols&&co<rows) AT[ro*rows+co]=tile[threadIdx.x][threadIdx.y];
 }
 
 __global__ void langevin_step_kernel(
@@ -259,92 +250,6 @@ __global__ void expmap0_bwd_kernel(
 }
 
 
-__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
-    unsigned int* addr_as_uint = (unsigned int*)addr;
-    unsigned int old = *addr_as_uint, assumed;
-    do {
-        assumed = old;
-        float old_val = __int_as_float(old);
-        if (old_val >= val) break;  // already >= val, no update needed
-        old = atomicCAS(addr_as_uint, assumed, __float_as_int(val));
-    } while (assumed != old);
-}
-
-__global__ void absmax_kernel(const float* data, float* out, int size)
-{
-    __shared__ float smax[256];
-    int idx=blockIdx.x*blockDim.x+threadIdx.x;
-    
-    float val=(idx<size)?fabsf(data[idx]):0.f;
-    smax[threadIdx.x]=val;
-    __syncthreads();
-    for (int s=blockDim.x/2;s>0;s>>=1) {
-        if (threadIdx.x<s) smax[threadIdx.x]=fmaxf(smax[threadIdx.x],smax[threadIdx.x+s]);
-        __syncthreads();
-    }
-   
-    if (threadIdx.x==0) atomicMaxFloat(out, smax[0]);
-}
-
-__global__ void nikhilam_quantize_kernel(
-    const float* __restrict__ src,
-    int8_t*      __restrict__ dst,
-    float scale, int size)
-{
-    int idx=blockIdx.x*blockDim.x+threadIdx.x;
-    if (idx>=size) return;
-    float v=src[idx];
-    float q=v/(scale+1e-8f);
-    q=fminf(fmaxf(q,-127.f),127.f);
-    dst[idx]=(int8_t)__float2int_rn(q);
-}
-
-__global__ void nikhilam_dequantize_kernel(
-    const int8_t* __restrict__ src,
-    float*        __restrict__ dst,
-    float scale, int size)
-{
-    int idx=blockIdx.x*blockDim.x+threadIdx.x;
-    if (idx>=size) return;
-    dst[idx]=(float)src[idx]*scale;
-}
-
-
-
-static NikhilamTensor nikhilam_compress(const GPUTensor& src)
-{
-    NikhilamTensor out;
-    out.size = src.size;
-
-    
-    CudaPtr<float> d_max(1);  // 1 float, zero-init
-    int blks = (src.size + 255) / 256;
-    absmax_kernel<<<blks, 256>>>(src.data, d_max.get(), src.size);
-    CUDA_KERNEL_CHECK();
-
-    float h_max = d_max.scalar();
-
-    
-    out.scale = (h_max + 1e-8f) / 127.5f;
-
-    CudaPtr<int8_t> tmp_data(out.size);
-    nikhilam_quantize_kernel<<<blks, 256>>>(src.data, tmp_data.get(), out.scale, out.size);
-    CUDA_KERNEL_CHECK();
-    out.data = tmp_data.release();
-
-    return out;
-}
-
-GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols)
-{
-    GPUTensor out = gpu_alloc(rows, cols);
-    int blks=(src.size+255)/256;
-    nikhilam_dequantize_kernel<<<blks,256>>>(src.data, out.data, src.scale, src.size);
-    CUDA_KERNEL_CHECK();
-    return out;
-}
-
-
 __device__ __forceinline__ float block_sum256(float v)
 {
     __shared__ float sh[8];
@@ -373,14 +278,6 @@ __device__ __forceinline__ float urand01(unsigned& s)
 {
     s = hash32(s + 0x9e3779b9U);
     return ((float)(s>>8) + 0.5f) * (1.0f/16777216.0f);
-}
-
-__global__ void shunyam_mask_kernel(float* scores, int seq, int window, int stride)
-{
-    int row=blockIdx.x, col=blockIdx.y*blockDim.x+threadIdx.x;
-    if (row>=seq||col>=seq) return;
-    bool allowed = (col<=row) && (col>=row-window || (col%stride)==0);
-    if (!allowed) scores[row*seq+col] += -1e9f;
 }
 
 __global__ void ns_advect_kernel(const float* Q, float* Qa, int seq, int d, float eta)
@@ -537,6 +434,13 @@ ModelGPU::ModelGPU(const ModelConfig& cfg_, const HyperConfig& hcfg)
     gpu_embedding     = gpu_alloc(V,D);
     gpu_pos_embedding = gpu_alloc(S,D);
     gpu_lm_head       = gpu_alloc(D,V);
+    ln_f_gamma        = gpu_alloc(1,D);
+    ln_f_beta         = gpu_alloc(1,D);
+    {
+        std::vector<float> ones_f(D,1.f), zeros_f(D,0.f);
+        h2d(ln_f_gamma, ones_f.data(),  D);
+        h2d(ln_f_beta,  zeros_f.data(), D);
+    }
     std::vector<float> zero_positions(static_cast<size_t>(S) * D, 0.0f);
     h2d(gpu_pos_embedding, zero_positions.data(), S * D);
 
@@ -590,7 +494,6 @@ ModelGPU::ModelGPU(const ModelConfig& cfg_, const HyperConfig& hcfg)
               << " H=" << cfg.num_heads << " V=" << V << "\n"
               << "   Hyperbolic: " << (hyper_cfg.enabled?"ON":"OFF")
               << " (c=" << hyper_cfg.curvature << ")\n"
-              << "   Nikhilam KV: ON (INT8, 4x compression)\n"
               << "   GPU: " << (total_mem-free_mem)/1024/1024
               << " MB / " << total_mem/1024/1024 << " MB\n";
 }
@@ -620,6 +523,14 @@ void ModelGPU::free_layer_cache() {
 void ModelGPU::load_from_cpu(const LOGOSModel& cpu_model) {
     h2d(gpu_embedding,     cpu_model.embedding.data.data(),     cpu_model.embedding.total_size);
     h2d(gpu_lm_head,       cpu_model.lm_head.data.data(),       cpu_model.lm_head.total_size);
+    // [PHASE0] Learned positional embedding bhi load karo (pehle zeros reh jaati thi)
+    if (cpu_model.pos_embedding.total_size == gpu_pos_embedding.size)
+        h2d(gpu_pos_embedding, cpu_model.pos_embedding.data.data(), gpu_pos_embedding.size);
+    if (cpu_model.final_ln.gamma.total_size == cfg.d_model &&
+        cpu_model.final_ln.beta.total_size  == cfg.d_model) {
+        h2d(ln_f_gamma, cpu_model.final_ln.gamma.data.data(), cfg.d_model);
+        h2d(ln_f_beta,  cpu_model.final_ln.beta.data.data(),  cfg.d_model);
+    }
     for (int l=0;l<cfg.num_layers;++l) {
         auto& gblk=gpu_blocks[l];
         const auto& cblk=cpu_model.layers[l];
@@ -634,6 +545,29 @@ void ModelGPU::load_from_cpu(const LOGOSModel& cpu_model) {
         h2d(gblk.b1,cblk.ffn.b1.data.data(),cblk.ffn.b1.total_size);
         h2d(gblk.W2,cblk.ffn.W2.data.data(),cblk.ffn.W2.total_size);
         h2d(gblk.b2,cblk.ffn.b2.data.data(),cblk.ffn.b2.total_size);
+
+        // [PHASE0] LayerNorm gamma/beta + Reynolds running stats ab load hote hain.
+        // Pehle sirf sync_to_cpu me save hote the, load me nahi => resume par gamma=1/beta=0 reset.
+        const int Dm = cfg.d_model;
+        if (cblk.ln1.gamma.total_size == Dm && cblk.ln1.beta.total_size == Dm &&
+            cblk.ln2.gamma.total_size == Dm && cblk.ln2.beta.total_size == Dm) {
+            h2d(gblk.ln1_gamma, cblk.ln1.gamma.data.data(), Dm);
+            h2d(gblk.ln1_beta,  cblk.ln1.beta.data.data(),  Dm);
+            h2d(gblk.ln2_gamma, cblk.ln2.gamma.data.data(), Dm);
+            h2d(gblk.ln2_beta,  cblk.ln2.beta.data.data(),  Dm);
+        }
+        auto load_stats = [&](int slot, const std::vector<float>& mean, const std::vector<float>& var) {
+            if ((int)mean.size() != Dm || (int)var.size() != Dm) return;
+            std::vector<float> m(mean), v(var);
+            for (int j = 0; j < Dm; ++j) {
+                if (!std::isfinite(m[j])) m[j] = 0.f;
+                if (!std::isfinite(v[j]) || v[j] <= 0.f) v[j] = 1.f;  // zero-init (old ckpt) se rsqrt blow-up bachao
+            }
+            h2d(run_mean[slot], m.data(), Dm);
+            h2d(run_var[slot],  v.data(), Dm);
+        };
+        load_stats(2*l,   cblk.ln1.running_mean, cblk.ln1.running_var);
+        load_stats(2*l+1, cblk.ln2.running_mean, cblk.ln2.running_var);
     }
     std::cout << "✅ CPU → GPU weights loaded\n";
 }
@@ -651,6 +585,8 @@ std::vector<GPUTensor*> ModelGPU::all_parameters() {
         p.push_back(&blk.ln1_gamma); p.push_back(&blk.ln1_beta);
         p.push_back(&blk.ln2_gamma); p.push_back(&blk.ln2_beta);
     }
+    // Final LayerNorm sabse END me — baaki saare param/grad indices (3 + l*PPL ...) same rehte hain
+    p.push_back(&ln_f_gamma); p.push_back(&ln_f_beta);
     return p;
 }
 
@@ -667,6 +603,14 @@ std::vector<GPUTensor*> ModelGPU::alloc_grad_buffers() const {
 void ModelGPU::sync_to_cpu(LOGOSModel& cpu_model) const {
     d2h(cpu_model.embedding.data.data(),    gpu_embedding,    gpu_embedding.size);
     d2h(cpu_model.lm_head.data.data(),      gpu_lm_head,      gpu_lm_head.size);
+    // [PHASE0] Learned positional embedding bhi checkpoint me jaayegi
+    if (cpu_model.pos_embedding.total_size == gpu_pos_embedding.size)
+        d2h(cpu_model.pos_embedding.data.data(), gpu_pos_embedding, gpu_pos_embedding.size);
+    if (cpu_model.final_ln.gamma.total_size == cfg.d_model &&
+        cpu_model.final_ln.beta.total_size  == cfg.d_model) {
+        d2h(cpu_model.final_ln.gamma.data.data(), ln_f_gamma, cfg.d_model);
+        d2h(cpu_model.final_ln.beta.data.data(),  ln_f_beta,  cfg.d_model);
+    }
     for (int l=0;l<cfg.num_layers;++l) {
         const auto& gblk=gpu_blocks[l];
         auto& cblk=cpu_model.layers[l];
@@ -687,13 +631,17 @@ void ModelGPU::sync_to_cpu(LOGOSModel& cpu_model) const {
             d2h(cblk.ln2.gamma.data.data(),gblk.ln2_gamma,cfg.d_model);
             d2h(cblk.ln2.beta.data.data(), gblk.ln2_beta, cfg.d_model);
         }
+        // [PHASE0] Reynolds running stats (GPU = source of truth) ko CPU model me copy karo
+        if ((int)cblk.ln1.running_mean.size()==cfg.d_model && (int)cblk.ln2.running_mean.size()==cfg.d_model &&
+            (int)cblk.ln1.running_var.size()==cfg.d_model  && (int)cblk.ln2.running_var.size()==cfg.d_model) {
+            d2h(cblk.ln1.running_mean.data(), run_mean[2*l],   cfg.d_model);
+            d2h(cblk.ln1.running_var.data(),  run_var[2*l],    cfg.d_model);
+            d2h(cblk.ln2.running_mean.data(), run_mean[2*l+1], cfg.d_model);
+            d2h(cblk.ln2.running_var.data(),  run_var[2*l+1],  cfg.d_model);
+        }
     }
 }
 
-
-#if 0  
-
-#endif  
 
 void ModelGPU::apply_norm(const GPUTensor& X, const GPUTensor& gamma, const GPUTensor& beta,
                           GPUTensor& Y, GPUTensor& W, int slot, int seq)
@@ -765,7 +713,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
                 fp16_param_ptrs[param_idx], N,
                 C_fp32.data);
         } else {
-            cuda_vedic_gemm(A_fp32, W_fp32, C_fp32);
+            cuda_gemm(A_fp32, W_fp32, C_fp32);
         }
     };
 
@@ -788,7 +736,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             add_bias_kernel<<<(sz+255)/256,256>>>(C_fp32.data, bias.data, M, N);
             CUDA_KERNEL_CHECK();
         } else {
-            cuda_vedic_gemm_bias(A_fp32, W_fp32, bias, C_fp32);
+            cuda_gemm_bias(A_fp32, W_fp32, bias, C_fp32);
         }
     };
 
@@ -839,8 +787,6 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
             hc.V=gpu_alloc(seq,DH);
             amp_gemm(cache.normed1, blk.W_V[h], pWV, hc.V);
 
-            if (phys.nikhilam_kv) { hc.K_int8=nikhilam_compress(hc.K); hc.V_int8=nikhilam_compress(hc.V); }
-
             hc.Q_adv=gpu_alloc(seq,DH);
             hc.V_s  =gpu_alloc(seq,DH);
             if (phys.navier_stokes) {
@@ -863,9 +809,7 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
                 attn_save_ptr,          // null = skip attn save (val/inference)
                 seq, DH,
                 1.0f / sqrtf((float)DH),
-                true,                   // causal = always true (autoregressive)
-                phys.shunyam && seq > phys.window,
-                phys.window, phys.stride
+                true                    // causal = always true (autoregressive)
             );
             CUDA_KERNEL_CHECK();
 
@@ -952,24 +896,13 @@ GPUTensor ModelGPU::forward(const std::vector<int>& token_ids)
         }
     }
 
-    last_hidden=std::move(X);
+    // [FINAL-LN] residual stream ko lm_head se pehle normalize karo
+    final_in = std::move(X);
+    last_hidden = gpu_alloc(seq, D);
+    cuda_layernorm(final_in, ln_f_gamma, ln_f_beta, last_hidden, seq, D);
+    CUDA_KERNEL_CHECK();
     GPUTensor logits=gpu_alloc(seq,V);
     amp_gemm(last_hidden, gpu_lm_head, 2, logits);
     CUDA_KERNEL_CHECK();
     return logits;
-}
-
-void ModelGPU::print_kvcache_stats(int seq, int num_steps) const {
-    int H=cfg.num_heads, DH=cfg.d_model/H, L=cfg.num_layers;
-    long long kv_float=2LL*L*H*seq*DH*4;
-    long long kv_int8 =2LL*L*H*seq*DH*1;
-    long long saved   =kv_float-kv_int8;
-    printf("[Nikhilam KV Cache Stats]\n");
-    printf("  Config: L=%d H=%d DH=%d seq=%d\n",L,H,DH,seq);
-    printf("  KV float32: %lld KB per forward\n",kv_float/1024);
-    printf("  KV int8:    %lld KB per forward\n",kv_int8/1024);
-    printf("  Saved:      %lld KB (%.1fx compression)\n",
-           saved/1024, (float)kv_float/kv_int8);
-    printf("  Over %d steps: %.1f MB freed\n",
-           num_steps,(float)(saved*num_steps)/1024/1024);
 }

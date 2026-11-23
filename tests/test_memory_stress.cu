@@ -1,6 +1,6 @@
-#include "../cuda/VedicGEMM.cuh"
+#include "../cuda/CublasGemm.cuh"
 #include "../cuda/ModelGPU.cuh"
-#include "../cuda/MixedPrecision.cuh"   // [FIX] cast_fp32_to_fp16_kernel — ModelGPU forward mein use hota hai
+#include "../cuda/MixedPrecision.cuh"
 #include "../include/Model.hpp"
 
 #include <cuda_runtime.h>
@@ -102,109 +102,6 @@ static void test_mem2_raii_cycle() {
     std::cout << "    Net change: " << diff << " bytes\n";
 
     TEST("RAII: no VRAM leak after 1000 cycles (< 1MB)", std::abs(diff) < 1024*1024LL);
-}
-
-static void test_mem3_nikhilam_1m() {
-    std::cout << "\n[MEM3] Nikhilam 1M Element Compress/Decompress\n";
-
-    int sz = 1024 * 1024;  // 1,048,576 elements
-    size_t vram_before = vram_used();
-
-    GPUTensor src = gpu_alloc(sz, 1);
-    std::cout << "    Source (float32): " << sz*4/1024 << " KB\n";
-
-    std::vector<float> h_src(sz);
-    for (int i=0; i<sz; ++i) h_src[i] = (float)(i % 201) - 100.f;
-    h2d(src, h_src.data(), sz);
-
-    float* d_max;
-    CUDA_CHECK(cudaMalloc(&d_max, sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_max, 0, sizeof(float)));
-    absmax_kernel<<<(sz+255)/256, 256>>>(src.data, d_max, sz);
-    cudaDeviceSynchronize();
-    float h_max=0.f;
-    CUDA_CHECK(cudaMemcpy(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost));
-    float scale = h_max / 127.0f + 1e-8f;
-    cudaFree(d_max);
-
-    int8_t* d_int8;
-    CUDA_CHECK(cudaMalloc(&d_int8, sz*sizeof(int8_t)));
-    nikhilam_quantize_kernel<<<(sz+255)/256, 256>>>(src.data, d_int8, scale, sz);
-    cudaDeviceSynchronize();
-    std::cout << "    Compressed (int8): " << sz*1/1024 << " KB (4x smaller)\n";
-
-    size_t vram_peak = vram_used();
-    std::cout << "    Peak VRAM (float+int8): " << (vram_peak-vram_before)/1024 << " KB\n";
-
-    float* d_rec;
-    CUDA_CHECK(cudaMalloc(&d_rec, sz*sizeof(float)));
-    nikhilam_dequantize_kernel<<<(sz+255)/256, 256>>>(d_int8, d_rec, scale, sz);
-    cudaDeviceSynchronize();
-
-    std::vector<float> h_rec(100);
-    CUDA_CHECK(cudaMemcpy(h_rec.data(), d_rec, 100*sizeof(float), cudaMemcpyDeviceToHost));
-    float max_err = 0.f;
-    for (int i=0; i<100; ++i)
-        max_err = std::max(max_err, std::abs(h_src[i] - h_rec[i]));
-
-    TEST("1M Nikhilam: max error < 1.0",         max_err < 1.0f);
-    TEST("1M Nikhilam: scale reasonable",         scale > 0.f && std::isfinite(scale));
-
-    cudaFree(d_int8); cudaFree(d_rec);
-    { GPUTensor tmp = std::move(src); }  // force destructor now
-    cudaDeviceSynchronize();
-
-    size_t vram_after = vram_used();
-    long long leak = (long long)vram_after - (long long)vram_before;
-    TEST("1M Nikhilam: no leak after free (< 1MB)", std::abs(leak) < 1024*1024LL);
-
-    std::cout << "    Max quant error (sample): " << max_err << "\n";
-}
-
-static void test_mem4_kv_cache_concurrent() {
-    std::cout << "\n[MEM4] Concurrent KV Cache — Max Config (L=6,H=8,seq=512,DH=64)\n";
-
-    int L=6, H=8, seq=512, DH=64;
-    size_t vram_before = vram_used();
-
-    std::vector<int8_t*> k_bufs, v_bufs;
-    size_t total_int8 = 0;
-
-    bool alloc_ok = true;
-    for (int l=0; l<L && alloc_ok; ++l) {
-        for (int h=0; h<H && alloc_ok; ++h) {
-            int8_t *dk=nullptr, *dv=nullptr;
-            cudaError_t ek = cudaMalloc(&dk, seq*DH*sizeof(int8_t));
-            cudaError_t ev = cudaMalloc(&dv, seq*DH*sizeof(int8_t));
-            if (ek!=cudaSuccess || ev!=cudaSuccess) {
-                alloc_ok = false;
-                if (dk) cudaFree(dk);
-                if (dv) cudaFree(dv);
-                cudaGetLastError();
-            } else {
-                k_bufs.push_back(dk);
-                v_bufs.push_back(dv);
-                total_int8 += 2*seq*DH;
-            }
-        }
-    }
-
-    size_t vram_peak = vram_used();
-    std::cout << "    Total int8 elements: " << total_int8/1024 << "K\n";
-    std::cout << "    KV int8 memory: " << total_int8/1024 << " KB\n";
-    std::cout << "    KV float32 would be: " << total_int8*4/1024 << " KB\n";
-    std::cout << "    VRAM at peak: " << vram_peak/1024/1024 << " MB used\n";
-
-    for (auto* b : k_bufs) cudaFree(b);
-    for (auto* b : v_bufs) cudaFree(b);
-    cudaDeviceSynchronize();
-
-    size_t vram_after = vram_used();
-    long long leak = (long long)vram_after - (long long)vram_before;
-
-    TEST("KV cache: all allocations succeeded", alloc_ok);
-    TEST("KV cache: int8 < 4 MB total",         total_int8 < 4*1024*1024ULL);
-    TEST("KV cache: no leak after free",         std::abs(leak) < 512*1024LL);
 }
 
 static void test_mem5_seq1_edge() {
@@ -544,8 +441,6 @@ static void test_mem12_scale_stress() {
                       << (shape_ok?"shape OK":"shape FAIL") << "\n";
 
             ok = finite && shape_ok;
-
-            model.print_kvcache_stats(sc.seq, 1000);
         }
         catch (const std::exception& e) {
             std::cerr << "      Exception: " << e.what() << "\n";
@@ -578,8 +473,6 @@ int main() {
     try {
         test_mem1_vram_limits();
         test_mem2_raii_cycle();
-        test_mem3_nikhilam_1m();
-        test_mem4_kv_cache_concurrent();
         test_mem5_seq1_edge();
         test_mem6_maxseq_edge();
         test_mem7_grad_buffer_sizes();

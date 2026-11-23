@@ -1,5 +1,7 @@
 #pragma once
 #include "Tokenizer.hpp"
+#include <algorithm>
+#include <climits>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -39,7 +41,28 @@ inline ScaledConfig decide_model_config(int64_t actual_text_bytes) {
     return {1024, 16, 16, 8192};
 }
 
-class StreamingDataLoader {
+// Common interface: StreamingDataLoader (text) aur TokenBinLoader (pre-tokenized uint16 .bin)
+class IBatchLoader {
+public:
+    struct LoaderState {
+        int     current_shard;
+        int64_t byte_pos;       // StreamingDataLoader: byte position; TokenBinLoader: token position
+        int64_t total_tokens_seen;
+        int64_t total_steps_done;
+        int     current_epoch;
+    };
+
+    virtual ~IBatchLoader() = default;
+    virtual bool next_batch(std::vector<int>& input_ids, std::vector<int>& target_ids) = 0;
+    virtual bool next_accum_batch(
+        std::vector<std::pair<std::vector<int>, std::vector<int>>>& micro_batches) = 0;
+    virtual int64_t total_batches_per_epoch() const = 0;
+    virtual void reset() = 0;
+    virtual LoaderState get_state() const = 0;
+    virtual void restore_state(const LoaderState& state) = 0;
+};
+
+class StreamingDataLoader : public IBatchLoader {
 public:
     int64_t total_tokens_seen  = 0;
     int64_t total_steps_done   = 0;
@@ -160,7 +183,11 @@ public:
     }
 
     ~StreamingDataLoader() {
-        prefetch_stop_ = true;
+        {
+            // prefetch_stop_ wait-predicate me lock ke andar padha jaata hai -> yahan bhi lock (data race fix)
+            std::lock_guard<std::mutex> lk(prefetch_mutex_);
+            prefetch_stop_ = true;
+        }
         prefetch_cv_.notify_all();
         if (prefetch_thread_.joinable()) prefetch_thread_.join();
     }
@@ -229,15 +256,7 @@ public:
         _launch_prefetch();           // background prefetch restart
     }
 
-    struct LoaderState {
-        int     current_shard;
-        int64_t byte_pos;       // position in current shard
-        int64_t total_tokens_seen;
-        int64_t total_steps_done;
-        int     current_epoch;
-    };
-
-    LoaderState get_state() const {
+    LoaderState get_state() const override {
         return {
             current_shard,
             shard_byte_pos_,
@@ -286,6 +305,10 @@ private:
     int64_t        shard_byte_pos_ = 0;
     std::mutex     stream_mutex_;  
 
+    static inline bool _is_ws(unsigned char c) {
+        return Tokenizer::is_ws_byte(c);   // Tokenizer ke saath EXACT same definition (\v,\f included)
+    }
+
     void _open_current_shard() {
         std::lock_guard<std::mutex> slk(stream_mutex_);
         if (stream_.is_open()) stream_.close();
@@ -322,12 +345,28 @@ private:
         if (got <= 0) { shard_eof_ = true; return {}; }
         if (stream_.eof()) shard_eof_ = true;
 
+        // [TOKENIZER] Chunk ko whitespace-run ke start pe kaato taaki word beech me na tute
+        // (aur UTF-8 bhi safe rahe). Kata hua hissa agli chunk me wapas padha jaata hai.
+        const bool more_follows = (to_read < remaining) && !stream_.eof();
+        if (more_follows && got > 1) {
+            const std::streamsize lo = (got > 8192) ? got - 8192 : 0;
+            std::streamsize k = got - 1;
+            while (k >= lo && !_is_ws((unsigned char)buf[(size_t)k])) --k;
+            if (k >= lo) {
+                while (k > lo && _is_ws((unsigned char)buf[(size_t)(k - 1)])) --k;
+                if (k > 0 && k < got) {
+                    stream_.clear();
+                    stream_.seekg(-(std::streamoff)(got - k), std::ios::cur);
+                    got = k;
+                }
+            }
+        }
+
         shard_byte_pos_ += got;
 
         std::string text(buf.data(), static_cast<size_t>(got));
-        int64_t max_tokens = static_cast<int64_t>(got) * 4;
-        int capped = (max_tokens > INT_MAX) ? INT_MAX : static_cast<int>(max_tokens);
-        return tokenizer_ref_->encode(text, capped);
+        // BOS/EOS chunk ke beech me NAHI — raw tokens (document/stream boundaries data me hi hain)
+        return tokenizer_ref_->encode_raw(text);
     }
 
     void _load_next_chunk_sync() {
@@ -373,8 +412,7 @@ private:
                             std::streamsize got = tmp.gcount();
                             if (got > 0) {
                                 std::string text(buf.data(), static_cast<size_t>(got));
-                                tokens = tokenizer_ref_->encode(
-                                    text, static_cast<int>(got) * 4);
+                                tokens = tokenizer_ref_->encode_raw(text);
                             }
                         }
                     }
@@ -457,74 +495,3 @@ inline std::vector<DataShard> shards_from_dir(
         });
     return result;
 }
-
-#include "DataLoader.hpp"
-
-#include "DataLoader.hpp"
-
-class UnifiedDataLoader {
-public:
-    int current_pos = 0;   // exposed for epoch-reset compat with main.cpp
-    int seq_len;
-
-    explicit UnifiedDataLoader(const std::string& file,
-                               Tokenizer& tok,
-                               int seq_len_    = 128,
-                               int grad_accum  = 1)
-        : seq_len(seq_len_)
-    {
-        int64_t file_bytes = scan_dataset_size(file);
-        constexpr int64_t STREAM_THRESHOLD = 64LL * 1024 * 1024;  // 64 MB
-
-        if (file_bytes >= STREAM_THRESHOLD) {
-            std::cout << "UnifiedDataLoader: " << file_bytes/1024/1024
-                      << " MB → StreamingDataLoader (prefetch, chunk-mode)\n";
-            stream_.reset(new StreamingDataLoader(file, tok, seq_len_, grad_accum));
-            use_stream_ = true;
-        } else {
-            std::cout << "UnifiedDataLoader: " << file_bytes/1024
-                      << " KB → DataLoader (in-memory)\n";
-            direct_.reset(new DataLoader(file, tok, seq_len_));
-            use_stream_ = false;
-        }
-
-        actual_text_size_ = file_bytes;
-    }
-
-    bool next_batch(std::vector<int>& input_ids, std::vector<int>& target_ids) {
-        bool ok;
-        if (use_stream_) {
-            ok = stream_->next_batch(input_ids, target_ids);
-            current_pos = (int)(stream_->total_tokens_seen % INT_MAX);
-        } else {
-            ok = direct_->next_batch(input_ids, target_ids);
-            current_pos = direct_->current_pos;
-        }
-        return ok;
-    }
-
-    void reset() {
-        if (use_stream_) {
-            stream_->reset();
-            current_pos = 0;
-        } else {
-            direct_->current_pos = 0;
-            current_pos          = 0;
-        }
-    }
-
-    int total_batches() const {
-        if (use_stream_)
-            return (int)std::min(stream_->total_batches_per_epoch(),
-                                 (int64_t)INT_MAX);
-        return direct_->total_batches();
-    }
-
-    int64_t actual_text_size() const { return actual_text_size_; }
-
-private:
-    bool use_stream_ = false;
-    int64_t actual_text_size_ = 0;
-    std::unique_ptr<StreamingDataLoader> stream_;
-    std::unique_ptr<DataLoader>          direct_;
-};

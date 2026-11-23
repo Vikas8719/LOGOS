@@ -129,6 +129,21 @@ static bool read_tensor_clamped(std::ifstream& f, Tensor& t, const std::string& 
     return true;
 }
 
+// Final LayerNorm footer (gamma, beta). Purane checkpoints me ye nahi hota — tab defaults
+// (gamma=1, beta=0) rehte hain aur load fail nahi hota.
+static bool read_optional_tensor(std::ifstream& f, Tensor& t, const char* lbl) {
+    const auto bytes = static_cast<std::streamsize>(t.total_size * sizeof(float));
+    std::vector<float> tmp(static_cast<size_t>(t.total_size));
+    f.read(reinterpret_cast<char*>(tmp.data()), bytes);
+    if (f.gcount() != bytes) {
+        f.clear();
+        std::cerr << "⚠️  " << lbl << " missing in checkpoint (older format) — default init (gamma=1, beta=0)\n";
+        return false;
+    }
+    std::copy(tmp.begin(), tmp.end(), t.data.begin());
+    return true;
+}
+
 bool save_checkpoint(const LOGOSModel& model,
                      const std::string& path,
                      int step)
@@ -148,7 +163,14 @@ bool save_checkpoint(const LOGOSModel& model,
     };
 
     wt(model.embedding);
-    write_legacy_position_slot(f, model.cfg);
+    // [PHASE0] Position slot: pehle zeros likhta tha (learned pos-emb lost ho jaati thi).
+    // Ab asli pos_embedding likhte hain; slot ka size same hai => purane checkpoints compatible.
+    if (static_cast<size_t>(model.pos_embedding.total_size) ==
+        static_cast<size_t>(model.cfg.max_seq_len) * model.cfg.d_model) {
+        wt(model.pos_embedding);
+    } else {
+        write_legacy_position_slot(f, model.cfg);
+    }
     wt(model.lm_head);
 
     auto wv = [&](const std::vector<float>& v) {
@@ -168,6 +190,10 @@ bool save_checkpoint(const LOGOSModel& model,
         wv(block.ln1.running_mean); wv(block.ln1.running_var);
         wv(block.ln2.running_mean); wv(block.ln2.running_var);
     }
+
+    // Footer: final LayerNorm (gamma, beta)
+    wt(model.final_ln.gamma);
+    wt(model.final_ln.beta);
 
     if (!f) {
         std::cerr << "❌ Write error: " << full_path << "\n";
@@ -203,7 +229,13 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     };
 
     if (!rt(model.embedding))     return false;
-    if (!discard_legacy_position_slot(f, file_cfg, path, false)) return false;
+    // [PHASE0] Position slot ab model.pos_embedding me load hota hai (purane ckpt me zeros = same behavior)
+    if (static_cast<size_t>(model.pos_embedding.total_size) ==
+        static_cast<size_t>(file_cfg.max_seq_len) * file_cfg.d_model) {
+        if (!rt(model.pos_embedding)) return false;
+    } else if (!discard_legacy_position_slot(f, file_cfg, path, false)) {
+        return false;
+    }
     if (!rt(model.lm_head))       return false;
 
     auto rv = [&](std::vector<float>& v, const std::string& lbl) -> bool {
@@ -241,6 +273,10 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         block.ln1.initialized = true;
         block.ln2.initialized = true;
     }
+
+    // Footer: final LayerNorm (optional — purane ckpt me nahi hota)
+    read_optional_tensor(f, model.final_ln.gamma, "final_ln.gamma");
+    read_optional_tensor(f, model.final_ln.beta,  "final_ln.beta");
 
     if (model.embedding.has_nan()) {
         std::cerr << "❌ Checkpoint corrupt — NaN in embeddings: " << path << "\n";
@@ -286,7 +322,12 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     };
 
     if (!rt(model.embedding))     return false;
-    if (!discard_legacy_position_slot(f, file_cfg, path, true)) return false;
+    if (static_cast<size_t>(model.pos_embedding.total_size) ==
+        static_cast<size_t>(file_cfg.max_seq_len) * file_cfg.d_model) {
+        if (!rt(model.pos_embedding)) return false;
+    } else if (!discard_legacy_position_slot(f, file_cfg, path, true)) {
+        return false;
+    }
     if (!rt(model.lm_head))       return false;
 
     for (auto& block : model.layers) {

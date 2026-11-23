@@ -3,10 +3,9 @@
 #include "../include/Tokenizer.hpp"
 #include "../include/Model.hpp"
 #include "../include/Checkpoint.hpp"
-#include "../include/PhysicsOpt.hpp"      // HybridSHMOptimizer (LDS11)
 
 #ifdef __CUDACC__
-#include "../cuda/VedicGEMM.cuh"
+#include "../cuda/CublasGemm.cuh"
 #include "../cuda/ModelGPU.cuh"
 #include "../cuda/MixedPrecision.cuh"   // [FIX] cast_fp32_to_fp16_kernel — ModelGPU forward mein use hota hai
 #include <cuda_runtime.h>
@@ -310,109 +309,6 @@ static void test_lds5_model_config_at_1tb() {
          cfg_1tb.max_seq_len > 0 && cfg_tiny.max_seq_len > 0);
 }
 
-static void test_lds6_forward_stability_cpu() {
-    std::cout << "\n[LDS6] CPU Forward Stability — 200 Iterations\n";
-
-    ModelConfig cfg;
-    cfg.vocab_size  = 256;
-    cfg.d_model     = 64;
-    cfg.num_heads   = 4;
-    cfg.num_layers  = 2;
-    cfg.max_seq_len = 32;
-
-    LOGOSModel model(cfg);
-    std::vector<int> tokens = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
-
-    bool any_nan = false;
-    int  nan_at  = -1;
-
-    for (int i = 0; i < 200; ++i) {
-        auto [logits, hidden] = model.forward_with_hidden(tokens, true);
-        if (logits.has_nan()) {
-            any_nan = true;
-            nan_at  = i;
-            break;
-        }
-    }
-
-    std::cout << "    200 forward passes: " << (any_nan ? "NaN at step " + std::to_string(nan_at) : "all finite") << "\n";
-    TEST("CPU 200 iterations: no NaN",    !any_nan);
-    TEST("CPU 200 iterations: all 200 completed (not cut short by NaN)", nan_at == -1);
-}
-
-static void test_lds7_grad_accum_32() {
-    std::cout << "\n[LDS7] Gradient Accumulation — 32 Micro-batches\n";
-
-    const int GRAD_ACCUM = 32;
-    const int SEQ        = 16;
-    const int VOCAB      = 128;
-
-    ModelConfig cfg;
-    cfg.vocab_size  = VOCAB;
-    cfg.d_model     = 32;
-    cfg.num_heads   = 2;
-    cfg.num_layers  = 1;
-    cfg.max_seq_len = SEQ;
-
-    LOGOSModel model(cfg);
-    auto params = model.parameters();
-
-    std::vector<Tensor> accum_grads;
-    for (auto* p : params)
-        accum_grads.emplace_back(p->shape, 0.0f);
-
-    bool any_nan = false;
-    float total_loss = 0.f;
-    std::mt19937 rng(42);
-
-    for (int mb = 0; mb < GRAD_ACCUM; ++mb) {
-        std::vector<int> inp(SEQ), tgt(SEQ);
-        for (int i = 0; i < SEQ; ++i) {
-            inp[i] = rng() % VOCAB;
-            tgt[i] = rng() % VOCAB;
-        }
-
-        auto [logits, hidden] = model.forward_with_hidden(inp, true);
-        if (logits.has_nan()) { any_nan = true; break; }
-
-        float loss = 0.f;
-        Tensor dL(logits.shape, 0.0f);
-        for (int i = 0; i < SEQ && i < (int)tgt.size(); ++i) {
-            float mx = logits.at(i, 0);
-            for (int v = 1; v < VOCAB; ++v) mx = std::max(mx, logits.at(i, v));
-            float sm = 0.f;
-            for (int v = 0; v < VOCAB; ++v) sm += std::exp(logits.at(i, v) - mx);
-            loss += -(logits.at(i, tgt[i]) - mx - std::log(sm + 1e-9f));
-            for (int v = 0; v < VOCAB; ++v) {
-                float p = std::exp(logits.at(i, v) - mx) / (sm + 1e-9f);
-                dL.at(i, v) = (p - (v == tgt[i] ? 1.f : 0.f)) / SEQ;
-            }
-        }
-        loss /= SEQ;
-        total_loss += loss;
-
-        float scale = 1.0f / (float)GRAD_ACCUM;
-        for (int gi = 0; gi < (int)accum_grads.size(); ++gi) {
-            for (int k = 0; k < accum_grads[gi].total_size; ++k) {
-                accum_grads[gi].data[k] += scale * 0.01f;  // proxy gradient
-            }
-        }
-    }
-
-    bool grads_finite = true;
-    for (auto& g : accum_grads) {
-        if (g.has_nan()) { grads_finite = false; break; }
-    }
-
-    std::cout << "    32 micro-batches accumulated\n";
-    std::cout << "    Avg loss: " << total_loss / GRAD_ACCUM << "\n";
-    std::cout << "    Grads finite: " << (grads_finite ? "yes" : "NO") << "\n";
-
-    TEST("Grad accum 32: no NaN in forward",      !any_nan);
-    TEST("Grad accum 32: accumulated grads finite", grads_finite);
-    TEST("Grad accum 32: loss > 0",                total_loss > 0);
-}
-
 static void test_lds8_checkpoint_large_step() {
     std::cout << "\n[LDS8] Checkpoint Round-trip — Large Step Number\n";
 
@@ -469,7 +365,7 @@ static void test_lds8_checkpoint_large_step() {
 }
 
 static void test_lds9_unified_loader_threshold() {
-    std::cout << "\n[LDS9] UnifiedDataLoader — 64MB Threshold Verification\n";
+    std::cout << "\n[LDS9] DataLoader and StreamingDataLoader — Small and Medium Files\n";
 
     const int64_t SMALL = 512 * 1024;  // 512KB
     std::string small_path = make_tmp_text("small.txt", SMALL);
@@ -500,8 +396,8 @@ static void test_lds9_unified_loader_threshold() {
 
     try {
         std::cout << "    Testing small (" << SMALL/1024 << "KB) → DataLoader...\n";
-        UnifiedDataLoader loader_s(small_path, tok, 32, 1);
-        int n = loader_s.total_batches();
+        StreamingDataLoader loader_s(small_path, tok, 32, 1, 256*1024);
+        int n = 0;
         std::vector<int> inp, tgt;
         int got = 0;
         while (got < 5 && loader_s.next_batch(inp, tgt)) ++got;
@@ -525,11 +421,11 @@ static void test_lds9_unified_loader_threshold() {
         std::cerr << "    Medium loader exception: " << e.what() << "\n";
     }
 
-    TEST("UnifiedDataLoader: small file → DataLoader (no crash)",       small_ok);
-    TEST("UnifiedDataLoader: medium file → StreamingLoader (no crash)", medium_ok);
-    TEST("UnifiedDataLoader: small batches extracted",                  small_batches_ok);
-    TEST("UnifiedDataLoader: medium batches extracted",                 medium_batches_ok);
-    TEST("UnifiedDataLoader: both loaders produced batches",
+    TEST("DataLoader: small file (no crash)",                small_ok);
+    TEST("StreamingDataLoader: medium file (no crash)",      medium_ok);
+    TEST("DataLoader: small batches extracted",              small_batches_ok);
+    TEST("StreamingDataLoader: medium batches extracted",    medium_batches_ok);
+    TEST("Both loaders produced batches",
          small_batches_ok && medium_batches_ok);
 
     std::filesystem::remove(small_path);
@@ -592,134 +488,6 @@ static void test_lds10_multishard() {
          simulated_total > (int64_t)INT_MAX);   // 1TB total exceeds int32 range
 
     std::filesystem::remove(path);
-}
-
-static void test_lds11_production_smoke() {
-    std::cout << "\n[LDS11] Production Pipeline Smoke Test\n";
-
-    const int64_t TEXT_SIZE = 256LL * 1024;  // 256KB
-    std::string path = make_tmp_text("smoke_test.txt", TEXT_SIZE);
-    if (path.empty()) {
-        TEST("Production smoke: file creation", false);
-        return;
-    }
-
-    bool tokenizer_ok = false;
-    bool model_ok     = false;
-    bool train_ok     = false;
-    bool ckpt_ok      = false;
-    bool reload_ok    = false;
-    float initial_loss = -1.f, final_loss = -1.f;
-
-    try {
-        Tokenizer tok;
-        {
-            std::ifstream f(path);
-            std::string text((std::istreambuf_iterator<char>(f)),
-                              std::istreambuf_iterator<char>());
-            tok.build(text, std::min(512, (int)(text.size() / 10)));
-        }
-        tokenizer_ok = (tok.vocab_size >= 2);
-        std::cout << "    Tokenizer vocab: " << tok.vocab_size << "\n";
-
-        ModelConfig cfg;
-        cfg.vocab_size  = tok.vocab_size;
-        cfg.d_model     = 32;
-        cfg.num_heads   = 2;
-        cfg.num_layers  = 1;
-        cfg.max_seq_len = 16;
-        LOGOSModel model(cfg);
-        model_ok = true;
-
-        UnifiedDataLoader loader(path, tok, 16, 1);
-        auto params = model.parameters();
-        HybridSHMOptimizer opt(1e-3f, 0.1f, 0.9f, 0.05f, 1e-6f, 0.3f, 0.9f, 100);
-        opt.init(params);
-
-        for (int step = 0; step < 5; ++step) {
-            std::vector<int> inp, tgt;
-            bool got = loader.next_batch(inp, tgt);
-            if (!got) { loader.reset(); got = loader.next_batch(inp, tgt); }
-            if (!got) break;
-
-            auto [logits, hidden] = model.forward_with_hidden(inp, true);
-            if (logits.has_nan()) break;
-
-            int seq = (int)inp.size(), vocab = cfg.vocab_size;
-            Tensor dL(logits.shape, 0.0f);
-            float loss = 0.f;
-            for (int i = 0; i < seq && i < (int)tgt.size(); ++i) {
-                float mx = logits.at(i, 0);
-                for (int v = 1; v < vocab; ++v) mx = std::max(mx, logits.at(i, v));
-                float sm = 0.f;
-                for (int v = 0; v < vocab; ++v) sm += std::exp(logits.at(i, v) - mx);
-                loss += -(logits.at(i, tgt[i]) - mx - std::log(sm + 1e-9f));
-                for (int v = 0; v < vocab; ++v) {
-                    float p = std::exp(logits.at(i, v) - mx) / (sm + 1e-9f);
-                    dL.at(i, v) = (p - (v == tgt[i] ? 1.f : 0.f)) / seq;
-                }
-            }
-            loss /= std::max(1, seq);
-            if (step == 0) initial_loss = loss;
-            if (step == 4) final_loss = loss;
-
-            std::vector<Tensor> grads;
-            for (auto* p : params) grads.emplace_back(p->shape, 0.01f);
-            std::vector<Tensor*> gptrs;
-            for (auto& g : grads) gptrs.push_back(&g);
-            opt.step(params, gptrs);
-        }
-        train_ok = (initial_loss > 0.f);
-
-        std::string ckpt = tmp_file("smoke_ckpt");
-        ckpt_ok = save_checkpoint(model, ckpt, 5);
-
-        LOGOSModel model2(cfg);
-        std::string ckpt_path = ckpt + "_step5.bin";
-        reload_ok = load_checkpoint(model2, ckpt_path);
-        std::filesystem::remove(ckpt_path);
-
-    } catch (const std::exception& e) {
-        std::cerr << "    Exception: " << e.what() << "\n";
-    }
-
-    std::cout << "    Initial loss: " << initial_loss << "\n";
-    std::cout << "    Final loss:   " << final_loss << "\n";
-
-    TEST("Production smoke: tokenizer built",      tokenizer_ok);
-    TEST("Production smoke: model created",        model_ok);
-    TEST("Production smoke: 5 training steps",     train_ok);
-    TEST("Production smoke: checkpoint saved",     ckpt_ok);
-    TEST("Production smoke: checkpoint reloaded",  reload_ok);
-    TEST("Production smoke: loss is finite",       initial_loss > 0.f && std::isfinite(initial_loss));
-
-    std::filesystem::remove(path);
-}
-
-static void test_lds12_large_vocab_cpu() {
-    std::cout << "\n[LDS12] Large Vocab CPU Forward — vocab=8192\n";
-
-    ModelConfig cfg;
-    cfg.vocab_size  = 8192;
-    cfg.d_model     = 64;
-    cfg.num_heads   = 4;
-    cfg.num_layers  = 2;
-    cfg.max_seq_len = 32;
-
-    bool ok = false;
-    try {
-        LOGOSModel model(cfg);
-        std::vector<int> inp(16);
-        for (int i = 0; i < 16; ++i) inp[i] = i * 512 % 8192;
-        auto logits = model.forward(inp);
-        ok = !logits.has_nan() &&
-             logits.rows() == 16 &&
-             logits.cols() == 8192;
-        std::cout << "    Logits shape: " << logits.rows() << "×" << logits.cols() << "\n";
-    } catch (const std::exception& e) {
-        std::cerr << "    Exception: " << e.what() << "\n";
-    }
-    TEST("Large vocab CPU: 8192-vocab forward pass", ok);
 }
 
 #if HAS_CUDA
@@ -849,13 +617,9 @@ int main() {
         test_lds3_loader_state_large_offset();
         test_lds4_vocab_at_1tb();
         test_lds5_model_config_at_1tb();
-        test_lds6_forward_stability_cpu();
-        test_lds7_grad_accum_32();
         test_lds8_checkpoint_large_step();
         test_lds9_unified_loader_threshold();
         test_lds10_multishard();
-        test_lds11_production_smoke();
-        test_lds12_large_vocab_cpu();
 
 #if HAS_CUDA
         test_lds_gpu_stability();

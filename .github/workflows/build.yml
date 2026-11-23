@@ -1,69 +1,25 @@
-name: LOGOS CI v34-BenchFuzz
+name: LOGOS CI
 
 permissions:
   contents: read
-  actions: write   # kaggle-gpu-trigger: workflow_dispatch trigger ke liye
+  actions: write
 
 on:
   push:
     branches: ["main", "dev"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"      # nightly: long randomised fuzz run
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# ─────────────────────────────────────────────────────────────────
-#  JOB OVERVIEW  (v34 — Bench + Fuzz added)
-#  ┌──────────────────────────────────────────────────────────────┐
-#  │  cpu-tests-linux   → T2 Math + T2b Checkpoint + T4 LDS      │
-#  │  sanitizer-tests-linux → T2 + T2b under ASan + UBSan       │
-#  │  cpu-tests-windows → T2 Math + T2b Checkpoint + T4 LDS      │
-#  │  cpu-tests-macos   → T2 Math + T2b Checkpoint + T4 LDS      │
-  #  │  gpu-tests         → T1+T2 GPU+T3+T4+T5 via ctest -L GPU    │
-#  │  rapidcheck-tests  → T7 RapidCheck C++ property tests       │
-#  │  bench-tests       → T8 Benchmark suite (logos_bench)       │
-#  │  fuzz-tests        → T9 Fuzz selftest + LibFuzzer 60s       │
-#  │  mutation-tests    → T6 MULL (clang++, non-blocking)        │
-#  │  linux-build       → full Linux build + E2E smoke            │
-#  │  windows-build     → full Windows build smoke                │
-#  │  macos-build       → full macOS build smoke                  │
-#  │  kaggle-gpu-trigger→ async Kaggle GPU notebook push          │
-#  │  summary           → final CI gate                           │
-#  └──────────────────────────────────────────────────────────────┘
-#
-#  Pipeline sequence (dependency order):
-#    Stage 1 (parallel):
-#      cpu-tests-linux, cpu-tests-windows, cpu-tests-macos, gpu-tests
-#    Stage 2 (needs stage-1):
-#      sanitizer-tests-linux (needs cpu-tests-linux)
-#      bench-tests           (needs cpu-tests-linux)
-#      fuzz-tests            (needs cpu-tests-linux)
-#      rapidcheck-tests      (needs cpu-tests-linux)
-#      mutation-tests        (needs cpu-tests-linux)
-#      linux-build           (needs cpu-tests-linux)
-#      windows-build         (needs cpu-tests-windows)
-#      macos-build           (needs cpu-tests-macos)
-#      kaggle-gpu-trigger    (needs cpu-tests-linux, main only)
-#    Stage 3 (gate):
-#      summary (needs all above)
-#
-#  Sanitizer layers:
-#    ASan+UBSan  : cmake -DLOGOS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
-#    compute-san : cmake -DLOGOS_USE_COMPUTE_SANITIZER=ON
-#    LibFuzzer   : cmake -DLOGOS_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++
-#    MULL        : cmake -DLOGOS_MUTATION_TEST=ON -DCMAKE_CXX_COMPILER=clang++
-#                  cmake --build build --target mull-run
-# ─────────────────────────────────────────────────────────────────
-
 jobs:
-  # ═══════════════════════════════════════════════════════════════
-  #  CPU TESTS — Linux
-  #  T2_Math_Unit + T2b_Checkpoint + T4_Large_Data_Scale
-  # ═══════════════════════════════════════════════════════════════
   cpu-tests-linux:
-    name: "CPU Tests — Linux (T2 + T2b + T4)"
+    name: "CPU Tests - Linux (T2b Checkpoint)"
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -76,29 +32,35 @@ jobs:
           sudo update-alternatives --install /usr/bin/gcc gcc \
             /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
 
-      - name: Configure (CPU-only)
+      - name: Configure
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      - name: Build CPU targets
+      - name: Build (checkpoint + tokenizer + physics + fuzz + integration + bench)
         run: |
-          cmake --build build \
-            --target test_math_unit test_checkpoint test_large_data_scale logos \
-            --parallel $(nproc)
+          cmake --build build --parallel $(nproc) --target \
+            test_checkpoint test_tokenizer test_physics_cpu test_fuzz test_integration test_bench
 
-      - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
+      - name: CTest (unit + physics + fuzz + integration; bench runs in its own job)
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600 -j 1
+        run: ctest --output-on-failure -LE "GPU|BENCH" --timeout 900 -j 1
 
-  # ═══════════════════════════════════════════════════════════════
-  #  CPU SANITIZERS — Linux (ASan + UBSan)
-  #  Run after the regular Linux CPU suite; failures block the CI gate.
-  # ═══════════════════════════════════════════════════════════════
+      - name: Upload build artifacts (ctest logs + test binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-linux
+          path: |
+            build/Testing/
+            build/test_*
+          if-no-files-found: ignore
+          retention-days: 14
+
   sanitizer-tests-linux:
-    name: "ASan + UBSan — Linux (T2 + T2b)"
+    name: "ASan + UBSan - Linux (T2b)"
     runs-on: ubuntu-22.04
     needs: [cpu-tests-linux]
     steps:
@@ -110,33 +72,25 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-12 g++-12 cmake ninja-build
 
-      - name: Configure (Debug + ASan + UBSan)
+      - name: Configure
         run: |
           cmake -B build-sanitize -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=g++-12 \
-            -DLOGOS_SANITIZE=ON
+            -DLOGOS_SANITIZE=ON \
+            -DLOGOS_FUZZ_ITERS=1000
 
-      - name: Build sanitized CPU test targets
+      - name: Build
         run: |
-          cmake --build build-sanitize \
-            --target test_math_unit test_checkpoint \
-            --parallel $(nproc)
+          cmake --build build-sanitize --parallel $(nproc) --target \
+            test_checkpoint test_tokenizer test_physics_cpu test_fuzz test_integration
 
-      - name: Run T2 + T2b with ASan + UBSan
+      - name: Run all CPU tests with ASan + UBSan
         working-directory: build-sanitize
-        run: |
-          ctest --output-on-failure \
-            -R "^(T2_Math_Unit|T2b_Checkpoint)$" \
-            --timeout 120 \
-            -j 1
+        run: ctest --output-on-failure -LE "GPU|BENCH" --timeout 900 -j 1
 
-  # ═══════════════════════════════════════════════════════════════
-  #  CPU TESTS — Windows
-  #  NOTE: PowerShell does NOT support backslash line continuation.
-  # ═══════════════════════════════════════════════════════════════
   cpu-tests-windows:
-    name: "CPU Tests — Windows (T2 + T2b + T4)"
+    name: "CPU Tests - Windows (T2b Checkpoint)"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -145,17 +99,25 @@ jobs:
         run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
       - name: Build
-        run: cmake --build build --target test_math_unit test_checkpoint test_large_data_scale --parallel 4
+        run: cmake --build build --target test_checkpoint test_tokenizer test_physics_cpu test_integration --parallel 4
 
-      - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
+      - name: CTest
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
+        run: ctest --output-on-failure -R '^(T2b_Checkpoint|T20_Tokenizer_Unit|T21_Physics_CPU|T23_Integration)$' --timeout 600
 
-  # ═══════════════════════════════════════════════════════════════
-  #  CPU TESTS — macOS
-  # ═══════════════════════════════════════════════════════════════
+      - name: Upload build artifacts (ctest logs + test binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-windows
+          path: |
+            build/Testing/
+            build/test_*
+          if-no-files-found: ignore
+          retention-days: 14
+
   cpu-tests-macos:
-    name: "CPU Tests — macOS (T2 + T2b + T4)"
+    name: "CPU Tests - macOS (T2b Checkpoint)"
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -167,18 +129,238 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O2 -std=c++20"
 
       - name: Build
-        run: cmake --build build --target test_math_unit test_checkpoint test_large_data_scale --parallel $(sysctl -n hw.logicalcpu)
+        run: cmake --build build --target test_checkpoint test_tokenizer test_physics_cpu test_integration --parallel $(sysctl -n hw.logicalcpu)
 
-      - name: CTest — T2 Math + T2b Checkpoint + T4 Large Data Scale
+      - name: CTest
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
+        run: ctest --output-on-failure -R '^(T2b_Checkpoint|T20_Tokenizer_Unit|T21_Physics_CPU|T23_Integration)$' --timeout 600
 
-  # ═══════════════════════════════════════════════════════════════
-  #  GPU TESTS
-  #  Runs T1+T2 GPU+T3+T4+T5 via: ctest -L GPU --output-on-failure
-  # ═══════════════════════════════════════════════════════════════
+      - name: Upload build artifacts (ctest logs + test binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-macos
+          path: |
+            build/Testing/
+            build/test_*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  tsan-linux:
+    name: "ThreadSanitizer - Linux (T20 T22 T23)"
+    runs-on: ubuntu-22.04
+    needs: [cpu-tests-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
+
+      - name: Relax ASLR (TSan needs it on newer runner kernels)
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: |
+          cmake -B build-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DLOGOS_TSAN=ON \
+            -DLOGOS_FUZZ_ITERS=500
+
+      - name: Build
+        run: cmake --build build-tsan --parallel $(nproc) --target test_tokenizer test_fuzz test_integration
+
+      - name: Run threaded tests under TSan
+        working-directory: build-tsan
+        run: ctest --output-on-failure -R "^(T20_Tokenizer_Unit|T22_Fuzz|T23_Integration)$" --timeout 900 -j 1
+
+  qa-matrix:
+    name: "Fuzz + Bench + Mutation (${{ matrix.label }})"
+    runs-on: ${{ matrix.os }}
+    needs: [cpu-tests-linux]
+    timeout-minutes: 90
+    # Windows/macOS legs report but do not block the gate until they have been seen green once
+    continue-on-error: ${{ matrix.os != 'ubuntu-22.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux
+            gen: Ninja
+            cxx: g++-12
+          - os: windows-latest
+            label: windows
+            gen: MinGW Makefiles
+            cxx: g++
+          - os: macos-14
+            label: macos
+            gen: Unix Makefiles
+            cxx: clang++
+    defaults:
+      run:
+        shell: bash
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
+
+      - name: Configure (fuzz seed saved to qa/fuzz_seed.txt)
+        run: |
+          mkdir -p qa
+          SEED=$(date +%s)
+          echo "$SEED" > qa/fuzz_seed.txt
+          echo "FUZZ SEED = $SEED  (reproduce: -DLOGOS_FUZZ_SEED=$SEED)"
+          cmake -B build -G "${{ matrix.gen }}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLOGOS_FUZZ_ITERS=20000 \
+            -DLOGOS_FUZZ_SEED=$SEED
+
+      - name: Build test_fuzz + test_bench
+        run: cmake --build build --parallel 4 --target test_fuzz test_bench
+
+      - name: Run fuzz (log -> qa/fuzz.log)
+        working-directory: build
+        run: ctest --output-on-failure -R "^T22_Fuzz$" --timeout 1800 -V 2>&1 | tee ../qa/fuzz.log
+
+      - name: Run benchmarks (json -> qa/bench_results.json)
+        if: always()
+        working-directory: build
+        env:
+          LOGOS_BENCH_JSON: ../qa/bench_results.json
+        run: ctest --output-on-failure -L BENCH --timeout 900 -j 1 -V 2>&1 | tee ../qa/bench.log
+
+      - name: Run mutation suite (fails below 80% kill score)
+        if: always()
+        run: python tools/mutation_test.py --min-score 0.80 --jobs 4 --report qa/mutation_report.json 2>&1 | tee qa/mutation.log
+
+      - name: Job summary (mutation score + bench numbers)
+        if: always()
+        run: |
+          python - <<'PYEOF_SUM' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          print("### ${{ matrix.label }}: fuzz / bench / mutation")
+          try:
+              print("- fuzz seed: " + open("qa/fuzz_seed.txt").read().strip())
+          except Exception:
+              pass
+          try:
+              m = json.load(open("qa/mutation_report.json"))
+              print(f"- mutation score: **{m['score']:.1%}** (killed={m['killed']}, survived={m['survived']}, invalid={m['invalid']}, stale={m['stale']})")
+              for r in m.get("mutants", []):
+                  if r.get("status") == "SURVIVED":
+                      print(f"  - SURVIVED: {r['name']}")
+          except Exception as e:
+              print(f"- mutation report missing ({e})")
+          try:
+              b = json.load(open("qa/bench_results.json"))
+              for k, v in b.items():
+                  print(f"- bench {k}: {v}")
+          except Exception as e:
+              print(f"- bench json missing ({e})")
+          PYEOF_SUM
+
+      - name: Upload QA artifacts (fuzz log+seed, bench json, mutation report)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-${{ matrix.label }}
+          path: qa/
+          if-no-files-found: warn
+          retention-days: 30
+
+  fuzz-nightly:
+    name: "Nightly long fuzz (random seed)"
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
+
+      - name: Configure with random seed
+        run: |
+          SEED=$(date +%s)
+          echo "FUZZ SEED = $SEED  (reproduce: -DLOGOS_FUZZ_SEED=$SEED)"
+          mkdir -p qa-nightly
+          echo "$SEED" > qa-nightly/fuzz_seed.txt
+          cmake -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DLOGOS_FUZZ_ITERS=300000 \
+            -DLOGOS_FUZZ_SEED=$SEED
+
+      - name: Build
+        run: cmake --build build-fuzz --parallel $(nproc) --target test_fuzz
+
+      - name: Run
+        working-directory: build-fuzz
+        run: ctest --output-on-failure -R "^T22_Fuzz$" --timeout 3000 -V 2>&1 | tee ../qa-nightly/fuzz.log
+
+      - name: Upload nightly fuzz artifacts (log + seed)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-nightly
+          path: qa-nightly/
+          if-no-files-found: warn
+          retention-days: 30
+
+  gpu-compile-check:
+    name: "GPU compile + link check (nvcc 12.4, no GPU needed)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build wget
+
+      - name: Install CUDA toolkit (compiler + cuBLAS only)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-4 cuda-cudart-dev-12-4 libcublas-dev-12-4
+          echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
+          echo "CUDACXX=/usr/local/cuda-12.4/bin/nvcc" >> "$GITHUB_ENV"
+          echo "CUDAToolkit_ROOT=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
+
+      - name: Configure (explicit sm_75; hosted runners have no GPU to auto-detect)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
+            -DCUDA_ARCH_MODE=75
+
+      - name: Build every GPU target (catches compile errors in CUDA code)
+        run: |
+          cmake --build build --parallel 2 --target \
+            logos_gpu test_syntax_build test_math_units_gpu test_memory_stress \
+            test_large_data_scale test_cuda_kernels test_cublas_gemm
+
   gpu-tests:
-    name: "GPU Tests (T1+T2 GPU+T3+T4+T5 via ctest)"
+    name: "GPU Tests (T1 T2 T3 T4 T5 T10)"
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -198,13 +380,13 @@ jobs:
             VER=$(nvcc --version | grep "release" | awk '{print $5}' | tr -d ',')
             echo "available=true"  >> $GITHUB_OUTPUT
             echo "version=$VER"    >> $GITHUB_OUTPUT
-            echo "✅ CUDA $VER found"
+            echo "CUDA $VER found"
           else
             echo "available=false" >> $GITHUB_OUTPUT
-            echo "⚠️  No CUDA — GPU tests will be skipped (non-blocking)"
+            echo "No CUDA - GPU tests skipped"
           fi
 
-      - name: Configure (with CUDA)
+      - name: Configure (CUDA)
         if: steps.cuda.outputs.available == 'true'
         run: |
           cmake -B build -G Ninja \
@@ -212,35 +394,20 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCUDA_ARCH_MODE=native
 
-      - name: Configure (CPU fallback)
-        if: steps.cuda.outputs.available == 'false'
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
-
-      - name: Build all GPU targets
+      - name: Build GPU targets
         if: steps.cuda.outputs.available == 'true'
         run: |
           cmake --build build \
             --target logos_gpu \
                      test_syntax_build \
                      test_math_units_gpu \
-                     test_math_unit \
                      test_memory_stress \
                      test_large_data_scale \
                      test_cuda_kernels \
+                     test_cublas_gemm \
             --parallel $(nproc)
 
-      - name: Build CPU fallback targets
-        if: steps.cuda.outputs.available == 'false'
-        run: |
-          cmake --build build \
-            --target logos test_math_unit test_checkpoint test_large_data_scale \
-            --parallel $(nproc)
-
-      - name: CTest — GPU tests (T1 T2 T3 T4 T5)
+      - name: CTest GPU
         if: steps.cuda.outputs.available == 'true'
         working-directory: build
         run: |
@@ -250,11 +417,6 @@ jobs:
                 -j 1 \
                 --test-output-size-passed 8192 \
                 --test-output-size-failed 65536
-
-      - name: CTest — CPU fallback (no CUDA runner)
-        if: steps.cuda.outputs.available == 'false'
-        working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600 -j 1
 
       - name: compute-sanitizer memcheck on T5
         if: steps.cuda.outputs.available == 'true'
@@ -277,1096 +439,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # ═══════════════════════════════════════════════════════════════
-  #  LINUX BUILD — Full build + E2E training smoke
-  #  (Replaces old training-pipeline job — now visible in UI)
-  # ═══════════════════════════════════════════════════════════════
-  linux-build:
-    name: "Linux Build + E2E Training"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 cmake ninja-build
-          sudo update-alternatives --install /usr/bin/gcc gcc \
-            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
-
-      - name: Configure and Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
-          cmake --build build --parallel $(nproc)
-
-      - name: logos CPU smoke
-        run: |
-          ./build/logos --test
-          ./build/logos --forward
-          ./build/logos --benchmark
-
-      - name: Prepare dataset
-        run: |
-          curl -L "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt" \
-            --max-filesize 524288 -o dataset_raw.txt --fail --silent --show-error \
-            && head -c 102400 dataset_raw.txt > dataset.txt \
-            || python3 -c "
-          import random; random.seed(42)
-          w=['the','cat','sat','on','mat','a','dog','ran','fast','slow','big','small','red','blue','Once','upon','time','there','was','little','girl','named','Lily']
-          print('\n'.join([' '.join(random.choices(w,k=random.randint(10,30)))+'.' for _ in range(500)]))" > dataset.txt
-          echo "Dataset: $(wc -c < dataset.txt) bytes"
-
-      - name: Train
-        run: timeout 600 ./build/logos --train dataset.txt || true
-
-      - name: Evaluate
-        run: ./build/logos --eval dataset.txt || true
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-linux
-          path: |
-            build/logos
-            build/test_math_unit
-            *.bin
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ═══════════════════════════════════════════════════════════════
-  #  WINDOWS BUILD
-  # ═══════════════════════════════════════════════════════════════
-  windows-build:
-    name: "Windows Build"
-    runs-on: windows-latest
-    needs: [cpu-tests-windows]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure
-        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
-
-      - name: Build
-        run: cmake --build build --parallel 4
-
-      - name: CTest CPU
-        working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
-
-      - name: logos smoke
-        run: |
-          .\build\logos.exe --test
-          .\build\test_math_unit.exe
-          .\build\logos.exe --forward
-          .\build\logos.exe --benchmark
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-windows
-          path: |
-            build/logos.exe
-            build/test_math_unit.exe
-          retention-days: 7
-
-  # ═══════════════════════════════════════════════════════════════
-  #  macOS BUILD
-  # ═══════════════════════════════════════════════════════════════
-  macos-build:
-    name: "macOS Build"
-    runs-on: macos-14
-    needs: [cpu-tests-macos]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -std=c++20"
-
-      - name: Build
-        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
-
-      - name: CTest CPU
-        working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ" --timeout 600
-
-      - name: logos smoke
-        run: |
-          ./build/logos --test
-          ./build/test_math_unit
-          ./build/logos --forward
-          ./build/logos --benchmark
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: logos-macos
-          path: |
-            build/logos
-            build/test_math_unit
-          retention-days: 7
-
-  # ═══════════════════════════════════════════════════════════════
-  #  BENCHMARK TESTS — T8
-  #  logos_bench build karke CTest T8_Bench_Smoke chalata hai.
-  #  Threshold violations pe exit 1 (blocking).
-  #  needs: cpu-tests-linux (Stage 1 ke baad hi chalega)
-  # ═══════════════════════════════════════════════════════════════
-  bench-tests:
-    name: "Benchmark Tests — Linux (T8)"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 cmake ninja-build
-          sudo update-alternatives --install /usr/bin/gcc gcc \
-            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
-
-      - name: Configure (Release, CPU-only)
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -std=c++20"
-
-      - name: Build logos_bench
-        run: |
-          cmake --build build \
-            --target logos_bench \
-            --parallel $(nproc)
-
-      - name: Run benchmark suite (T8_Bench_Smoke)
-        working-directory: build
-        run: |
-          ctest --output-on-failure \
-            -L "BENCH" \
-            --timeout 300 \
-            -j 1
-
-      - name: Print benchmark results
-        if: always()
-        run: |
-          ./build/logos_bench 2>&1 | tail -40 || true
-
-      - name: Upload benchmark log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-results-linux
-          path: build/Testing/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ═══════════════════════════════════════════════════════════════
-  #  FUZZ TESTS — T9
-  #  Stage A: logos_fuzz_selftest --selftest (smoke, blocking)
-  #  Stage B: logos_fuzz LibFuzzer 60s (clang++, non-blocking)
-  #  needs: cpu-tests-linux (Stage 1 ke baad hi chalega)
-  # ═══════════════════════════════════════════════════════════════
-  fuzz-tests:
-    name: "Fuzz Tests — Linux (T9 selftest + LibFuzzer)"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 clang cmake ninja-build
-          sudo update-alternatives --install /usr/bin/gcc gcc \
-            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
-
-      - name: Stage A — Build logos_fuzz_selftest (g++, no fuzzer)
-        run: |
-          cmake -B build_fuzz_st -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O1 -g -march=x86-64 -std=c++20"
-          cmake --build build_fuzz_st \
-            --target logos_fuzz_selftest \
-            --parallel $(nproc)
-
-      - name: Stage A — Run selftest (T9_Fuzz_Selftest, blocking)
-        run: |
-          ./build_fuzz_st/logos_fuzz_selftest --selftest
-          echo "✅ Fuzz selftest passed — all 13 targets smoke-tested"
-
-      - name: Stage B — Build logos_fuzz (clang++ + LibFuzzer + ASan)
-        id: libfuzzer_build
-        continue-on-error: true
-        run: |
-          CLANG_BIN=$(which clang++ 2>/dev/null || echo "")
-          if [ -z "$CLANG_BIN" ]; then
-            echo "clang++ not found — skipping LibFuzzer build"
-            echo "available=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          echo "clang++ found: $CLANG_BIN"
-          cmake -B build_fuzz_lf -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DLOGOS_FUZZ=ON
-          cmake --build build_fuzz_lf \
-            --target logos_fuzz \
-            --parallel $(nproc)
-          echo "available=true" >> $GITHUB_OUTPUT
-
-      - name: Stage B — Run LibFuzzer 60s (T9_Fuzz_LibFuzzer, non-blocking)
-        if: steps.libfuzzer_build.outputs.available == 'true'
-        continue-on-error: true
-        run: |
-          mkdir -p corpus_fuzz
-          ./build_fuzz_lf/logos_fuzz \
-            -max_total_time=60 \
-            -max_len=1024 \
-            -rss_limit_mb=512 \
-            -print_final_stats=1 \
-            corpus_fuzz/ \
-            2>&1 | tee fuzz_output.log | tail -30
-          echo "LibFuzzer 60s run complete"
-
-      - name: Fuzz Summary
-        if: always()
-        run: |
-          echo "════════════════════════════════════════════════════"
-          echo "  LOGOS Fuzz Testing Results — T9"
-          echo "════════════════════════════════════════════════════"
-          echo "  Stage A (selftest): ✅ All 13 targets verified"
-          if [ -f fuzz_output.log ]; then
-            CRASHES=$(grep -c "SUMMARY: .*Sanitizer" fuzz_output.log 2>/dev/null || echo 0)
-            EXECS=$(grep -oP 'stat::number_of_executed_units:\s*\K\d+' fuzz_output.log | tail -1)
-            echo "  Stage B (LibFuzzer): execs=${EXECS:-N/A}, crashes=${CRASHES}"
-            if [ "$CRASHES" -gt 0 ] 2>/dev/null; then
-              echo "  ❌ CRASH FOUND — check fuzz-results artifact"
-            else
-              echo "  ✅ No crashes in 60s run"
-            fi
-          else
-            echo "  Stage B (LibFuzzer): skipped (clang++ not available)"
-          fi
-          echo "════════════════════════════════════════════════════"
-
-      - name: Upload fuzz artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-results
-          path: |
-            fuzz_output.log
-            corpus_fuzz/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # ═══════════════════════════════════════════════════════════════
-  #  RAPIDCHECK — C++ Property-Based Tests (T7)
-  #  Hypothesis (Python) ko replace kiya — woh C++ ka Python re-implementation tha.
-  #  RapidCheck actual C++ headers directly include karta hai:
-  #    VedicGEMM.hpp, Tensor.hpp, PhysicsOpt.hpp, Checkpoint.hpp, LayerNorm.hpp
-  #  Tests:
-  #    RC1: VedicGEMM == reference (random sizes + values)
-  #    RC2: VEDIC_BLOCK=64 boundary (63,64,65,128,129)
-  #    RC3: vedic_gemm_bias correctness
-  #    RC4: Free Energy F=CE-T*S properties
-  #    RC5: Tensor reshape roundtrip
-  #    RC6: Riemannian distance symmetry, self=0, triangle
-  #    RC7: Checkpoint size formula (random ModelConfig)
-  #    RC8: Leapfrog energy drift < Euler drift
-  #  Non-blocking: continue-on-error: true
-  # ═══════════════════════════════════════════════════════════════
-  rapidcheck-tests:
-    name: "RapidCheck C++ Property Tests (T7)"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 cmake ninja-build git
-          sudo update-alternatives --install /usr/bin/gcc gcc \
-            /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
-
-      - name: Configure (LOGOS_RAPIDCHECK=ON — FetchContent se rapidcheck download hoga)
-        run: |
-          cmake -B build_rc -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20" \
-            -DLOGOS_RAPIDCHECK=ON
-
-      - name: Build test_rapidcheck
-        run: |
-          cmake --build build_rc \
-            --target test_rapidcheck \
-            --parallel $(nproc)
-        env:
-          # Agar build mein CUDA nahi hai toh bhi test_rapidcheck target hona chahiye
-          # (CPU-only branch mein LOGOS_RAPIDCHECK=ON se yeh target define hota hai)
-          NINJA_STATUS: "[%f/%t] "
-
-      - name: Run RapidCheck property tests (T7)
-        id: rc_run
-        run: |
-          # RC_PARAMS format: key=value pairs, semicolon-separated
-          # max_success=1000  : 1000 random cases per property (was 500 — too lenient)
-          # max_discard_ratio=10 : RC_PRE rejections limit (10x max_success se zyada = fail)
-          # noshrink=0        : counterexample shrinking ON — reproducible min-case milta hai
-          # seed alag nahi set kiya — har run different random seed use karega
-          # Agar failure ho toh seed output mein dikhega — wahi seed re-run mein use karo:
-          #   RC_PARAMS="max_success=1000;seed=<N>" ./test_rapidcheck
-          RC_PARAMS="max_success=1000;max_discard_ratio=10" \
-            ./build_rc/test_rapidcheck 2>&1 | tee rc_output.log
-          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
-
-      - name: RapidCheck Summary
-        if: always()
-        run: |
-          echo "════════════════════════════════════════════════════"
-          echo "  RapidCheck C++ Property Test Results (T7)"
-          echo "  Strict: max_success=1000 per property"
-          echo "════════════════════════════════════════════════════"
-          grep -E "(RC[0-9]|✅|❌|PASSED|FAILED|passed|failed)" rc_output.log || true
-          echo "════════════════════════════════════════════════════"
-
-          python3 - <<'PYEOF'
-          import os, re
-          log = open("rc_output.log").read() if os.path.exists("rc_output.log") else ""
-          passed = log.count("✅")
-          failed = log.count("❌")
-          total  = passed + failed
-          emoji  = "✅" if failed == 0 else "❌"
-
-          # RC_PARAMS seed extract karo agar failure mein printed hai
-          seed_match = re.search(r'(?:seed|Seed)[=:\s]+(\d+)', log)
-          seed_info  = f"Seed: `{seed_match.group(1)}`" if seed_match else "Seed: random (set RC_PARAMS=seed=N to reproduce)"
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stderr")
-          with open(summary_path, "a") as f:
-              f.write("## 🔬 RapidCheck C++ Property Tests — T7\n\n")
-              f.write(f"> **Strict mode**: `max_success=1000` per property, `max_discard_ratio=10`\n")
-              f.write(f"> {seed_info}\n\n")
-              f.write("| Test | Result |\n")
-              f.write("|------|--------|\n")
-              for line in log.splitlines():
-                  # Match RC1..RC8b lines with result icon
-                  if re.search(r'RC\d', line) and ("✅" in line or "❌" in line):
-                      icon = "✅" if "✅" in line else "❌"
-                      f.write(f"| `{line.strip()}` | {icon} |\n")
-              f.write(f"\n**Overall: {emoji} {passed}/{total} passed**\n\n")
-              f.write("Properties tested:\n")
-              f.write("- RC1: VedicGEMM == naive_gemm (1000 random sizes+values)\n")
-              f.write("- RC2: VEDIC_BLOCK=64 tiling boundary (200 × 9 sizes = 1800 matrices)\n")
-              f.write("- RC3: vedic_gemm_bias == GEMM+bias (1000 cases)\n")
-              f.write("- RC4a-d: Free Energy F=CE-T*S properties (1000 each)\n")
-              f.write("- RC5: Tensor reshape roundtrip (1000 cases)\n")
-              f.write("- RC6a-d: Riemannian distance axioms (1000 each)\n")
-              f.write("- RC7: Checkpoint serialized size formula (1000 configs)\n")
-              f.write("- RC8a: Leapfrog drift < Euler drift (1000 cases, lr<0.5)\n")
-              f.write("- RC8b: Leapfrog drift < 1% for small lr (1000 cases, lr<0.1)\n")
-          PYEOF
-
-      - name: Upload RapidCheck results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rapidcheck-results
-          path: rc_output.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-    # ═══════════════════════════════════════════════════════════════
-  #  MULL MUTATION TESTING
-  #  Test suite ki weakness dhundta hai:
-  #    - src/VedicGEMM.cpp, src/Checkpoint.cpp
-  #    - include/Tensor.hpp, PhysicsOpt.hpp, LayerNorm.hpp, Attention.hpp
-  #  Target: Mutation score > 80% (90%+ excellent)
-  #  Runtime: ~10-20 min (sabhi mutants × dono test binaries)
-  #  Non-blocking: continue-on-error: true (CI block nahi karta)
-  # ═══════════════════════════════════════════════════════════════
-  mutation-tests:
-    name: "MULL Mutation Tests (T6)"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    continue-on-error: true # mutation score gap se CI block nahi hoga
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install gcc-12, clang-15, LLVM-15, and MULL-15
-        id: mull_install
-        run: |
-          # ── gcc-12 PEHLE install karo ────────────────────────────
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 cmake ninja-build
-
-          # ── clang-15 + llvm-15 (LLVM apt repo se) ──────────────
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
-            sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] \
-            http://apt.llvm.org/jammy/ llvm-toolchain-jammy-15 main" | \
-            sudo tee /etc/apt/sources.list.d/llvm.list
-
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            clang-15 llvm-15
-
-          # ── MULL-15: GitHub Releases se direct download ─────────
-          # Cloudsmith repo (paid) ki zarurat nahi — GitHub Releases free hai
-          MULL_DEB_URL="https://github.com/mull-project/mull/releases/download/0.34.2/Mull-15-0.34.2-LLVM-15.0.7-ubuntu-amd64-22.04.deb"
-          wget -q "$MULL_DEB_URL" -O /tmp/mull-15.deb || \
-            wget -q "https://github.com/mull-project/mull/releases/download/0.34.1/Mull-15-0.34.1-LLVM-15.0.7-ubuntu-amd64-22.04.deb" \
-              -O /tmp/mull-15.deb
-          if [ -f /tmp/mull-15.deb ] && [ -s /tmp/mull-15.deb ]; then
-            sudo dpkg -i /tmp/mull-15.deb || sudo apt-get install -f -y
-            echo "✅ MULL installed from GitHub Releases"
-          else
-            echo "⚠️  MULL deb not available — mutation tests will be skipped"
-          fi
-
-          # symlinks — CMake find_program aur clang++ ko path milega
-          sudo ln -sf /usr/bin/clang-15    /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-15  /usr/local/bin/clang++
-          MULL_BIN=$(find /usr/bin /usr/local/bin -name "mull-runner*" 2>/dev/null | head -1)
-          if [ -n "$MULL_BIN" ]; then
-            sudo ln -sf "$MULL_BIN" /usr/local/bin/mull-runner
-            echo "✅ mull-runner → $MULL_BIN"
-          else
-            echo "⚠️  mull-runner not found after install"
-          fi
-
-          # verify
-          echo "GCC-12 crtbeginS.o: $(g++-12 -print-file-name=crtbeginS.o)"
-          clang++ --version | head -1
-          mull-runner --version 2>&1 | head -1 || echo "mull-runner not available"
-          if mull-runner --version >/dev/null 2>&1 && command -v llvm-profdata-15 >/dev/null; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
-
-      - name: Configure (MULL + Debug + clang++ + GCC-12 sysroot)
-        if: steps.mull_install.outputs.available == 'true'
-        run: |
-          GCC12_PREFIX=/usr
-          echo "GCC-12 prefix: ${GCC12_PREFIX}"
-          ls /usr/bin/g++-12
-          ls /usr/lib/gcc/x86_64-linux-gnu/12/crtbeginS.o
-
-          # mull-15 IR frontend plugin — mutations inject karne ke liye ZARURI hai
-          # Without this: "No mutants found. Mutation score: infinitely high"
-          # Plugin path verified from mull docs + mull-15 package contents
-          MULL_PLUGIN=""
-          for p in \
-            /usr/lib/mull-ir-frontend-15 \
-            /usr/lib/mull-ir-frontend-15.so \
-            /usr/lib/x86_64-linux-gnu/mull-ir-frontend-15 \
-            /usr/local/lib/mull-ir-frontend-15 \
-            /usr/lib/llvm-15/lib/mull-ir-frontend-15.so; do
-            if [ -f "$p" ]; then MULL_PLUGIN="$p"; break; fi
-          done
-          # dpkg fallback
-          if [ -z "$MULL_PLUGIN" ]; then
-            MULL_PLUGIN=$(dpkg -L mull-15 2>/dev/null | grep -E "mull-ir-frontend" | head -1)
-          fi
-          echo "MULL plugin: '${MULL_PLUGIN:-NOT FOUND}'"
-          ls -la "$MULL_PLUGIN" 2>/dev/null || echo "Plugin file not found at above path"
-
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DLOGOS_MUTATION_TEST=ON \
-            -DCMAKE_CXX_FLAGS="--gcc-toolchain=${GCC12_PREFIX}" \
-            -DMULL_PASS_PLUGIN="${MULL_PLUGIN}"
-
-      - name: Build mutation targets
-        if: steps.mull_install.outputs.available == 'true'
-        run: |
-          cmake --build build \
-            --target mull_math_unit mull_checkpoint \
-            --parallel $(nproc)
-
-      - name: Check mull-runner version + output format
-        if: steps.mull_install.outputs.available == 'true'
-        run: |
-          echo "=== mull-runner version ==="
-          mull-runner --version 2>&1 || mull-runner -version 2>&1 || true
-          echo "=== mull-runner help (first 20 lines) ==="
-          mull-runner --help 2>&1 | head -20 || true
-
-      - name: Diagnose mull-runner + binaries
-        if: steps.mull_install.outputs.available == 'true'
-        run: |
-          echo "=== mull-runner full path ==="
-          which mull-runner || echo "NOT IN PATH"
-          ls -la /usr/local/bin/mull-runner || true
-          ls -la /usr/bin/mull-runner-15 || true
-
-          echo "=== Built binaries ==="
-          ls -la build/mull_math_unit build/mull_checkpoint 2>&1 || echo "BINARIES NOT FOUND"
-
-          echo "=== Binary execute test ==="
-          ./build/mull_math_unit 2>&1 | head -5 || echo "Binary execute failed with $?"
-          ./build/mull_checkpoint 2>&1 | head -5 || echo "Binary execute failed with $?"
-
-          echo "=== mull-runner full --help ==="
-          mull-runner --help 2>&1 || true
-
-          echo "=== runner-discovered MULL config files ==="
-          cat build/mull-report/math-run/mull.yml 2>&1 || echo "math mull.yml not found"
-          cat build/mull-report/checkpoint-run/mull.yml 2>&1 || echo "checkpoint mull.yml not found"
-
-      - name: Run MULL — test_math_unit (M1-M16)
-        id: mull_math
-        if: steps.mull_install.outputs.available == 'true'
-        continue-on-error: true
-        run: |
-          mkdir -p build/mull-report/math build/mull-report/math-run
-
-          echo "--- Collecting LLVM coverage for math tests ---"
-          LLVM_PROFILE_FILE="$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profraw" \
-            "$GITHUB_WORKSPACE/build/mull_math_unit" > /dev/null
-          llvm-profdata-15 merge -sparse \
-            "$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profraw" \
-            -o "$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profdata"
-
-          echo "--- Running mull-runner on mull_math_unit ---"
-          (
-            cd build/mull-report/math-run
-            mull-runner \
-            --workers 2 \
-            --timeout 30000 \
-            --report-dir "$GITHUB_WORKSPACE/build/mull-report/math" \
-            --coverage-info "$GITHUB_WORKSPACE/build/mull-report/math-run/coverage.profdata" \
-            --ld-search-path "$GITHUB_WORKSPACE/build" \
-            "$GITHUB_WORKSPACE/build/mull_math_unit" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build/mull-report/math/runner.log"
-          ) || true
-
-          LOG=build/mull-report/math/runner.log
-
-          echo "════ FULL MULL OUTPUT (math) ════"
-          cat "$LOG"
-          echo "════ END MULL OUTPUT (math) ════"
-
-          # Format 1: "Mutation score: 85.71%"
-          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
-
-          # "infinitely high" = 0 mutants found = instrumentation missing
-          if [ -z "$SCORE" ] && grep -q "infinitely high" "$LOG" 2>/dev/null; then
-            echo "❌ No mutants found — check compile flags"
-            SCORE="N/A"
-          fi
-
-          # Format 2: "Killed: 12 out of 14"
-          if [ -z "$SCORE" ]; then
-            KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-              SCORE=$(python3 -c "print(f'{100*int(\"$KILLED\")/int(\"$TOTAL\"):.1f}')")
-            fi
-          fi
-
-          # Format 3: "Killed mutants: 12 / 14"
-          if [ -z "$SCORE" ]; then
-            KILLED=$(grep -oP '[Kk]illed mutants?:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            TOTAL=$(grep -oP '[Kk]illed mutants?:\s*\d+\s*/\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-              SCORE=$(python3 -c "print(f'{100*int(\"$KILLED\")/int(\"$TOTAL\"):.1f}')")
-            fi
-          fi
-
-          # Format 4: any percentage in log
-          if [ -z "$SCORE" ]; then
-            SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
-          fi
-
-          echo "Parsed math score: '${SCORE:-NOT_FOUND}'"
-          echo "score=${SCORE:-N/A}" >> $GITHUB_OUTPUT
-
-      - name: Run MULL — test_checkpoint (T2b)
-        id: mull_ckpt
-        if: steps.mull_install.outputs.available == 'true'
-        continue-on-error: true
-        run: |
-          mkdir -p build/mull-report/checkpoint build/mull-report/checkpoint-run
-
-          echo "--- Collecting LLVM coverage for checkpoint tests ---"
-          LLVM_PROFILE_FILE="$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profraw" \
-            "$GITHUB_WORKSPACE/build/mull_checkpoint" > /dev/null
-          llvm-profdata-15 merge -sparse \
-            "$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profraw" \
-            -o "$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profdata"
-
-          echo "--- Running mull-runner on mull_checkpoint ---"
-          (
-            cd build/mull-report/checkpoint-run
-            mull-runner \
-            --workers 2 \
-            --timeout 30000 \
-            --report-dir "$GITHUB_WORKSPACE/build/mull-report/checkpoint" \
-            --coverage-info "$GITHUB_WORKSPACE/build/mull-report/checkpoint-run/coverage.profdata" \
-            --ld-search-path "$GITHUB_WORKSPACE/build" \
-            "$GITHUB_WORKSPACE/build/mull_checkpoint" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build/mull-report/checkpoint/runner.log"
-          ) || true
-
-          LOG=build/mull-report/checkpoint/runner.log
-
-          echo "════ FULL MULL OUTPUT (checkpoint) ════"
-          cat "$LOG"
-          echo "════ END MULL OUTPUT (checkpoint) ════"
-
-          SCORE=$(grep -oP 'Mutation score: \K[\d.]+' "$LOG" 2>/dev/null | tail -1)
-          if [ -z "$SCORE" ] && grep -q "infinitely high" "$LOG" 2>/dev/null; then
-            SCORE="N/A"
-          fi
-          if [ -z "$SCORE" ]; then
-            KILLED=$(grep -oP 'Killed:\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            TOTAL=$(grep -oP 'out of\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
-            if [ -n "$KILLED" ] && [ -n "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-              SCORE=$(python3 -c "print(f'{100*int(\"$KILLED\")/int(\"$TOTAL\"):.1f}')")
-            fi
-          fi
-          if [ -z "$SCORE" ]; then
-            SCORE=$(grep -oP '\b\d+\.?\d*(?=%)' "$LOG" 2>/dev/null | tail -1)
-          fi
-
-          echo "Parsed checkpoint score: '${SCORE:-NOT_FOUND}'"
-          echo "score=${SCORE:-N/A}" >> $GITHUB_OUTPUT
-          echo "--- Last 30 lines ---"
-          tail -30 "$LOG"
-
-      - name: Mutation Score Summary
-        if: always()
-        run: |
-          MATH_SCORE="${{ steps.mull_math.outputs.score }}"
-          CKPT_SCORE="${{ steps.mull_ckpt.outputs.score }}"
-          MATH_SCORE="${MATH_SCORE:-N/A}"
-          CKPT_SCORE="${CKPT_SCORE:-N/A}"
-          echo "════════════════════════════════════════════════════"
-          echo "  LOGOS MULL Mutation Testing Results"
-          echo "════════════════════════════════════════════════════"
-          echo "  test_math_unit   (M1-M16) : ${MATH_SCORE}%"
-          echo "  test_checkpoint  (T2b)    : ${CKPT_SCORE}%"
-          echo "════════════════════════════════════════════════════"
-          python3 - "$MATH_SCORE" "$CKPT_SCORE" <<'PYEOF'
-          import sys, os
-          math_s = sys.argv[1] if len(sys.argv) > 1 else "N/A"
-          ckpt_s = sys.argv[2] if len(sys.argv) > 2 else "N/A"
-          scores = []
-          for s in [math_s, ckpt_s]:
-              try: scores.append(float(s))
-              except: pass
-          avg = sum(scores)/len(scores) if scores else None
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stderr")
-          with open(summary_path, "a") as f:
-              f.write("## 🧬 MULL Mutation Testing — T6\n\n")
-              f.write("| Target | Score |\n|--------|-------|\n")
-              def grade(v):
-                  if v is None: return "N/A", "⚠️"
-                  if v >= 90:   return f"{v:.1f}%", "🏆"
-                  if v >= 80:   return f"{v:.1f}%", "✅"
-                  if v >= 60:   return f"{v:.1f}%", "⚠️"
-                  return f"{v:.1f}%", "❌"
-              try: ms = float(math_s)
-              except: ms = None
-              try: cs = float(ckpt_s)
-              except: cs = None
-              mv, mg = grade(ms); cv, cg = grade(cs)
-              f.write(f"| `mull_math_unit`   | {mg} {mv} |\n")
-              f.write(f"| `mull_checkpoint`  | {cg} {cv} |\n")
-              if avg is not None:
-                  av, ag = grade(avg)
-                  f.write(f"| **Average** | **{ag} {av}** |\n")
-              f.write("\n> See `mull-reports` artifact for HTML report\n")
-
-          if avg is None:
-              print("⚠️  Score N/A — mull runner full output upar dekho (FULL MULL OUTPUT section)")
-              print("   Next CI run mein format clear ho jaayega")
-              sys.exit(0)  # non-blocking jab tak format confirm na ho
-          elif avg < 60:
-              print(f"❌ Poor: {avg:.1f}% (target ≥ 75%)")
-          elif avg < 75:
-              print(f"⚠️  Improving: {avg:.1f}% (target ≥ 75% — add M22-M28 test calls)")
-          elif avg < 80:
-              print(f"✅ Target met: {avg:.1f}% ≥ 75% (excellent ≥ 80%)")
-          else:
-              print(f"✅ Excellent: {avg:.1f}%")
-          PYEOF
-
-      - name: Upload MULL reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mull-reports
-          path: build/mull-report/
-          if-no-files-found: warn
-          retention-days: 14
-
-  # ═══════════════════════════════════════════════════════════════
-  #  KAGGLE GPU TRIGGER
-  #  Async: Kaggle notebook push (GPU training) — non-blocking
-  #  Requires secrets:
-  #    KAGGLE_USERNAME  — Kaggle account username
-  #    KAGGLE_KEY       — Kaggle API key (Settings → API → Create New Token)
-  #  kernel-metadata.json must exist at repo root with kernel slug.
-  #
-  #  Kya karta hai:
-  #    1. kaggle CLI install karo
-  #    2. API credentials configure karo (~/.kaggle/kaggle.json)
-  #    3. kaggle_gpu_train.ipynb ko Kaggle pe push karo
-  #       (kaggle kernels push — kernel-metadata.json se slug leta hai)
-  #    4. Push hone ke baad status check karta hai (async)
-  #
-  #  main branch push par hi chalega (dev pe nahi) — GPU waste bachao.
-  #  Non-blocking: continue-on-error: true
-  # ═══════════════════════════════════════════════════════════════
-  kaggle-gpu-trigger:
-    name: "Kaggle GPU Notebook Push (async)"
-    runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    continue-on-error: true
-    concurrency:
-      group: kaggle-${{ github.repository }}-logos-gpu-training-v3
-      cancel-in-progress: false
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install kaggle CLI
-        run: pip install --quiet kaggle
-
-      - name: Configure Kaggle credentials
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-        run: |
-          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
-            echo "❌ KAGGLE_USERNAME ya KAGGLE_KEY secret missing hai"
-            exit 1
-          fi
-
-          # Debug: secret values ki length check karo (value print nahi, sirf length)
-          echo "KAGGLE_USERNAME length: ${#KAGGLE_USERNAME}"
-          echo "KAGGLE_KEY length:      ${#KAGGLE_KEY}"
-          echo "KAGGLE_USERNAME first3: ${KAGGLE_USERNAME:0:3}***"
-          echo "KAGGLE_KEY first4:      ${KAGGLE_KEY:0:4}****"
-
-          mkdir -p ~/.kaggle
-
-          # Method 1: printf (clean, no whitespace)
-          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" \
-            > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
-          echo "=== kaggle.json raw bytes ==="
-          xxd ~/.kaggle/kaggle.json | head -5
-          echo "=== kaggle.json content ==="
-          cat ~/.kaggle/kaggle.json
-
-          echo "=== kaggle CLI version ==="
-          kaggle --version
-
-          echo "=== kaggle config view ==="
-          kaggle config view 2>&1 || true
-
-          echo "=== Direct API test (whoami) ==="
-          python3 - << 'PYEOF'
-          import urllib.request, urllib.error, base64, os, json
-          u = os.environ["KAGGLE_USERNAME"]
-          k = os.environ["KAGGLE_KEY"]
-          cred = base64.b64encode(f"{u}:{k}".encode()).decode()
-          req = urllib.request.Request(
-              "https://www.kaggle.com/api/v1/kernels",
-              headers={"Authorization": f"Basic {cred}"}
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=15) as r:
-                  print(f"✅ API OK — HTTP {r.status}")
-          except urllib.error.HTTPError as e:
-              body = e.read().decode()[:300]
-              print(f"❌ API {e.code}: {body}")
-          except Exception as ex:
-              print(f"❌ {ex}")
-          PYEOF
-          echo "✅ Kaggle credentials configured"
-
-      - name: Verify kernel-metadata.json
-        run: |
-          if [ ! -f kernel-metadata.json ]; then
-            echo "❌ kernel-metadata.json root mein nahi mila"
-            echo "   Example content:"
-            cat << 'EOF'
-          {
-            "id": "YOUR_USERNAME/logos-gpu-training",
-            "title": "LOGOS GPU Training",
-            "code_file": "kaggle_gpu_train.ipynb",
-            "language": "python",
-            "kernel_type": "notebook",
-            "is_private": true,
-            "enable_gpu": true,
-            "enable_internet": true
-          }
-          EOF
-            exit 1
-          fi
-
-          echo "✅ kernel-metadata.json found:"
-          cat kernel-metadata.json
-
-          # Notebook exist check
-          NOTEBOOK=$(python3 -c "import json; d=json.load(open('kernel-metadata.json')); print(d.get('code_file','kaggle_gpu_train.ipynb'))")
-          if [ ! -f "$NOTEBOOK" ]; then
-            echo "❌ Notebook nahi mila: $NOTEBOOK"
-            exit 1
-          fi
-          echo "✅ Notebook found: $NOTEBOOK"
-
-      - name: Push notebook to Kaggle
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-        run: |
-          KERNEL_SLUG=$(python3 -c "import json; print(json.load(open('kernel-metadata.json'))['id'])")
-          KERNEL_OWNER=$(echo "$KERNEL_SLUG" | cut -d'/' -f1)
-          KERNEL_NAME=$(echo "$KERNEL_SLUG"  | cut -d'/' -f2)
-          : > push_output.txt
-
-          echo "📤 Kaggle pe notebook push ho rahi hai..." | tee -a push_output.txt
-
-          # ── v31: ROOT CAUSE FIX ─────────────────────────────────────────────────
-          # 409 Conflict ka REAL reason:
-          #   Kaggle kernel "id_no" (version counter) track karta hai.
-          #   Agar locally metadata.json mein id_no missing ya stale hai,
-          #   Kaggle sochta hai "yeh version already exist karta hai" → 409.
-          #   Fix: API se current version number fetch karo, +1 karke inject karo.
-          #
-          # Agar kernel exist hi nahi (fresh/new) → API 404 deta hai → id_no=1 use karo.
-          # Agar API unreachable → id_no inject mat karo, content-hash change kaafi hai.
-          # ────────────────────────────────────────────────────────────────────────
-
-          # Step 1: Kaggle API se current version number fetch karo
-          echo "🔍 Fetching current kernel version from Kaggle API..." | tee -a push_output.txt
-          NEXT_VERSION=$(python3 - << PYEOF_VER
-          import urllib.request, urllib.error, base64, json, os, sys
-          username = os.environ.get("KAGGLE_USERNAME", "")
-          key      = os.environ.get("KAGGLE_KEY", "")
-          owner    = "$KERNEL_OWNER"
-          slug     = "$KERNEL_NAME"
-
-          cred = base64.b64encode(f"{username}:{key}".encode()).decode()
-          url  = f"https://www.kaggle.com/api/v1/kernels/{owner}/{slug}"
-          req  = urllib.request.Request(url, headers={"Authorization": f"Basic {cred}"})
-          try:
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  data = json.loads(r.read())
-                  # currentRunningVersion.versionNumber OR top-level versionNumber
-                  ver = None
-                  if isinstance(data.get("currentRunningVersion"), dict):
-                      ver = data["currentRunningVersion"].get("versionNumber")
-                  if ver is None:
-                      ver = data.get("currentRunningVersion") if isinstance(data.get("currentRunningVersion"), int) else None
-                  if ver is None:
-                      ver = data.get("versionNumber", 0)
-                  # Status bhi print karo (stderr pe) — debugging ke liye
-                  status = ""
-                  if isinstance(data.get("currentRunningVersion"), dict):
-                      status = str(data["currentRunningVersion"].get("status", ""))
-                  elif "status" in data:
-                      status = str(data["status"])
-                  numeric_map = {"0":"running","1":"queued","2":"complete","3":"error","4":"cancelled","5":"cancelling"}
-                  status_str = numeric_map.get(status, status.lower() if status else "unknown")
-                  print(f"STATUS:{status_str}", file=sys.stderr)
-                  print(int(ver) + 1)   # next version = current + 1
-          except urllib.error.HTTPError as e:
-              if e.code in (404, 403):
-                  # Kernel nahi bana abhi tak — pehli push, version 1 se start
-                  print("STATUS:new_kernel", file=sys.stderr)
-                  print(1)
-              else:
-                  print(f"STATUS:http_{e.code}", file=sys.stderr)
-                  print(0)   # 0 = inject mat karo
-          except Exception as e:
-              print(f"STATUS:error_{str(e)[:40]}", file=sys.stderr)
-              print(0)
-          PYEOF_VER
-          )
-          echo "  Next version will be: ${NEXT_VERSION}" | tee -a push_output.txt
-
-          # Step 2: kernel-metadata.json mein id_no inject karo (agar valid version mila)
-          if [ "$NEXT_VERSION" -gt 0 ] 2>/dev/null; then
-            python3 - "$NEXT_VERSION" << 'PYEOF_META'
-          import json, sys
-          ver = int(sys.argv[1])
-          meta = json.load(open("kernel-metadata.json"))
-          meta["id_no"] = ver
-          json.dump(meta, open("kernel-metadata.json", "w"), indent=2)
-          print(f"✅ kernel-metadata.json: id_no set to {ver}")
-          PYEOF_META
-            echo "  metadata.json id_no → ${NEXT_VERSION}" | tee -a push_output.txt
-          else
-            echo "  ⚠️  Version fetch failed — pushing without id_no (content-hash change only)" | tee -a push_output.txt
-          fi
-
-          # Step 3: Unique run-id inject karo notebook mein (content hash guarantee)
-          RUN_ID="ci-run-$(date -u +%Y%m%dT%H%M%S)-${{ github.sha }}"
-          python3 - "$RUN_ID" << 'PYEOF_NB'
-          import json, sys
-          run_id = sys.argv[1]
-          nb = json.load(open("kaggle_gpu_train.ipynb"))
-          injected = False
-          for cell in nb["cells"]:
-              if cell["cell_type"] == "markdown":
-                  src = cell["source"]
-                  lines = src if isinstance(src, list) else src.splitlines(keepends=True)
-                  lines = [l for l in lines if not l.strip().startswith("<!-- run-id:")]
-                  insert_pos = 1 if len(lines) >= 1 else 0
-                  lines.insert(insert_pos, f"<!-- run-id: {run_id} -->\n")
-                  cell["source"] = lines
-                  injected = True
-                  break
-          if not injected:
-              nb["cells"].insert(0, {
-                  "cell_type": "markdown",
-                  "metadata": {},
-                  "source": [f"<!-- run-id: {run_id} -->\n"]
-              })
-          json.dump(nb, open("kaggle_gpu_train.ipynb", "w"), indent=1)
-          print(f"✅ Injected run-id: {run_id}")
-          PYEOF_NB
-          echo "  Run-id injected: $RUN_ID" | tee -a push_output.txt
-
-          # Step 4: Push — agar 409 aaya toh version +1 karke retry
-          for attempt in 1 2 3; do
-            echo "Push attempt ${attempt}/3..." | tee -a push_output.txt
-            set +e
-            kaggle kernels push -p . 2>&1 | tee push_attempt.txt
-            PUSH_EXIT=${PIPESTATUS[0]}
-            set -e
-            cat push_attempt.txt >> push_output.txt
-
-            if [ "$PUSH_EXIT" -eq 0 ]; then
-              echo "✅ Notebook successfully pushed to Kaggle (version ${NEXT_VERSION})" | tee -a push_output.txt
-              exit 0
-            fi
-
-            if grep -Eqi '409|conflict' push_attempt.txt; then
-              if [ "$attempt" -eq 3 ]; then
-                echo "❌ Kaggle push 3 attempts ke baad bhi 409 de raha hai." | tee -a push_output.txt
-                echo "   ➡️  MANUAL FIX: https://www.kaggle.com/code/${KERNEL_SLUG}" | tee -a push_output.txt
-                echo "       Kaggle pe jaao → agar kernel RUNNING hai → Stop karo → 10 min baad CI re-run karo" | tee -a push_output.txt
-                exit 0  # Non-blocking
-              fi
-              # Version bump karke retry
-              NEXT_VERSION=$((NEXT_VERSION + 1))
-              python3 - "$NEXT_VERSION" << 'PYEOF_BUMP'
-          import json, sys
-          ver = int(sys.argv[1])
-          meta = json.load(open("kernel-metadata.json"))
-          meta["id_no"] = ver
-          json.dump(meta, open("kernel-metadata.json", "w"), indent=2)
-          print(f"✅ Bumped id_no to {ver} for retry")
-          PYEOF_BUMP
-              # Fresh run-id bhi inject karo
-              NEW_RUN_ID="ci-run-$(date -u +%Y%m%dT%H%M%S)-${{ github.sha }}-r${attempt}"
-              python3 - "$NEW_RUN_ID" << 'PYEOF_RETRY'
-          import json, sys
-          run_id = sys.argv[1]
-          nb = json.load(open("kaggle_gpu_train.ipynb"))
-          for cell in nb["cells"]:
-              if cell["cell_type"] == "markdown":
-                  src = cell["source"]
-                  lines = src if isinstance(src, list) else src.splitlines(keepends=True)
-                  lines = [l for l in lines if not l.strip().startswith("<!-- run-id:")]
-                  lines.insert(1 if len(lines) >= 1 else 0, f"<!-- run-id: {run_id} -->\n")
-                  cell["source"] = lines
-                  break
-          json.dump(nb, open("kaggle_gpu_train.ipynb", "w"), indent=1)
-          print(f"✅ Re-injected run-id: {run_id}")
-          PYEOF_RETRY
-              RETRY_DELAY=$((attempt * 30))
-              echo "⚠️  409 — bumped id_no to ${NEXT_VERSION}, retrying in ${RETRY_DELAY}s..." | tee -a push_output.txt
-              sleep "$RETRY_DELAY"
-            if grep -Eqi '403|401' push_attempt.txt; then
-              echo "❌ Auth error (403/401) on push attempt ${attempt}." | tee -a push_output.txt
-              echo "   Full error:" | tee -a push_output.txt
-              cat push_attempt.txt | tee -a push_output.txt
-              if [ "$attempt" -eq 3 ]; then
-                echo "   Check: KAGGLE_KEY GitHub secret mein valid API key hai?" | tee -a push_output.txt
-                echo "   Regenerate: kaggle.com → Settings → API → Expire API Token → Create New" | tee -a push_output.txt
-                exit 0  # Non-blocking — auth issue CI block nahi karega
-              fi
-              sleep 10
-            else
-              echo "❌ Unexpected error (exit $PUSH_EXIT)" | tee -a push_output.txt
-              exit "$PUSH_EXIT"
-            fi
-          done
-
-      - name: Check push status (async poll)
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-        run: |
-          # kernel slug extract karo
-          KERNEL_SLUG=$(python3 -c "
-          import json
-          d = json.load(open('kernel-metadata.json'))
-          kernel_id = d.get('id', '')
-          # Format: 'username/slug' — full slug as-is
-          print(kernel_id)
-          ")
-
-          if [ -z "$KERNEL_SLUG" ]; then
-            echo "⚠️  kernel slug nahi mila kernel-metadata.json se"
-            exit 0
-          fi
-
-          echo "Kernel slug: $KERNEL_SLUG"
-          echo "30 second wait — Kaggle queue mein aane do..."
-          sleep 30
-
-          # Status check (non-blocking — just info)
-          echo "=== Kernel Status ==="
-          kaggle kernels status "$KERNEL_SLUG" 2>&1 || \
-            echo "⚠️  Status check failed — kernel shayad queue mein hai"
-
-          echo ""
-          echo "📊 Training status Kaggle pe dekho:"
-          echo "   https://www.kaggle.com/code/${KERNEL_SLUG}"
-
-      - name: Upload push log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kaggle-push-log
-          path: push_output.txt
-          if-no-files-found: ignore
-          retention-days: 3
-
-  # ═══════════════════════════════════════════════════════════════
-  #  SUMMARY GATE
-  # ═══════════════════════════════════════════════════════════════
+  # (kaggle-gpu-trigger job removed: notebook ab manually Kaggle par upload hota hai)
   summary:
     name: "CI Summary"
     runs-on: ubuntu-22.04
@@ -1376,119 +449,42 @@ jobs:
       - cpu-tests-windows
       - cpu-tests-macos
       - gpu-tests
-      - bench-tests
-      - fuzz-tests
-      - linux-build
-      - windows-build
-      - macos-build
-      - rapidcheck-tests
-      - mutation-tests
-      - kaggle-gpu-trigger
+      - tsan-linux
+      - qa-matrix
+      - gpu-compile-check
     if: always()
     steps:
-      - name: Print results + gate
+      - name: Print results and gate
         env:
           R_CPU_LX: ${{ needs.cpu-tests-linux.result }}
           R_SANITIZER: ${{ needs.sanitizer-tests-linux.result }}
           R_CPU_WIN: ${{ needs.cpu-tests-windows.result }}
           R_CPU_MAC: ${{ needs.cpu-tests-macos.result }}
           R_GPU: ${{ needs.gpu-tests.result }}
-          R_BENCH: ${{ needs.bench-tests.result }}
-          R_FUZZ: ${{ needs.fuzz-tests.result }}
-          R_LX_BLD: ${{ needs.linux-build.result }}
-          R_WIN_BLD: ${{ needs.windows-build.result }}
-          R_MAC_BLD: ${{ needs.macos-build.result }}
-          R_MULL: ${{ needs.mutation-tests.result }}
-          R_RC: ${{ needs.rapidcheck-tests.result }}
-          R_KAGGLE: ${{ needs.kaggle-gpu-trigger.result }}
+          R_TSAN: ${{ needs.tsan-linux.result }}
+          R_QA: ${{ needs.qa-matrix.result }}
+          R_COMPILE: ${{ needs.gpu-compile-check.result }}
         run: |
-          echo "════════════════════════════════════════════════════"
-          echo "  LOGOS CI Summary — v34-BenchFuzz"
-          echo "════════════════════════════════════════════════════"
-          echo ""
-          echo "  ── Stage 1 (Parallel) ──────────────────────────"
-          echo "  CPU Tests Linux:      $R_CPU_LX"
-          echo "  CPU Tests Windows:    $R_CPU_WIN"
-          echo "  CPU Tests macOS:      $R_CPU_MAC"
-          echo "  GPU Tests (ctest):    $R_GPU"
-          echo ""
-          echo "  ── Stage 2 (needs Stage 1) ──────────────────────"
-          echo "  ASan + UBSan Linux:   $R_SANITIZER"
-          echo "  Benchmark Tests T8:   $R_BENCH"
-          echo "  Fuzz Tests T9:        $R_FUZZ"
-          echo "  RapidCheck Tests T7:  $R_RC (non-blocking)"
-          echo "  MULL Mutation T6:     $R_MULL (non-blocking)"
-          echo "  Linux Build + E2E:    $R_LX_BLD"
-          echo "  Windows Build:        $R_WIN_BLD"
-          echo "  macOS Build:          $R_MAC_BLD"
-          echo "  Kaggle GPU Trigger:   $R_KAGGLE (non-blocking, main only)"
-          echo ""
-          echo "  ── Stage 3 (this job) ───────────────────────────"
-          echo "  Summary Gate:         running"
-          echo ""
-          echo "  CTest coverage:"
-          echo "    T2  Math Unit (CPU)"
-          echo "    T2b Checkpoint roundtrip (CPU)"
-          echo "    T4  Large Data Scale (CPU — all 3 platforms)"
-          echo "    T1  Syntax Build  (GPU)"
-          echo "    T3  Memory Stress (GPU)"
-          echo "    T5  CUDA Kernels  (GPU)"
-          echo "    T6  MULL Mutation (Linux, non-blocking)"
-          echo "    T7  RapidCheck C++ property tests (Linux, non-blocking)"
-          echo "    T8  Benchmark Suite logos_bench (Linux, blocking)"
-          echo "    T9  Fuzz selftest + LibFuzzer 60s (Linux)"
-          echo ""
-          echo "  Sanitizer layers:"
-          echo "    ASan+UBSan  → CPU test bugs (LOGOS_SANITIZE=ON)"
-          echo "    compute-san → GPU memory errors (LOGOS_USE_COMPUTE_SANITIZER=ON)"
-          echo "    LibFuzzer   → crash discovery  (LOGOS_FUZZ=ON, clang++)"
-          echo "    MULL        → Test suite weakness (LOGOS_MUTATION_TEST=ON)"
-          echo ""
-          echo "════════════════════════════════════════════════════"
-          echo ""
-          echo "  Changes in v34 (BenchFuzz):"
-          echo "    ✅ bench.cpp: #pragma once bug fixed (was header guard, now main file)"
-          echo "    ✅ tests/test_fuzz.cpp: 13-target LibFuzzer harness added"
-          echo "       Targets: vedic_gemm, gemm_bias, tensor_ops, layer_norm,"
-          echo "                reynolds_bn, softmax, causal_mask, attention_head,"
-          echo "                feedforward, gelu, gradient_clip, langevin_opt, tokenizer"
-          echo "    ✅ CMakeLists.txt: logos_bench + logos_fuzz_selftest + logos_fuzz targets"
-          echo "       T8_Bench_Smoke: blocking, threshold violations = exit 1"
-          echo "       T9_Fuzz_Selftest: blocking selftest (13 targets)"
-          echo "       T9_Fuzz_LibFuzzer_30s: non-blocking, 30s LibFuzzer run"
-          echo "    ✅ CI: bench-tests job (needs cpu-tests-linux, blocking)"
-          echo "    ✅ CI: fuzz-tests job (needs cpu-tests-linux, selftest blocking)"
-          echo "    ✅ CI: summary job updated with bench + fuzz results"
-          echo "    ✅ Pipeline sequence documented: Stage 1 → Stage 2 → Stage 3"
-          echo ""
-          echo "════════════════════════════════════════════════════"
+          echo "Checkpoint Linux:   $R_CPU_LX"
+          echo "Checkpoint Windows: $R_CPU_WIN"
+          echo "Checkpoint macOS:   $R_CPU_MAC"
+          echo "ASan + UBSan:       $R_SANITIZER"
+          echo "GPU Tests:          $R_GPU"
+          echo "TSan:                $R_TSAN"
+          echo "Fuzz+Bench+Mutation: $R_QA"
+          echo "GPU compile check:  $R_COMPILE"
 
           FAIL=false
-          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_CPU_WIN" "$R_CPU_MAC" \
-                   "$R_BENCH" "$R_FUZZ" \
-                   "$R_LX_BLD" "$R_WIN_BLD" "$R_MAC_BLD"; do
+          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_CPU_WIN" "$R_CPU_MAC" "$R_TSAN" "$R_QA" "$R_COMPILE"; do
             [ "$r" = "failure" ] && FAIL=true
           done
 
           if [ "$R_GPU" = "failure" ]; then
-            echo "⚠️  GPU tests failed (non-blocking if no CUDA runner)"
-          fi
-          if [ "$R_RC" = "failure" ]; then
-            echo "⚠️  RapidCheck C++ property tests failed (non-blocking — check rapidcheck-results artifact)"
-          fi
-          if [ "$R_MULL" = "failure" ]; then
-            echo "⚠️  MULL mutation tests failed (non-blocking — check mull-reports artifact)"
-          fi
-          if [ "$R_KAGGLE" = "failure" ]; then
-            echo "⚠️  Kaggle GPU push failed (non-blocking) — check kaggle-push-log artifact"
-          elif [ "$R_KAGGLE" = "skipped" ]; then
-            echo "ℹ️  Kaggle GPU push: skipped (sirf main branch push par chalta hai)"
-          else
-            echo "✅ Kaggle GPU push: $R_KAGGLE"
+            echo "GPU tests failed (non-blocking when no CUDA runner)"
           fi
 
           if [ "$FAIL" = "true" ]; then
-            echo "❌ FAILED — check individual job logs"
+            echo "FAILED - check individual job logs"
             exit 1
           fi
-          echo "✅ ALL CRITICAL TESTS PASSED"
+          echo "ALL CRITICAL TESTS PASSED"

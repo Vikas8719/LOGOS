@@ -1,5 +1,5 @@
 #pragma once
-#include "VedicGEMM.cuh"
+#include "CublasGemm.cuh"
 #include "../include/Model.hpp"
 #include <vector>
 
@@ -11,37 +11,10 @@ struct GPUBlock {
     GPUTensor ln2_gamma, ln2_beta;
 };
 
-struct NikhilamTensor {
-    int8_t* data  = nullptr;
-    float   scale = 1.0f;
-    int     size  = 0;
-
-    NikhilamTensor() = default;
-    NikhilamTensor(const NikhilamTensor&) = delete;
-    NikhilamTensor& operator=(const NikhilamTensor&) = delete;
-
-    NikhilamTensor(NikhilamTensor&& o) noexcept
-        : data(o.data), scale(o.scale), size(o.size)
-    { o.data = nullptr; o.size = 0; }
-
-    NikhilamTensor& operator=(NikhilamTensor&& o) noexcept {
-        if (this != &o) {
-            if (data) cudaFree(data);
-            data=o.data; scale=o.scale; size=o.size;
-            o.data=nullptr; o.size=0;
-        }
-        return *this;
-    }
-
-    ~NikhilamTensor() { if (data) { cudaFree(data); data=nullptr; } }
-    bool valid() const { return data != nullptr && size > 0; }
-};
-
 struct HeadCache {
     GPUTensor Q, K, V;
     GPUTensor attn_probs;
     GPUTensor head_out;
-    NikhilamTensor K_int8, V_int8;
     GPUTensor Q_adv;  
     GPUTensor V_s;    
 };
@@ -59,14 +32,10 @@ struct LayerCache {
 
 struct HyperConfig {
     float curvature = 1.0f;
-    bool  enabled   = true;
+    bool  enabled   = false;   // default OFF; LOGOS_HYPERBOLIC=1 se on (train + generate dono me same rakho)
 };
 
 struct GPUPhysicsConfig {
-    bool  nikhilam_kv     = true;
-    bool  shunyam         = true;
-    int   window          = 32;
-    int   stride          = 8;
     bool  navier_stokes   = true;
     float ns_eta          = 0.1f;
     float ns_nu           = 0.05f;
@@ -84,11 +53,6 @@ __global__ void langevin_step_kernel(float* weights, float* velocity, const floa
 __global__ void expmap0_kernel(float* X, int seq, int d, float curvature);
 __global__ void logmap0_kernel(float* X, int seq, int d, float curvature);
 __global__ void expmap0_bwd_kernel(const float* X_hyp, const float* dOut, float* dX, int seq, int d, float curvature);
-__global__ void nikhilam_quantize_kernel(const float* src, int8_t* dst, float scale, int size);
-__global__ void nikhilam_dequantize_kernel(const int8_t* src, float* dst, float scale, int size);
-__global__ void absmax_kernel(const float* data, float* out, int size);
-GPUTensor nikhilam_decompress(const NikhilamTensor& src, int rows, int cols);
-__global__ void shunyam_mask_kernel(float* scores, int seq, int window, int stride);
 __global__ void ns_advect_kernel(const float* Q, float* Qa, int seq, int d, float eta);
 __global__ void ns_advect_bwd_kernel(const float* dQa, float* dQ, int seq, int d, float eta);
 __global__ void ns_diffuse_kernel(const float* V, float* Vs, int seq, int d, float nu);
@@ -107,10 +71,12 @@ public:
     unsigned dropout_seed = 12345u;
 
     GPUTensor gpu_embedding, gpu_pos_embedding, gpu_lm_head;
+    GPUTensor ln_f_gamma, ln_f_beta;   // final LayerNorm (lm_head se pehle); all_parameters() ke END me
     std::vector<GPUBlock> gpu_blocks;
 
     int* d_token_ids = nullptr;
-    GPUTensor last_hidden;
+    GPUTensor last_hidden;   // final-LN output (lm_head ka input)
+    GPUTensor final_in;      // final LN se pehle ka residual stream (backward ke liye)
     GPUTensor X_euclidean;  
     std::vector<LayerCache> layer_cache;
 
@@ -129,5 +95,4 @@ public:
     void free_layer_cache();
     void apply_norm(const GPUTensor& X, const GPUTensor& gamma, const GPUTensor& beta, GPUTensor& Y, GPUTensor& W, int slot, int seq);
     void update_norm_stats();
-    void print_kvcache_stats(int seq, int num_steps) const;
 };

@@ -1,6 +1,6 @@
-#include "../cuda/VedicGEMM.cuh"
+#include "../cuda/CublasGemm.cuh"
 #include "../cuda/ModelGPU.cuh"
-#include "../cuda/MixedPrecision.cuh"   // [FIX] cast_fp32_to_fp16_kernel + scale_tensor — ModelGPU forward mein use hota hai
+#include "../cuda/MixedPrecision.cuh"
 #include "../include/Model.hpp"
 
 #include <cuda_runtime.h>
@@ -49,7 +49,7 @@ static bool gpu_tensor_finite(const GPUTensor& t) {
 
 static void test_s1_cpu_headers() {
     std::cout << "\n[S1] CPU Headers Compile Check\n";
-    TEST("VedicGEMM.cuh included",   true);
+    TEST("CublasGemm.cuh included",  true);
     TEST("ModelGPU.cuh included",    true);
     TEST("Model.hpp included",       true);
     TEST("cuda_runtime.h included",  true);
@@ -115,19 +115,10 @@ static void test_s4_gpu_tensor_raii() {
     TEST("After move: dst size == 256",     t2.size == 256);
 
     TEST("RAII cleanup (no explicit free needed)", true);
-
-    NikhilamTensor nt;
-    TEST("NikhilamTensor default: data==null", nt.data == nullptr);
-    TEST("NikhilamTensor default: size==0",    nt.size == 0);
 }
 
 static void test_s5_structs() {
     std::cout << "\n[S5] Struct Constructors\n";
-
-    VedicVerifyResult vr;
-    vr.checksum_C = 1.0f; vr.checksum_vedic = 1.0f;
-    vr.relative_error = 0.0f; vr.pass = true;
-    TEST("VedicVerifyResult constructible", vr.pass == true);
 
     FreeEnergyResult fe;
     fe.cross_entropy = 2.3f; fe.entropy = 0.5f;
@@ -136,7 +127,7 @@ static void test_s5_structs() {
 }
 
 static void test_s6_gemm() {
-    std::cout << "\n[S6] cuda_vedic_gemm\n";
+    std::cout << "\n[S6] cuda_gemm (cuBLAS)\n";
 
     int M=4, K=8, N=4;
     GPUTensor A = gpu_alloc(M, K);
@@ -145,7 +136,7 @@ static void test_s6_gemm() {
 
     fill_gpu(A, 1.0f);
     fill_gpu(B, 2.0f);
-    cuda_vedic_gemm(A, B, C);
+    cuda_gemm(A, B, C);
     cudaDeviceSynchronize();
 
     auto h = read_gpu(C);
@@ -163,7 +154,7 @@ static void test_s6_gemm() {
     for (int i = 0; i < 35; ++i) h_b2[i] = static_cast<float>((i % 7) - 3);
     h2d(A2, h_a2.data(), 15);
     h2d(B2, h_b2.data(), 35);
-    cuda_vedic_gemm(A2, B2, C2);
+    cuda_gemm(A2, B2, C2);
     d2h(h_c2.data(), C2, 21);
     float irregular_max_err = 0.f;
     for (int row = 0; row < 3; ++row) {
@@ -181,7 +172,7 @@ static void test_s6_gemm() {
     std::vector<float> h_bias(7);
     for (int col = 0; col < 7; ++col) h_bias[col] = 0.25f * col;
     h2d(bias, h_bias.data(), 7);
-    cuda_vedic_gemm_bias(A2, B2, bias, C2);
+    cuda_gemm_bias(A2, B2, bias, C2);
     d2h(h_c2.data(), C2, 21);
     float bias_max_err = 0.f;
     for (int row = 0; row < 3; ++row) {
@@ -194,9 +185,7 @@ static void test_s6_gemm() {
         }
     }
     TEST("GEMM bias: matches CPU reference", bias_max_err < 1e-4f);
-    std::cout << "    GEMM backend: "
-              << (cuda_vedic_gemm_uses_cublas() ? "cuBLAS" : "Vedic tiled fallback")
-              << "\n";
+    std::cout << "    GEMM backend: cuBLAS\n";
 }
 
 static void test_s7_softmax() {
@@ -360,76 +349,44 @@ static void test_s11_free_energy_loss() {
     cudaFree(d_logits); cudaFree(d_loss); cudaFree(d_grad); cudaFree(d_targets);
 }
 
-static void test_s12_vedic_verify() {
-    std::cout << "\n[S12] cuda_vedic_verify (Gunitasamuchayah)\n";
+static void test_s12_cublas_rm_transposes() {
+    std::cout << "\n[S12] cuda_gemm_rm (transpose combos vs CPU)\n";
 
-    int M=16, K=32, N=16;
-    GPUTensor A=gpu_alloc(M,K), B=gpu_alloc(K,N), C=gpu_alloc(M,N);
-    fill_gpu(A, 1.0f);
-    fill_gpu(B, 1.0f);
-    cuda_vedic_gemm(A, B, C);
-    cudaDeviceSynchronize();
+    const int M=6, N=5, K=7;
+    std::vector<float> a((size_t)M*K), b((size_t)K*N);
+    for (size_t i=0; i<a.size(); ++i) a[i] = (float)((int)(i%9) - 4) * 0.25f;
+    for (size_t i=0; i<b.size(); ++i) b[i] = (float)((int)(i%5) - 2) * 0.5f;
 
-    VedicVerifyResult vr = cuda_vedic_verify(A, B, C, 0.05f);
-    std::cout << "    checksum_C=" << vr.checksum_C
-              << " vedic=" << vr.checksum_vedic
-              << " err=" << vr.relative_error << "\n";
-    TEST("Gunitasamuchayah: PASS on correct GEMM", vr.pass);
-    TEST("Gunitasamuchayah: relative_error < 5%",  vr.relative_error < 0.05f);
-    TEST("Gunitasamuchayah: checksum_C finite",     std::isfinite(vr.checksum_C));
+    // CPU reference C = A·B  (row-major)
+    std::vector<float> ref((size_t)M*N, 0.f);
+    for (int i=0; i<M; ++i)
+        for (int j=0; j<N; ++j)
+            for (int k=0; k<K; ++k) ref[i*N+j] += a[i*K+k] * b[k*N+j];
 
-    GPUTensor C_bad = gpu_alloc(M, N);
-    fill_gpu(C_bad, 0.0f);  // all zeros — clearly wrong
-    VedicVerifyResult vr_bad = cuda_vedic_verify(A, B, C_bad, 0.05f);
-    TEST("Gunitasamuchayah: WARN on zeroed C",  !vr_bad.pass);
-}
+    // Transposed copies (row-major): At is K×M, Bt is N×K
+    std::vector<float> at((size_t)K*M), bt((size_t)N*K);
+    for (int i=0; i<M; ++i) for (int k=0; k<K; ++k) at[k*M+i] = a[i*K+k];
+    for (int k=0; k<K; ++k) for (int j=0; j<N; ++j) bt[j*K+k] = b[k*N+j];
 
-static void test_s13_nikhilam_quant() {
-    std::cout << "\n[S13] Nikhilam Quantization Round-trip\n";
+    GPUTensor dA = gpu_alloc(M,K), dB = gpu_alloc(K,N);
+    GPUTensor dAt = gpu_alloc(K,M), dBt = gpu_alloc(N,K);
+    h2d(dA, a.data(), M*K);   h2d(dB, b.data(), K*N);
+    h2d(dAt, at.data(), K*M); h2d(dBt, bt.data(), N*K);
 
-    int rows=32, cols=64, sz=rows*cols;
-    GPUTensor src = gpu_alloc(rows, cols);
-
-    std::vector<float> h_src(sz);
-    for (int i=0; i<sz; ++i) h_src[i] = 5.0f + (float)(i % 32) * (5.0f / 32.0f);
-    h2d(src, h_src.data(), sz);
-
-    int8_t* d_int8;
-    CUDA_CHECK(cudaMalloc(&d_int8, sz*sizeof(int8_t)));
-
-    float* d_max;
-    CUDA_CHECK(cudaMalloc(&d_max, sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_max, 0, sizeof(float)));
-    absmax_kernel<<<(sz+255)/256, 256>>>(src.data, d_max, sz);
-    cudaDeviceSynchronize();
-    float h_max=0.f;
-    CUDA_CHECK(cudaMemcpy(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost));
-    float scale = h_max / 127.5f + 1e-8f;  // [FIX] 127.5f gives better round-trip accuracy (< 1% rel error)
-
-    nikhilam_quantize_kernel<<<(sz+255)/256, 256>>>(src.data, d_int8, scale, sz);
-    cudaDeviceSynchronize();
-
-    float* d_rec;
-    CUDA_CHECK(cudaMalloc(&d_rec, sz*sizeof(float)));
-    nikhilam_dequantize_kernel<<<(sz+255)/256, 256>>>(d_int8, d_rec, scale, sz);
-    cudaDeviceSynchronize();
-
-    std::vector<float> h_rec(sz);
-    CUDA_CHECK(cudaMemcpy(h_rec.data(), d_rec, sz*sizeof(float), cudaMemcpyDeviceToHost));
-
-    float max_abs_err = 0.f, max_rel_err = 0.f;
-    for (int i=0; i<sz; ++i) {
-        float err = std::abs(h_src[i] - h_rec[i]);
-        float rel = h_src[i] != 0 ? err / std::abs(h_src[i]) : err;
-        max_abs_err = std::max(max_abs_err, err);
-        max_rel_err = std::max(max_rel_err, rel);
-    }
-    std::cout << "    Max abs error: " << max_abs_err << "\n";
-    std::cout << "    Max rel error: " << max_rel_err * 100 << "%\n";
-    TEST("Nikhilam: abs error < 0.1", max_abs_err < 0.1f);
-    TEST("Nikhilam: rel error < 1%",  max_rel_err < 0.01f);
-
-    cudaFree(d_int8); cudaFree(d_max); cudaFree(d_rec);
+    auto check = [&](bool tA, bool tB, const GPUTensor& A, int lda,
+                     const GPUTensor& B, int ldb, const char* name) {
+        GPUTensor C = gpu_alloc(M, N);
+        cuda_gemm_rm(tA, tB, M, N, K, 1.f, A.data, lda, B.data, ldb, 0.f, C.data, N);
+        cudaDeviceSynchronize();
+        auto h = read_gpu(C);
+        float worst = 0.f;
+        for (size_t i=0; i<h.size(); ++i) worst = std::max(worst, std::abs(h[i]-ref[i]));
+        TEST(name, worst < 1e-4f);
+    };
+    check(false, false, dA,  K, dB,  N, "cuda_gemm_rm NN matches CPU");
+    check(true,  false, dAt, M, dB,  N, "cuda_gemm_rm TN matches CPU");
+    check(false, true,  dA,  K, dBt, K, "cuda_gemm_rm NT matches CPU");
+    check(true,  true,  dAt, M, dBt, K, "cuda_gemm_rm TT matches CPU");
 }
 
 static void test_s14_expmap() {
@@ -509,7 +466,7 @@ static void test_s16_model_forward() {
 }
 
 static void test_s17_full_pipeline() {
-    std::cout << "\n[S17] Full Pipeline (Forward + Loss + Verify)\n";
+    std::cout << "\n[S17] Full Pipeline (Forward + Loss + GEMM)\n";
 
     ModelConfig cfg;
     cfg.vocab_size=128; cfg.d_model=64;
@@ -543,10 +500,9 @@ static void test_s17_full_pipeline() {
     TEST("Pipeline: F finite",       std::isfinite(fe.free_energy));
 
     GPUTensor C_check = gpu_alloc(model.last_hidden.rows, model.gpu_lm_head.cols);
-    cuda_vedic_gemm(model.last_hidden, model.gpu_lm_head, C_check);
+    cuda_gemm(model.last_hidden, model.gpu_lm_head, C_check);
     cudaDeviceSynchronize();
-    VedicVerifyResult vr = cuda_vedic_verify(model.last_hidden, model.gpu_lm_head, C_check, 0.1f);
-    TEST("Pipeline: Gunitasamuchayah PASS", vr.pass);
+    TEST("Pipeline: lm_head GEMM output finite", gpu_tensor_finite(C_check));
 
     cudaFree(d_targets); cudaFree(d_loss); cudaFree(d_grad);
 }
@@ -568,8 +524,7 @@ int main() {
         test_s9_gelu();
         test_s10_leapfrog();
         test_s11_free_energy_loss();
-        test_s12_vedic_verify();
-        test_s13_nikhilam_quant();
+        test_s12_cublas_rm_transposes();
         test_s14_expmap();
         test_s15_model_gpu_constructor();
         test_s16_model_forward();
