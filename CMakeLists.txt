@@ -12,6 +12,22 @@ include_directories(include)
 # ── Options ───────────────────────────────────────────────────
 option(LOGOS_SANITIZE "Enable ASan + UBSan on CPU test targets" OFF)
 option(LOGOS_USE_COMPUTE_SANITIZER "Wrap GPU CTest tests with compute-sanitizer" OFF)
+option(LOGOS_RAPIDCHECK "Build T25 RapidCheck property tests (fetches rapidcheck via FetchContent)" OFF)
+set(LOGOS_RAPIDCHECK_TAG "master" CACHE STRING "rapidcheck git tag/branch/commit used by LOGOS_RAPIDCHECK")
+# Real Mull mutation testing (Linux + clang only). Path of the Mull IR-frontend plugin,
+# e.g. /usr/lib/mull-ir-frontend-14 (must match the clang + mull-NN package version).
+# When set, every CPU test target is built -O0 -g with the Mull plugin so that
+# `mull-runner-NN <test exe>` can mutate include/*.hpp and src/*.cpp.
+set(LOGOS_MULL_PLUGIN "" CACHE FILEPATH "Mull IR frontend plugin (enables Mull instrumentation of CPU tests)")
+if(LOGOS_MULL_PLUGIN)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR APPLE OR WIN32)
+        message(FATAL_ERROR "LOGOS_MULL_PLUGIN needs clang on Linux (got ${CMAKE_CXX_COMPILER_ID})")
+    endif()
+    if(NOT EXISTS "${LOGOS_MULL_PLUGIN}")
+        message(FATAL_ERROR "LOGOS_MULL_PLUGIN not found: ${LOGOS_MULL_PLUGIN}")
+    endif()
+    message(STATUS "Mull instrumentation ON: ${LOGOS_MULL_PLUGIN}")
+endif()
 
 function(logos_set_cpu_test_options target)
     if(MSVC)
@@ -44,6 +60,12 @@ function(logos_set_cpu_test_options target)
                 -fsanitize=bounds)
             target_link_options(${target} PRIVATE -fsanitize=address,undefined)
             message(STATUS "  ${target}: ASan+UBSan ON (GCC/Clang Linux)")
+        endif()
+        if(LOGOS_MULL_PLUGIN)
+            # appended after -O1 above, so -O0 wins (Mull needs unoptimised IR + debug info)
+            target_compile_options(${target} PRIVATE
+                -O0 -g -grecord-command-line -fpass-plugin=${LOGOS_MULL_PLUGIN})
+            message(STATUS "  ${target}: Mull plugin ON")
         endif()
     endif()
 endfunction()
@@ -96,6 +118,42 @@ logos_add_cpu_test(test_integration tests/cpu/test_integration.cpp "T23_Integrat
 logos_add_cpu_test(test_bench       tests/cpu/bench_tokenizer.cpp  "T24_Bench"           900 "CPU;BENCH")
 if(NOT MSVC)
     target_compile_options(test_bench PRIVATE -O2)   # later flag wins over -O1: bench Release-like
+endif()
+
+# T25 RapidCheck (property-based; opt-in so normal configures never touch the network)
+if(LOGOS_RAPIDCHECK)
+    include(FetchContent)
+    set(RC_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(RC_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(RC_INSTALL_ALL_EXTRAS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(rapidcheck
+        GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
+        GIT_TAG        ${LOGOS_RAPIDCHECK_TAG}
+        GIT_SHALLOW    ON)
+    FetchContent_MakeAvailable(rapidcheck)
+    logos_add_cpu_test(test_rapidcheck tests/cpu/test_rapidcheck.cpp "T25_RapidCheck" 900 "CPU;RAPIDCHECK")
+    target_link_libraries(test_rapidcheck PRIVATE rapidcheck)
+endif()
+
+# libFuzzer (LLVM's open-source C++ coverage-guided fuzzer) + ASan + UBSan. Clang only, opt-in.
+# Targets are run by hand / CI (./fuzz_tokenizer corpus/ -max_total_time=N), not via ctest.
+option(LOGOS_LIBFUZZER "Build libFuzzer targets (fuzz_tokenizer, fuzz_vocab, fuzz_tokenbin, fuzz_checkpoint)" OFF)
+if(LOGOS_LIBFUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR MSVC)
+        message(FATAL_ERROR "LOGOS_LIBFUZZER needs clang (got ${CMAKE_CXX_COMPILER_ID})")
+    endif()
+    function(logos_add_libfuzzer target src)
+        add_executable(${target} ${src} ${ARGN})
+        target_include_directories(${target} PRIVATE include tests/cpu tests/fuzz)
+        target_compile_options(${target} PRIVATE -std=c++20 -O1 -g -fno-omit-frame-pointer
+            -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined)
+        target_link_options(${target} PRIVATE -fsanitize=fuzzer,address,undefined)
+        target_link_libraries(${target} PRIVATE Threads::Threads)
+    endfunction()
+    logos_add_libfuzzer(fuzz_tokenizer  tests/fuzz/fuzz_tokenizer.cpp)
+    logos_add_libfuzzer(fuzz_vocab      tests/fuzz/fuzz_vocab.cpp)
+    logos_add_libfuzzer(fuzz_tokenbin   tests/fuzz/fuzz_tokenbin.cpp)
+    logos_add_libfuzzer(fuzz_checkpoint tests/fuzz/fuzz_checkpoint.cpp src/Checkpoint.cpp)
 endif()
 
 # ── CUDA detection ────────────────────────────────────────────

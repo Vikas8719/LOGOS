@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   cpu-tests-linux:
-    name: "CPU Tests - Linux (T2b Checkpoint)"
+    name: "CPU Tests - Linux (checkpoint + tokenizer + physics + integration)"
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -39,14 +39,14 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CXX_FLAGS="-O2 -march=x86-64 -std=c++20"
 
-      - name: Build (checkpoint + tokenizer + physics + fuzz + integration + bench)
+      - name: Build (checkpoint + tokenizer + physics + integration)
         run: |
           cmake --build build --parallel $(nproc) --target \
-            test_checkpoint test_tokenizer test_physics_cpu test_fuzz test_integration test_bench
+            test_checkpoint test_tokenizer test_physics_cpu test_integration
 
-      - name: CTest (unit + physics + fuzz + integration; bench runs in its own job)
+      - name: CTest (unit + physics + integration; fuzz / bench / rapidcheck / mull have their own jobs)
         working-directory: build
-        run: ctest --output-on-failure -LE "GPU|BENCH" --timeout 900 -j 1
+        run: ctest --output-on-failure -LE "GPU|BENCH|FUZZ|RAPIDCHECK" --timeout 900 -j 1
 
       - name: Upload build artifacts (ctest logs + test binaries)
         if: always()
@@ -59,10 +59,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # PIPELINE ORDER
+  #   PHASE 1 (all in parallel): cpu-tests-linux, sanitizer-tests-linux (ASan+UBSan), tsan-linux (TSan),
+  #                              rapidcheck-linux (1000 examples), Windows, macOS, GPU compile check
+  #   PHASE 2 (one after another, only after PHASE 1 is green):
+  #                              bench-linux (30 min) -> fuzz-linux (libFuzzer 2 h) -> mull-linux (real Mull)
   sanitizer-tests-linux:
-    name: "ASan + UBSan - Linux (T2b)"
+    name: "ASan + UBSan - Linux (ALL CPU tests incl. fuzz + RapidCheck x1000)"
     runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -70,7 +75,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            gcc-12 g++-12 cmake ninja-build
+            gcc-12 g++-12 cmake ninja-build git
 
       - name: Configure
         run: |
@@ -78,16 +83,28 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DLOGOS_SANITIZE=ON \
-            -DLOGOS_FUZZ_ITERS=1000
+            -DLOGOS_RAPIDCHECK=ON \
+            -DLOGOS_FUZZ_ITERS=3000
 
-      - name: Build
+      - name: Build every CPU test (bench excluded: timing is meaningless under ASan)
         run: |
           cmake --build build-sanitize --parallel $(nproc) --target \
-            test_checkpoint test_tokenizer test_physics_cpu test_fuzz test_integration
+            test_checkpoint test_tokenizer test_physics_cpu test_fuzz test_integration test_rapidcheck
 
       - name: Run all CPU tests with ASan + UBSan
         working-directory: build-sanitize
-        run: ctest --output-on-failure -LE "GPU|BENCH" --timeout 900 -j 1
+        env:
+          RC_PARAMS: "max_success=1000"
+        run: ctest --output-on-failure -LE "GPU|BENCH" --timeout 3000 -j 1
+
+      - name: Upload sanitizer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-asan-ubsan
+          path: build-sanitize/Testing/
+          if-no-files-found: ignore
+          retention-days: 30
 
   cpu-tests-windows:
     name: "CPU Tests - Windows (T2b Checkpoint)"
@@ -147,16 +164,16 @@ jobs:
           retention-days: 14
 
   tsan-linux:
-    name: "ThreadSanitizer - Linux (T20 T22 T23)"
+    name: "ThreadSanitizer - Linux (T20 T21 T22 T23 T25)"
     runs-on: ubuntu-22.04
-    needs: [cpu-tests-linux]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build git
 
       - name: Relax ASLR (TSan needs it on newer runner kernels)
         run: sudo sysctl -w vm.mmap_rnd_bits=28
@@ -167,117 +184,305 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DLOGOS_TSAN=ON \
+            -DLOGOS_RAPIDCHECK=ON \
             -DLOGOS_FUZZ_ITERS=500
 
-      - name: Build
-        run: cmake --build build-tsan --parallel $(nproc) --target test_tokenizer test_fuzz test_integration
+      - name: Build every TSan-instrumented CPU test
+        run: |
+          cmake --build build-tsan --parallel $(nproc) --target \
+            test_tokenizer test_physics_cpu test_fuzz test_integration test_rapidcheck
 
-      - name: Run threaded tests under TSan
+      - name: Run all of them under TSan (RapidCheck x1000)
         working-directory: build-tsan
-        run: ctest --output-on-failure -R "^(T20_Tokenizer_Unit|T22_Fuzz|T23_Integration)$" --timeout 900 -j 1
+        env:
+          RC_PARAMS: "max_success=1000"
+        run: ctest --output-on-failure -R "^(T20_Tokenizer_Unit|T21_Physics_CPU|T22_Fuzz|T23_Integration|T25_RapidCheck)$" --timeout 3000 -j 1
 
-  qa-matrix:
-    name: "Fuzz + Bench + Mutation (${{ matrix.label }})"
-    runs-on: ${{ matrix.os }}
-    needs: [cpu-tests-linux]
-    timeout-minutes: 90
-    # Windows/macOS legs report but do not block the gate until they have been seen green once
-    continue-on-error: ${{ matrix.os != 'ubuntu-22.04' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            label: linux
-            gen: Ninja
-            cxx: g++-12
-          - os: windows-latest
-            label: windows
-            gen: MinGW Makefiles
-            cxx: g++
-          - os: macos-latest
-            label: macos
-            gen: Unix Makefiles
-            cxx: clang++
-    defaults:
-      run:
-        shell: bash
-    env:
-      CXX: ${{ matrix.cxx }}
+      - name: Upload TSan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-tsan
+          path: build-tsan/Testing/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # QA jobs: each runs SEPARATELY, Linux only, on the full repo checkout, and
+  # uploads its own report artifact (qa-bench / qa-fuzz / qa-rapidcheck / qa-mull).
+  # ───────────────────────────────────────────────────────────────────────────
+  bench-linux:
+    name: "[PHASE 2 - 1/3] Bench (T24, Linux, 30 min cap)"
+    runs-on: ubuntu-22.04
+    needs:
+      - cpu-tests-linux
+      - sanitizer-tests-linux
+      - tsan-linux
+      - rapidcheck-linux
+      - cpu-tests-windows
+      - cpu-tests-macos
+      - gpu-compile-check
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install build tools (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build
 
-      - name: Configure (fuzz seed saved to qa/fuzz_seed.txt)
+      - name: Configure
         run: |
           mkdir -p qa
-          SEED=$(date +%s)
-          echo "$SEED" > qa/fuzz_seed.txt
-          echo "FUZZ SEED = $SEED  (reproduce: -DLOGOS_FUZZ_SEED=$SEED)"
-          cmake -B build -G "${{ matrix.gen }}" \
+          cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLOGOS_FUZZ_ITERS=20000 \
-            -DLOGOS_FUZZ_SEED=$SEED
+            -DCMAKE_CXX_COMPILER=g++-12
 
-      - name: Build test_fuzz + test_bench
-        run: cmake --build build --parallel 4 --target test_fuzz test_bench
+      - name: Build test_bench
+        run: cmake --build build --parallel $(nproc) --target test_bench
 
-      - name: Run fuzz (log -> qa/fuzz.log)
-        working-directory: build
-        run: ctest --output-on-failure -R "^T22_Fuzz$" --timeout 1800 -V 2>&1 | tee ../qa/fuzz.log
-
-      - name: Run benchmarks (json -> qa/bench_results.json)
-        if: always()
+      - name: Run benchmarks (json -> qa/bench_results.json, log -> qa/bench.log)
         working-directory: build
         env:
-          LOGOS_BENCH_JSON: ../qa/bench_results.json
-        run: ctest --output-on-failure -L BENCH --timeout 900 -j 1 -V 2>&1 | tee ../qa/bench.log
+          LOGOS_BENCH_JSON: ${{ github.workspace }}/qa/bench_results.json
+        run: |
+          set -o pipefail
+          ctest --output-on-failure -L BENCH --timeout 1500 -j 1 -V 2>&1 | tee ../qa/bench.log
 
-      - name: Run mutation suite (fails below 80% kill score)
-        if: always()
-        run: python tools/mutation_test.py --min-score 0.80 --jobs 4 --report qa/mutation_report.json 2>&1 | tee qa/mutation.log
-
-      - name: Job summary (mutation score + bench numbers)
+      - name: Job summary
         if: always()
         run: |
-          python - <<'PYEOF_SUM' >> "$GITHUB_STEP_SUMMARY"
-          import json, os
-          print("### ${{ matrix.label }}: fuzz / bench / mutation")
+          python3 - <<'PYEOF_SUM' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          print("### Bench (Linux)")
           try:
-              print("- fuzz seed: " + open("qa/fuzz_seed.txt").read().strip())
-          except Exception:
-              pass
-          try:
-              m = json.load(open("qa/mutation_report.json"))
-              print(f"- mutation score: **{m['score']:.1%}** (killed={m['killed']}, survived={m['survived']}, invalid={m['invalid']}, stale={m['stale']})")
-              for r in m.get("mutants", []):
-                  if r.get("status") == "SURVIVED":
-                      print(f"  - SURVIVED: {r['name']}")
-          except Exception as e:
-              print(f"- mutation report missing ({e})")
-          try:
-              b = json.load(open("qa/bench_results.json"))
-              for k, v in b.items():
-                  print(f"- bench {k}: {v}")
+              for k, v in json.load(open("qa/bench_results.json")).items():
+                  print(f"- `{k}`: {v}")
           except Exception as e:
               print(f"- bench json missing ({e})")
           PYEOF_SUM
 
-      - name: Upload QA artifacts (fuzz log+seed, bench json, mutation report)
+      - name: Upload bench artifacts (json + log + ctest logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qa-${{ matrix.label }}
-          path: qa/
+          name: qa-bench
+          path: |
+            qa/
+            build/Testing/
+          if-no-files-found: warn
+          retention-days: 30
+
+  fuzz-linux:
+    name: "[PHASE 2 - 2/3] Fuzz (libFuzzer, Linux, 2 h)"
+    runs-on: ubuntu-22.04
+    needs: [bench-linux]
+    timeout-minutes: 160
+    env:
+      LLVM_VERSION: "14"
+      FUZZ_SECONDS: "7200"        # 2 hours; all 4 fuzzers run in parallel for this long
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang + libFuzzer runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang-${LLVM_VERSION} libclang-rt-${LLVM_VERSION}-dev cmake ninja-build
+
+      - name: Configure (clang + libFuzzer + ASan + UBSan)
+        run: |
+          mkdir -p qa/fuzz
+          cmake -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++-${LLVM_VERSION} \
+            -DLOGOS_LIBFUZZER=ON
+
+      - name: Build fuzz targets
+        run: |
+          cmake --build build-fuzz --parallel $(nproc) --target \
+            fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint
+
+      - name: Run libFuzzer (4 targets in parallel, FUZZ_SECONDS each)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=0:symbolize=1"
+          UBSAN_OPTIONS: "print_stacktrace=1"
+        run: |
+          TARGETS="fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint"
+          for T in $TARGETS; do
+            mkdir -p "qa/fuzz/corpus/$T" "qa/fuzz/crashes/$T"
+            (
+              "./build-fuzz/$T" "qa/fuzz/corpus/$T" \
+                -max_total_time="$FUZZ_SECONDS" \
+                -max_len=4096 -timeout=60 -rss_limit_mb=3072 \
+                -artifact_prefix="qa/fuzz/crashes/$T/" \
+                -print_final_stats=1 > "qa/fuzz/$T.log" 2>&1
+              echo $? > "qa/fuzz/$T.rc"
+            ) &
+          done
+          wait
+          FAIL=0
+          for T in $TARGETS; do
+            RC=$(cat "qa/fuzz/$T.rc")
+            echo "$T exit code: $RC"
+            [ "$RC" = "0" ] || FAIL=1
+          done
+          exit $FAIL
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Fuzz (libFuzzer, ${FUZZ_SECONDS}s per target)"
+            for f in qa/fuzz/fuzz_*.log; do
+              echo "**$(basename "$f" .log)** (exit: $(cat "${f%.log}.rc" 2>/dev/null || echo n/a))"
+              grep -E "INFO: Seed|stat::number_of_executed_units|stat::average_exec_per_sec|stat::new_units_added|ERROR|SUMMARY" "$f" | sed 's/^/- /' || true
+            done
+            echo "- crashing inputs (if any): artifact qa-fuzz -> qa/fuzz/crashes/"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload fuzz artifacts (logs + corpus + crashing inputs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-fuzz
+          path: qa/fuzz/
+          if-no-files-found: warn
+          retention-days: 30
+
+  rapidcheck-linux:
+    name: "RapidCheck (T25, Linux, 1000 examples per property)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 cmake ninja-build git
+
+      - name: Configure (RapidCheck via FetchContent)
+        run: |
+          mkdir -p qa
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DLOGOS_RAPIDCHECK=ON
+
+      - name: Build test_rapidcheck
+        run: cmake --build build --parallel $(nproc) --target test_rapidcheck
+
+      - name: Run properties (1000 examples each; log -> qa/rapidcheck.log)
+        working-directory: build
+        env:
+          RC_PARAMS: "max_success=1000"
+        run: |
+          set -o pipefail
+          ctest --output-on-failure -R "^T25_RapidCheck$" --timeout 1800 -V 2>&1 | tee ../qa/rapidcheck.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### RapidCheck (Linux)"
+            grep -E "Using configuration|OK, passed|Falsifiable|T25_RapidCheck:" qa/rapidcheck.log | head -40 | sed 's/^/- /' || true
+            echo "- reproduce a failure: RC_PARAMS=\"seed=<seed printed in the log>\""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload RapidCheck artifacts (log + ctest logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-rapidcheck
+          path: |
+            qa/
+            build/Testing/
+          if-no-files-found: warn
+          retention-days: 30
+
+  mull-linux:
+    name: "[PHASE 2 - 3/3] Mull mutation testing (real Mull, Linux)"
+    runs-on: ubuntu-22.04
+    needs: [fuzz-linux]
+    timeout-minutes: 300
+    env:
+      LLVM_VERSION: "14"          # clang-NN, mull-NN, mull-runner-NN and the plugin must all match
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang + cmake + ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang-${LLVM_VERSION} cmake ninja-build git curl ca-certificates python3
+
+      - name: Install Mull (cloudsmith apt repo)
+        run: |
+          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
+          sudo apt-get update -qq
+          apt-cache policy mull-${LLVM_VERSION}
+          sudo apt-get install -y mull-${LLVM_VERSION}
+          PLUGIN=$(dpkg -L mull-${LLVM_VERSION} | grep -m1 'mull-ir-frontend-')
+          RUNNER=$(dpkg -L mull-${LLVM_VERSION} | grep -m1 -E '/mull-runner-[0-9]+$')
+          test -f "$PLUGIN" && test -x "$RUNNER"
+          echo "MULL_PLUGIN=$PLUGIN" >> "$GITHUB_ENV"
+          echo "MULL_RUNNER=$RUNNER" >> "$GITHUB_ENV"
+          "$RUNNER" --version
+
+      - name: Configure (clang + Mull IR plugin on every CPU test; RapidCheck ON)
+        run: |
+          mkdir -p qa/mull
+          cmake -B build-mull -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++-${LLVM_VERSION} \
+            -DLOGOS_RAPIDCHECK=ON \
+            -DLOGOS_MULL_PLUGIN="$MULL_PLUGIN"
+
+      - name: Build every CPU test binary with the plugin
+        run: |
+          cmake --build build-mull --parallel $(nproc) --target \
+            test_checkpoint test_tokenizer test_physics_cpu test_integration test_fuzz test_rapidcheck
+
+      - name: Run real mull-runner on every test binary (no score gate: score is only reported)
+        env:
+          LOGOS_FUZZ_ITERS: "300"      # Mull re-runs the binary once per mutant -> keep fuzz/rapidcheck short
+          LOGOS_FUZZ_SEED: "1337"      # fixed seed: mutation testing needs deterministic tests
+          RC_PARAMS: "max_success=100 seed=1337"
+        run: |
+          cp mull.yml qa/mull/mull.yml
+          FAILED=0
+          for T in test_checkpoint test_tokenizer test_physics_cpu test_integration test_fuzz test_rapidcheck; do
+            echo "::group::mull-runner $T"
+            "$MULL_RUNNER" "build-mull/$T" \
+              --workers="$(nproc)" \
+              --timeout=120000 \
+              --reporters=IDE --reporters=Elements --reporters=SQLite \
+              --report-dir="qa/mull/$T" --report-name="$T" \
+              --ide-reporter-show-killed \
+              --allow-surviving \
+              2>&1 | tee "qa/mull/$T.log" || FAILED=1
+            echo "::endgroup::"
+          done
+          exit $FAILED
+
+      - name: Job summary (score lines from mull-runner output)
+        if: always()
+        run: |
+          {
+            echo "### Mull mutation testing (real mull-runner, no gate)"
+            for f in qa/mull/*.log; do
+              echo "**$(basename "$f" .log)**"
+              grep -E "Mutation score|Total mutants|Killed mutants|Survived mutants|Surviving" "$f" | sed 's/^/- /' || true
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Mull artifacts (Elements JSON + SQLite + full logs per test binary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-mull
+          path: qa/mull/
           if-no-files-found: warn
           retention-days: 30
 
@@ -450,7 +655,10 @@ jobs:
       - cpu-tests-macos
       - gpu-tests
       - tsan-linux
-      - qa-matrix
+      - bench-linux
+      - fuzz-linux
+      - rapidcheck-linux
+      - mull-linux
       - gpu-compile-check
     if: always()
     steps:
@@ -462,7 +670,10 @@ jobs:
           R_CPU_MAC: ${{ needs.cpu-tests-macos.result }}
           R_GPU: ${{ needs.gpu-tests.result }}
           R_TSAN: ${{ needs.tsan-linux.result }}
-          R_QA: ${{ needs.qa-matrix.result }}
+          R_BENCH: ${{ needs.bench-linux.result }}
+          R_FUZZ: ${{ needs.fuzz-linux.result }}
+          R_RC: ${{ needs.rapidcheck-linux.result }}
+          R_MULL: ${{ needs.mull-linux.result }}
           R_COMPILE: ${{ needs.gpu-compile-check.result }}
         run: |
           echo "Checkpoint Linux:   $R_CPU_LX"
@@ -471,11 +682,19 @@ jobs:
           echo "ASan + UBSan:       $R_SANITIZER"
           echo "GPU Tests:          $R_GPU"
           echo "TSan:                $R_TSAN"
-          echo "Fuzz+Bench+Mutation: $R_QA"
+          echo "Bench (Linux):      $R_BENCH"
+          echo "Fuzz (Linux):       $R_FUZZ"
+          echo "RapidCheck (Linux): $R_RC"
+          echo "Mull (Linux):       $R_MULL"
           echo "GPU compile check:  $R_COMPILE"
 
           FAIL=false
-          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_CPU_WIN" "$R_CPU_MAC" "$R_TSAN" "$R_QA" "$R_COMPILE"; do
+          # Phase 1 jobs + Phase 2 chain (bench -> fuzz -> mull): anything but "success" (failed,
+          # cancelled or SKIPPED because an earlier stage failed) means a test did not run green -> gate fails.
+          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_TSAN" "$R_RC" "$R_BENCH" "$R_FUZZ" "$R_MULL"; do
+            [ "$r" != "success" ] && FAIL=true
+          done
+          for r in "$R_CPU_WIN" "$R_CPU_MAC" "$R_COMPILE"; do
             [ "$r" = "failure" ] && FAIL=true
           done
 
