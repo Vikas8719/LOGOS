@@ -1,0 +1,17 @@
+# Mull mutation-testing config (read by the clang plugin at compile time).
+# Scope = ALL first-party C++ code: include/*.hpp and src/*.cpp.
+# (GPU .cu code cannot be mutated: Mull needs the test binary to run, and CI has no GPU.)
+mutators:
+  - cxx_all
+
+includePaths:
+  - '.*/include/.*'
+  - '.*/src/.*'
+
+excludePaths:
+  - '.*/tests/.*'      # never mutate the tests themselves
+  - '.*/_deps/.*'      # rapidcheck (FetchContent)
+  - '.*/build.*/.*'
+  - '/usr/.*'          # system / libstdc++ headers
+
+quiet: false
