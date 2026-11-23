@@ -86,7 +86,7 @@ jobs:
             -DLOGOS_RAPIDCHECK=ON \
             -DLOGOS_FUZZ_ITERS=3000
 
-      - name: Build every CPU test (bench excluded: timing is meaningless under ASan)
+      - name: "Build every CPU test (bench excluded - timing is meaningless under ASan)"
         run: |
           cmake --build build-sanitize --parallel $(nproc) --target \
             test_checkpoint test_tokenizer test_physics_cpu test_fuzz test_integration test_rapidcheck
@@ -444,7 +444,7 @@ jobs:
           cmake --build build-mull --parallel $(nproc) --target \
             test_checkpoint test_tokenizer test_physics_cpu test_integration test_fuzz test_rapidcheck
 
-      - name: Run real mull-runner on every test binary (no score gate: score is only reported)
+      - name: "Run real mull-runner on every test binary (no score gate - score is only reported)"
         env:
           LOGOS_FUZZ_ITERS: "300"      # Mull re-runs the binary once per mutant -> keep fuzz/rapidcheck short
           LOGOS_FUZZ_SEED: "1337"      # fixed seed: mutation testing needs deterministic tests
