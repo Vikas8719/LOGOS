@@ -48,6 +48,8 @@ int main() {
         expected_bytes += static_cast<size_t>(parameter->total_size) * sizeof(float);
     expected_bytes += static_cast<size_t>(cfg.num_layers) * 4 *
                       static_cast<size_t>(cfg.d_model) * sizeof(float);
+    // footer: final LayerNorm gamma + beta
+    expected_bytes += 2 * static_cast<size_t>(cfg.d_model) * sizeof(float);
 
 
     if (sizeof(ModelConfig) == 0) {
@@ -79,12 +81,15 @@ int main() {
         return 1;
     }
 
-    if (std::filesystem::file_size(file) != expected_bytes) {
-        std::remove(file.c_str());
-        std::cerr << "checkpoint size mismatch: got "
-                  << std::filesystem::file_size(file)
-                  << " expected " << expected_bytes << "\n";
-        return 1;
+    {
+        // size pehle padho, file baad me hatao (pehle ulta tha: remove ke baad file_size() throw karta tha)
+        const size_t got_bytes = std::filesystem::file_size(file);
+        if (got_bytes != expected_bytes) {
+            std::remove(file.c_str());
+            std::cerr << "checkpoint size mismatch: got " << got_bytes
+                      << " expected " << expected_bytes << "\n";
+            return 1;
+        }
     }
 
     {
@@ -176,6 +181,7 @@ int main() {
             expected2 += static_cast<size_t>(p->total_size) * sizeof(float);
         expected2 += static_cast<size_t>(cfg2.num_layers) * 4 *
                      static_cast<size_t>(cfg2.d_model) * sizeof(float);
+        expected2 += 2 * static_cast<size_t>(cfg2.d_model) * sizeof(float);   // final LN footer
 
         size_t actual2 = std::filesystem::file_size(file2);
         std::remove(file2.c_str());
@@ -222,6 +228,11 @@ int main() {
             for (Tensor* p : src3.parameters())
                 for (float& v : p->data) v = (float)(++idx) * 0.01f;
         }
+        // final LayerNorm (footer) non-default values so the round-trip really exercises it
+        for (size_t i = 0; i < src3.final_ln.gamma.data.size(); ++i)
+            src3.final_ln.gamma.data[i] = 1.5f + 0.25f * static_cast<float>(i);
+        for (size_t i = 0; i < src3.final_ln.beta.data.size(); ++i)
+            src3.final_ln.beta.data[i] = -0.5f + 0.125f * static_cast<float>(i);
         const std::string base3 = "logos_ckpt_nontrivial";
         const std::string file3 = base3 + "_step5.bin";
         std::remove(file3.c_str());
@@ -244,6 +255,9 @@ int main() {
         bool match3 = (ps3.size() == pr3.size());
         for (size_t i = 0; match3 && i < ps3.size(); ++i)
             match3 = (ps3[i]->data == pr3[i]->data);
+        match3 = match3 &&
+                 src3.final_ln.gamma.data == rst3.final_ln.gamma.data &&
+                 src3.final_ln.beta.data  == rst3.final_ln.beta.data;
 
         if (!match3) {
             std::cerr << "nontrivial round-trip: parameter mismatch\n";
@@ -553,8 +567,10 @@ int main() {
         }
         const size_t stats_bytes = static_cast<size_t>(cfg.num_layers) * 4 *
                                    static_cast<size_t>(cfg.d_model) * sizeof(float);
+        // legacy = no BN stats AND no final-LN footer (footer ab file ke sabse end me hai)
+        const size_t footer_bytes = 2 * static_cast<size_t>(cfg.d_model) * sizeof(float);
         const size_t full_size = std::filesystem::file_size(legacy_file);
-        std::filesystem::resize_file(legacy_file, full_size - stats_bytes);
+        std::filesystem::resize_file(legacy_file, full_size - stats_bytes - footer_bytes);
 
         LOGOSModel legacy_target(cfg);
         for (auto& block : legacy_target.layers) {
@@ -581,7 +597,46 @@ int main() {
                 return 1;
             }
         }
+        for (float g : legacy_target.final_ln.gamma.data)
+            if (g != 1.0f) {
+                std::remove(legacy_file.c_str());
+                std::cerr << "legacy checkpoint: final_ln.gamma not default (1.0)\n";
+                return 1;
+            }
+        for (float b : legacy_target.final_ln.beta.data)
+            if (b != 0.0f) {
+                std::remove(legacy_file.c_str());
+                std::cerr << "legacy checkpoint: final_ln.beta not default (0.0)\n";
+                return 1;
+            }
         std::remove(legacy_file.c_str());
+    }
+
+    {
+        // checkpoint with BN stats but WITHOUT the final-LN footer (pre-footer format):
+        // load must succeed and leave final_ln at defaults (gamma=1, beta=0)
+        const std::string nf_base = "logos_ckpt_no_footer";
+        const std::string nf_file = nf_base + "_step8.bin";
+        std::remove(nf_file.c_str());
+        if (!save_checkpoint(source, nf_base, 8)) {
+            std::cerr << "no-footer fixture save failed\n";
+            return 1;
+        }
+        const size_t footer_bytes = 2 * static_cast<size_t>(cfg.d_model) * sizeof(float);
+        std::filesystem::resize_file(nf_file, std::filesystem::file_size(nf_file) - footer_bytes);
+
+        LOGOSModel nf_target(cfg);
+        if (!load_checkpoint(nf_target, nf_file)) {
+            std::remove(nf_file.c_str());
+            std::cerr << "checkpoint without final-LN footer failed to load\n";
+            return 1;
+        }
+        std::remove(nf_file.c_str());
+        for (float g : nf_target.final_ln.gamma.data)
+            if (g != 1.0f) { std::cerr << "no-footer: final_ln.gamma not default\n"; return 1; }
+        for (float b : nf_target.final_ln.beta.data)
+            if (b != 0.0f) { std::cerr << "no-footer: final_ln.beta not default\n"; return 1; }
+        std::cout << "no-footer (pre final-LN) checkpoint loads with defaults\n";
     }
 
     {
