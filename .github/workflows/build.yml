@@ -10,6 +10,11 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-run every stage even if it is already green for identical code"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 3 * * *"      # nightly: long randomised fuzz run
 
@@ -18,6 +23,90 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── PLAN: a stage that already finished GREEN for byte-identical code is skipped (GitHub cache marker).
+  # Markers are saved only by a successful stage, so failed/cancelled stages always re-run.
+  # Nightly (schedule) and manual runs with force=true ignore the markers and re-run everything.
+  plan:
+    name: "Plan (skip stages already green for identical code)"
+    runs-on: ubuntu-22.04
+    outputs:
+      asan_hit:  ${{ steps.asan.outputs.cache-hit  == 'true' && steps.mode.outputs.reuse == 'true' }}
+      tsan_hit:  ${{ steps.tsan.outputs.cache-hit  == 'true' && steps.mode.outputs.reuse == 'true' }}
+      rc_hit:    ${{ steps.rc.outputs.cache-hit    == 'true' && steps.mode.outputs.reuse == 'true' }}
+      bench_hit: ${{ steps.bench.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' }}
+      fuzz_hit:  ${{ steps.fuzz.outputs.cache-hit  == 'true' && steps.mode.outputs.reuse == 'true' }}
+      mull_hit:  ${{ steps.mull.outputs.cache-hit  == 'true' && steps.mode.outputs.reuse == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reuse mode
+        id: mode
+        run: |
+          REUSE=true
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.force }}" = "true" ]; then REUSE=false; fi
+          echo "reuse=$REUSE" >> "$GITHUB_OUTPUT"
+          echo "reuse markers: $REUSE"
+
+      - name: Lookup ASan marker
+        id: asan
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-done
+          key: ci-done-asan-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+          lookup-only: true
+
+      - name: Lookup TSan marker
+        id: tsan
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-done
+          key: ci-done-tsan-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+          lookup-only: true
+
+      - name: Lookup RapidCheck marker
+        id: rc
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-done
+          key: ci-done-rc-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+          lookup-only: true
+
+      - name: Lookup Bench marker
+        id: bench
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-done
+          key: ci-done-bench-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+          lookup-only: true
+
+      - name: Lookup Fuzz marker
+        id: fuzz
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-done
+          key: ci-done-fuzz-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'tests/fuzz/**', 'CMakeLists.txt') }}
+          lookup-only: true
+
+      - name: Lookup Mull marker
+        id: mull
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-done
+          key: ci-done-mull-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt', 'mull.yml') }}
+          lookup-only: true
+
+      - name: Plan summary
+        run: |
+          {
+            echo "### CI plan (stages marked SKIP are already green for identical code)"
+            echo "- ASan+UBSan: ${{ steps.asan.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' && 'SKIP' || 'RUN' }}"
+            echo "- TSan: ${{ steps.tsan.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' && 'SKIP' || 'RUN' }}"
+            echo "- RapidCheck: ${{ steps.rc.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' && 'SKIP' || 'RUN' }}"
+            echo "- Bench: ${{ steps.bench.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' && 'SKIP' || 'RUN' }}"
+            echo "- Fuzz: ${{ steps.fuzz.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' && 'SKIP' || 'RUN' }}"
+            echo "- Mull: ${{ steps.mull.outputs.cache-hit == 'true' && steps.mode.outputs.reuse == 'true' && 'SKIP' || 'RUN' }} (Mull also mutates only files changed since the last green Mull run)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   cpu-tests-linux:
     name: "CPU Tests - Linux (checkpoint + tokenizer + physics + integration)"
     runs-on: ubuntu-22.04
@@ -67,6 +156,8 @@ jobs:
   sanitizer-tests-linux:
     name: "ASan + UBSan - Linux (ALL CPU tests incl. fuzz + RapidCheck x1000)"
     runs-on: ubuntu-22.04
+    needs: [plan]
+    if: ${{ needs.plan.outputs.asan_hit != 'true' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +196,15 @@ jobs:
           path: build-sanitize/Testing/
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Record green result for this exact code
+        run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save ASan marker
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-done
+          key: ci-done-asan-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
 
   cpu-tests-windows:
     name: "CPU Tests - Windows (T2b Checkpoint)"
@@ -166,6 +266,8 @@ jobs:
   tsan-linux:
     name: "ThreadSanitizer - Linux (T20 T21 T22 T23 T25)"
     runs-on: ubuntu-22.04
+    needs: [plan]
+    if: ${{ needs.plan.outputs.tsan_hit != 'true' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -207,6 +309,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Record green result for this exact code
+        run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save TSan marker
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-done
+          key: ci-done-tsan-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+
   # ───────────────────────────────────────────────────────────────────────────
   # QA jobs: each runs SEPARATELY, Linux only, on the full repo checkout, and
   # uploads its own report artifact (qa-bench / qa-fuzz / qa-rapidcheck / qa-mull).
@@ -215,6 +326,7 @@ jobs:
     name: "[PHASE 2 - 1/3] Bench (T24, Linux, 30 min cap)"
     runs-on: ubuntu-22.04
     needs:
+      - plan
       - cpu-tests-linux
       - sanitizer-tests-linux
       - tsan-linux
@@ -222,6 +334,8 @@ jobs:
       - cpu-tests-windows
       - cpu-tests-macos
       - gpu-compile-check
+    # runs only if nothing before it failed/cancelled (a SKIPPED phase-1 job = already green, fine)
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.bench_hit != 'true' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -273,10 +387,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Record green result for this exact code
+        run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save Bench marker
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-done
+          key: ci-done-bench-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+
   fuzz-linux:
     name: "[PHASE 2 - 2/3] Fuzz (libFuzzer, Linux, 2 h)"
     runs-on: ubuntu-22.04
-    needs: [bench-linux]
+    needs:
+      - plan
+      - cpu-tests-linux
+      - sanitizer-tests-linux
+      - tsan-linux
+      - rapidcheck-linux
+      - cpu-tests-windows
+      - cpu-tests-macos
+      - gpu-compile-check
+      - bench-linux
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.fuzz_hit != 'true' }}
     timeout-minutes: 160
     env:
       LLVM_VERSION: "14"
@@ -287,8 +420,11 @@ jobs:
       - name: Install clang + libFuzzer runtime
         run: |
           sudo apt-get update -qq
+          # Ubuntu 22.04 has no libclang-rt-NN-dev: the libFuzzer/ASan runtimes ship in
+          # libclang-common-NN-dev, which clang-NN pulls in. llvm-NN gives llvm-symbolizer.
           sudo apt-get install -y --no-install-recommends \
-            clang-${LLVM_VERSION} libclang-rt-${LLVM_VERSION}-dev cmake ninja-build
+            clang-${LLVM_VERSION} llvm-${LLVM_VERSION} cmake ninja-build
+          ls /usr/lib/llvm-${LLVM_VERSION}/lib/clang/*/lib/linux/ | grep -i fuzzer
 
       - name: Configure (clang + libFuzzer + ASan + UBSan)
         run: |
@@ -305,6 +441,7 @@ jobs:
 
       - name: Run libFuzzer (4 targets in parallel, FUZZ_SECONDS each)
         env:
+          ASAN_SYMBOLIZER_PATH: "/usr/lib/llvm-14/bin/llvm-symbolizer"
           ASAN_OPTIONS: "detect_leaks=1:abort_on_error=0:symbolize=1"
           UBSAN_OPTIONS: "print_stacktrace=1"
         run: |
@@ -350,9 +487,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Record green result for this exact code
+        run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save Fuzz marker
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-done
+          key: ci-done-fuzz-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'tests/fuzz/**', 'CMakeLists.txt') }}
+
   rapidcheck-linux:
     name: "RapidCheck (T25, Linux, 1000 examples per property)"
     runs-on: ubuntu-22.04
+    needs: [plan]
+    if: ${{ needs.plan.outputs.rc_hit != 'true' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -401,23 +549,91 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Record green result for this exact code
+        run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save RapidCheck marker
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-done
+          key: ci-done-rc-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt') }}
+
   mull-linux:
     name: "[PHASE 2 - 3/3] Mull mutation testing (real Mull, Linux)"
     runs-on: ubuntu-22.04
-    needs: [fuzz-linux]
+    needs:
+      - plan
+      - cpu-tests-linux
+      - sanitizer-tests-linux
+      - tsan-linux
+      - rapidcheck-linux
+      - cpu-tests-windows
+      - cpu-tests-macos
+      - gpu-compile-check
+      - bench-linux
+      - fuzz-linux
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.mull_hit != 'true' }}
     timeout-minutes: 300
     env:
       LLVM_VERSION: "14"          # clang-NN, mull-NN, mull-runner-NN and the plugin must all match
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # full history: needed to diff against the last green Mull commit
+
+      - name: Restore last green Mull commit
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-mull
+          key: mull-last-none-${{ github.sha }}
+          restore-keys: mull-last-
+
+      - name: "Decide Mull scope (only files changed since last green Mull run, or full)"
+        id: scope
+        run: |
+          mkdir -p qa/mull
+          cp mull.yml qa/mull/mull.full.yml
+          MODE=full
+          BASE=$(cat .ci-mull/last_sha 2>/dev/null || true)
+          if [ -n "$BASE" ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE" HEAD > qa/mull/changed_files.txt
+            if grep -qE '^(tests/|mull\.yml|CMakeLists\.txt)' qa/mull/changed_files.txt; then
+              echo "tests / mull config / CMake changed -> the whole suite is re-judged: FULL mutation run"
+            else
+              grep -E '^(include/|src/)' qa/mull/changed_files.txt > qa/mull/changed_src.txt || true
+              if [ -s qa/mull/changed_src.txt ]; then MODE=incremental; else MODE=none; fi
+            fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Mull scope: $MODE (base=${BASE:-none})"
+          if [ "$MODE" = "incremental" ]; then
+            {
+              echo "mutators:"
+              echo "  - cxx_all"
+              echo "includePaths:"
+              while read -r f; do
+                echo "  - '.*/$(printf '%s' "$f" | sed 's/\./\\./g')'"
+              done < qa/mull/changed_src.txt
+              echo "excludePaths:"
+              echo "  - '.*/tests/.*'"
+              echo "  - '.*/_deps/.*'"
+              echo "  - '.*/build.*/.*'"
+              echo "  - '/usr/.*'"
+              echo "quiet: false"
+            } > mull.yml
+            echo "--- scoped mull.yml ---"
+            cat mull.yml
+          fi
 
       - name: Install clang + cmake + ninja
+        if: steps.scope.outputs.mode != 'none'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             clang-${LLVM_VERSION} cmake ninja-build git curl ca-certificates python3
 
       - name: Install Mull (cloudsmith apt repo)
+        if: steps.scope.outputs.mode != 'none'
         run: |
           curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
           sudo apt-get update -qq
@@ -431,6 +647,7 @@ jobs:
           "$RUNNER" --version
 
       - name: Configure (clang + Mull IR plugin on every CPU test; RapidCheck ON)
+        if: steps.scope.outputs.mode != 'none'
         run: |
           mkdir -p qa/mull
           cmake -B build-mull -G Ninja \
@@ -440,11 +657,13 @@ jobs:
             -DLOGOS_MULL_PLUGIN="$MULL_PLUGIN"
 
       - name: Build every CPU test binary with the plugin
+        if: steps.scope.outputs.mode != 'none'
         run: |
           cmake --build build-mull --parallel $(nproc) --target \
             test_checkpoint test_tokenizer test_physics_cpu test_integration test_fuzz test_rapidcheck
 
       - name: "Run real mull-runner on every test binary (no score gate - score is only reported)"
+        if: steps.scope.outputs.mode != 'none'
         env:
           LOGOS_FUZZ_ITERS: "300"      # Mull re-runs the binary once per mutant -> keep fuzz/rapidcheck short
           LOGOS_FUZZ_SEED: "1337"      # fixed seed: mutation testing needs deterministic tests
@@ -470,7 +689,14 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Mull mutation testing (real mull-runner, no gate)"
+            echo "### Mull mutation testing (real mull-runner, no gate) - scope: ${{ steps.scope.outputs.mode }}"
+            if [ "${{ steps.scope.outputs.mode }}" = "incremental" ]; then
+              echo "mutated only the files changed since the last green Mull run:"
+              sed 's/^/- /' qa/mull/changed_src.txt
+            fi
+            if [ "${{ steps.scope.outputs.mode }}" = "none" ]; then
+              echo "no first-party code or test changed since the last green Mull run -> nothing to mutate"
+            fi
             for f in qa/mull/*.log; do
               echo "**$(basename "$f" .log)**"
               grep -E "Mutation score|Total mutants|Killed mutants|Survived mutants|Surviving" "$f" | sed 's/^/- /' || true
@@ -485,6 +711,24 @@ jobs:
           path: qa/mull/
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Record green result (marker + last green commit for the next incremental run)
+        run: |
+          mkdir -p .ci-done .ci-mull
+          echo "${{ github.sha }}" > .ci-done/ok
+          echo "${{ github.sha }}" > .ci-mull/last_sha
+
+      - name: Save Mull marker
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-done
+          key: ci-done-mull-${{ hashFiles('include/**', 'src/**', 'tests/cpu/**', 'CMakeLists.txt', 'mull.yml') }}
+
+      - name: Save last green Mull commit
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-mull
+          key: mull-last-${{ github.sha }}
 
   fuzz-nightly:
     name: "Nightly long fuzz (random seed)"
@@ -689,13 +933,11 @@ jobs:
           echo "GPU compile check:  $R_COMPILE"
 
           FAIL=false
-          # Phase 1 jobs + Phase 2 chain (bench -> fuzz -> mull): anything but "success" (failed,
-          # cancelled or SKIPPED because an earlier stage failed) means a test did not run green -> gate fails.
-          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_TSAN" "$R_RC" "$R_BENCH" "$R_FUZZ" "$R_MULL"; do
-            [ "$r" != "success" ] && FAIL=true
-          done
-          for r in "$R_CPU_WIN" "$R_CPU_MAC" "$R_COMPILE"; do
-            [ "$r" = "failure" ] && FAIL=true
+          # "skipped" is fine: either the stage is already green for identical code (plan job), or an
+          # earlier stage FAILED - and that failure is itself reported here. Failed/cancelled = gate fails.
+          for r in "$R_CPU_LX" "$R_SANITIZER" "$R_TSAN" "$R_RC" "$R_BENCH" "$R_FUZZ" "$R_MULL" \
+                   "$R_CPU_WIN" "$R_CPU_MAC" "$R_COMPILE"; do
+            { [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; } && FAIL=true
           done
 
           if [ "$R_GPU" = "failure" ]; then
