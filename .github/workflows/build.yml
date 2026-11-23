@@ -118,7 +118,7 @@ jobs:
 
   cpu-tests-macos:
     name: "CPU Tests - macOS (T2b Checkpoint)"
-    runs-on: macos-14
+    runs-on: macos-latest   # macos-14 retired 2026-11-02 (jobs get terminated); latest = macos-26 arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -195,7 +195,7 @@ jobs:
             label: windows
             gen: MinGW Makefiles
             cxx: g++
-          - os: macos-14
+          - os: macos-latest
             label: macos
             gen: Unix Makefiles
             cxx: clang++
