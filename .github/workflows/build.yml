@@ -375,15 +375,15 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          python3 - <<'PYEOF_SUM' >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "
           import json
-          print("### Bench (Linux)")
+          print('### Bench (Linux)')
           try:
-              for k, v in json.load(open("qa/bench_results.json")).items():
-                  print(f"- `{k}`: {v}")
+              for k, v in json.load(open('qa/bench_results.json')).items():
+                  print('- \`' + str(k) + '\`: ' + str(v))
           except Exception as e:
-              print(f"- bench json missing ({e})")
-          PYEOF_SUM
+              print('- bench json missing (' + str(e) + ')')
+          " >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload bench artifacts (json + log + ctest logs)
         if: always()
