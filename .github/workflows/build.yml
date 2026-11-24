@@ -399,7 +399,7 @@ jobs:
       - name: Record green result for this exact code
         run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
 
-      - name: Save bench baseline (main only: PRs compare against main, they never move the baseline)
+      - name: "Save bench baseline (main only - PRs compare against main, they never move the baseline)"
         if: github.ref == 'refs/heads/main'
         run: |
           mkdir -p .ci-bench
@@ -551,7 +551,7 @@ jobs:
       - name: Record green result for this exact code
         run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
 
-      - name: Save fuzz corpus (also after a failing run: new coverage-increasing inputs are still valid seeds)
+      - name: "Save fuzz corpus (also after a failing run - new coverage-increasing inputs are still valid seeds)"
         if: always()
         uses: actions/cache/save@v4
         with:
