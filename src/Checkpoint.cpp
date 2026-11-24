@@ -8,8 +8,31 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
 #include <cstdint>
 
+
+// Atomic publish: files are written to "<dst>.tmp" first and renamed over <dst> only after a clean
+// flush+close, so a crash / kill mid-save can never leave a half-written checkpoint under the real name.
+static bool commit_tmp_file(const std::string& tmp, const std::string& dst) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::rename(tmp, dst, ec);
+    if (ec) {                          // some platforms refuse to rename over an existing file
+        std::error_code rm_ec;
+        fs::remove(dst, rm_ec);
+        ec.clear();
+        fs::rename(tmp, dst, ec);
+    }
+    if (ec) {
+        std::cerr << "❌ Cannot finalize " << dst << ": " << ec.message() << "\n";
+        std::error_code rm_ec;
+        fs::remove(tmp, rm_ec);
+        return false;
+    }
+    return true;
+}
 
 static void write_legacy_position_slot(std::ofstream& f, const ModelConfig& cfg) {
     constexpr size_t CHUNK_BYTES = 64 * 1024;
@@ -131,17 +154,24 @@ static bool read_tensor_clamped(std::ifstream& f, Tensor& t, const std::string& 
 
 // Final LayerNorm footer (gamma, beta). Purane checkpoints me ye nahi hota — tab defaults
 // (gamma=1, beta=0) rehte hain aur load fail nahi hota.
-static bool read_optional_tensor(std::ifstream& f, Tensor& t, const char* lbl) {
+// returns  1 = tensor read,  0 = absent (file ends exactly before it: older format),
+//         -1 = file ends INSIDE the tensor (truncated / corrupt -> caller must reject)
+static int read_optional_tensor(std::ifstream& f, Tensor& t, const char* lbl) {
     const auto bytes = static_cast<std::streamsize>(t.total_size * sizeof(float));
     std::vector<float> tmp(static_cast<size_t>(t.total_size));
     f.read(reinterpret_cast<char*>(tmp.data()), bytes);
     if (f.gcount() != bytes) {
+        const auto got = f.gcount();
         f.clear();
+        if (got > 0) {
+            std::cerr << "❌ Checkpoint truncated inside " << lbl << " (" << got << "/" << bytes << " bytes)\n";
+            return -1;
+        }
         std::cerr << "⚠️  " << lbl << " missing in checkpoint (older format) — default init (gamma=1, beta=0)\n";
-        return false;
+        return 0;
     }
     std::copy(tmp.begin(), tmp.end(), t.data.begin());
-    return true;
+    return 1;
 }
 
 bool save_checkpoint(const LOGOSModel& model,
@@ -149,7 +179,8 @@ bool save_checkpoint(const LOGOSModel& model,
                      int step)
 {
     std::string full_path = path + "_step" + std::to_string(step) + ".bin";
-    std::ofstream f(full_path, std::ios::binary);
+    const std::string tmp_path = full_path + ".tmp";
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
     if (!f) {
         std::cerr << "❌ Cannot save checkpoint: " << full_path << "\n";
         return false;
@@ -197,6 +228,17 @@ bool save_checkpoint(const LOGOSModel& model,
 
     if (!f) {
         std::cerr << "❌ Write error: " << full_path << "\n";
+        f.close();
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp_path, rm_ec);
+        return false;
+    }
+    f.flush();
+    f.close();
+    if (f.fail() || !commit_tmp_file(tmp_path, full_path)) {
+        std::cerr << "❌ Checkpoint finalize failed: " << full_path << "\n";
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp_path, rm_ec);
         return false;
     }
     std::cout << "✅ Checkpoint saved: " << full_path
@@ -238,12 +280,28 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
     }
     if (!rt(model.lm_head))       return false;
 
+    // 0 = not seen yet, 1 = stats present, -1 = absent (older format: file ends exactly before them).
+    // A cut INSIDE a vector, or between vectors after some were read, is corruption -> reject.
+    int stats_state = 0;
     auto rv = [&](std::vector<float>& v, const std::string& lbl) -> bool {
         auto bytes = static_cast<std::streamsize>(v.size() * sizeof(float));
         f.read(reinterpret_cast<char*>(v.data()), bytes);
+        if (bytes > 0 && f.gcount() == bytes) stats_state = 1;
         if (f.gcount() != bytes) {
-            std::fill(v.begin(), v.end(), 0.0f);
+            const auto got = f.gcount();
             f.clear();
+            if (got > 0) {
+                std::cerr << "❌ Checkpoint truncated inside BN running stat '" << lbl
+                          << "' (" << got << "/" << bytes << " bytes): " << path << "\n";
+                return false;
+            }
+            if (stats_state == 1) {
+                std::cerr << "❌ Checkpoint truncated between BN running stats ('" << lbl
+                          << "' missing after earlier stats were read): " << path << "\n";
+                return false;
+            }
+            stats_state = -1;
+            std::fill(v.begin(), v.end(), 0.0f);
             std::cerr << "⚠️  BN running stat '" << lbl
                       << "' missing in checkpoint (older format) — zero-initialised\n";
         }
@@ -266,17 +324,22 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         if (!rt(block.ln1.beta))   return false;
         if (!rt(block.ln2.gamma))  return false;
         if (!rt(block.ln2.beta))   return false;
-        rv(block.ln1.running_mean, "ln1.running_mean");
-        rv(block.ln1.running_var,  "ln1.running_var");
-        rv(block.ln2.running_mean, "ln2.running_mean");
-        rv(block.ln2.running_var,  "ln2.running_var");
+        if (!rv(block.ln1.running_mean, "ln1.running_mean")) return false;
+        if (!rv(block.ln1.running_var,  "ln1.running_var"))  return false;
+        if (!rv(block.ln2.running_mean, "ln2.running_mean")) return false;
+        if (!rv(block.ln2.running_var,  "ln2.running_var"))  return false;
         block.ln1.initialized = true;
         block.ln2.initialized = true;
     }
 
     // Footer: final LayerNorm (optional — purane ckpt me nahi hota)
-    read_optional_tensor(f, model.final_ln.gamma, "final_ln.gamma");
-    read_optional_tensor(f, model.final_ln.beta,  "final_ln.beta");
+    const int ln_g = read_optional_tensor(f, model.final_ln.gamma, "final_ln.gamma");
+    if (ln_g < 0) return false;
+    const int ln_b = read_optional_tensor(f, model.final_ln.beta,  "final_ln.beta");
+    if (ln_b < 0 || (ln_g == 1 && ln_b == 0)) {
+        std::cerr << "❌ Checkpoint truncated in final LayerNorm footer: " << path << "\n";
+        return false;
+    }
 
     if (model.embedding.has_nan()) {
         std::cerr << "❌ Checkpoint corrupt — NaN in embeddings: " << path << "\n";
@@ -361,7 +424,8 @@ bool save_optimizer_state(const OptimizerState& state,
                           int step)
 {
     std::string path = base_path + "_step" + std::to_string(step) + ".optstate";
-    std::ofstream f(path, std::ios::binary);
+    const std::string tmp_path = path + ".tmp";
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
     if (!f) {
         std::cerr << "⚠️  Cannot save optimizer state: " << path
                   << " (training continues, next resume will be cold)\n";
@@ -388,6 +452,17 @@ bool save_optimizer_state(const OptimizerState& state,
 
     if (!f) {
         std::cerr << "❌ Write error: " << path << "\n";
+        f.close();
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp_path, rm_ec);
+        return false;
+    }
+    f.flush();
+    f.close();
+    if (f.fail() || !commit_tmp_file(tmp_path, path)) {
+        std::cerr << "❌ Optimizer state finalize failed: " << path << "\n";
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp_path, rm_ec);
         return false;
     }
     std::cout << "✅ Optimizer state saved: " << path

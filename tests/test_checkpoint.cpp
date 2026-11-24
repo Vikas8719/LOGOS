@@ -696,5 +696,114 @@ int main() {
         std::remove(force_file.c_str());
     }
 
+    {
+        // Atomic save: a stale "<file>.tmp" from a killed run must not matter, no ".tmp" may remain after a
+        // successful save, and saving over an existing checkpoint (rename over existing file) must work.
+        const std::string at_base = "logos_ckpt_atomic";
+        const std::string at_file = at_base + "_step9.bin";
+        const std::string at_tmp  = at_file + ".tmp";
+        std::remove(at_file.c_str());
+        {
+            std::ofstream stale(at_tmp, std::ios::binary | std::ios::trunc);
+            stale << "half-written garbage from a killed run";
+        }
+        if (!save_checkpoint(source, at_base, 9)) {
+            std::remove(at_tmp.c_str());
+            std::cerr << "atomic test: save over a stale .tmp failed\n";
+            return 1;
+        }
+        if (std::filesystem::exists(at_tmp)) {
+            std::remove(at_file.c_str());
+            std::remove(at_tmp.c_str());
+            std::cerr << "atomic test: .tmp file left behind after a successful save\n";
+            return 1;
+        }
+        if (!save_checkpoint(source, at_base, 9)) {
+            std::remove(at_file.c_str());
+            std::cerr << "atomic test: overwriting an existing checkpoint failed\n";
+            return 1;
+        }
+        LOGOSModel at_target(cfg);
+        const bool at_loaded = load_checkpoint(at_target, at_file);
+        std::remove(at_file.c_str());
+        if (!at_loaded) {
+            std::cerr << "atomic test: checkpoint saved via tmp+rename did not load\n";
+            return 1;
+        }
+
+        OptimizerState at_opt;
+        at_opt.velocities = {{1.0f, 2.0f}};
+        const std::string at_opt_file = at_base + "_step9.optstate";
+        const bool at_opt_ok = save_optimizer_state(at_opt, at_base, 9);
+        const bool at_opt_tmp_left = std::filesystem::exists(at_opt_file + ".tmp");
+        std::remove(at_opt_file.c_str());
+        std::remove((at_opt_file + ".tmp").c_str());
+        if (!at_opt_ok || at_opt_tmp_left) {
+            std::cerr << "atomic test: optimizer state save failed or left a .tmp file\n";
+            return 1;
+        }
+        std::cout << "atomic save (checkpoint + optimizer state) passed\n";
+    }
+
+    {
+        // A file that ends INSIDE the BN running stats or the final-LN footer is corrupt (e.g. an interrupted
+        // copy), not an "older format". Cuts exactly on the legacy boundaries must keep loading.
+        const std::string tr_base = "logos_ckpt_trunc_src";
+        const std::string tr_src  = tr_base + "_step10.bin";
+        const std::string tr_case = "logos_ckpt_trunc_case.bin";
+        std::remove(tr_src.c_str());
+        if (!save_checkpoint(source, tr_base, 10)) {
+            std::cerr << "truncation fixture save failed\n";
+            return 1;
+        }
+        std::string blob;
+        {
+            std::ifstream in(tr_src, std::ios::binary);
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            blob = ss.str();
+        }
+        std::remove(tr_src.c_str());
+
+        const size_t vec    = static_cast<size_t>(cfg.d_model) * sizeof(float);      // one gamma/beta/stat vector
+        const size_t footer = 2 * vec;                                                // final-LN gamma + beta
+        const size_t stats  = static_cast<size_t>(cfg.num_layers) * 4 * vec;          // BN running stats
+        struct Cut { size_t removed; bool ok; const char* what; };
+        const Cut cuts[] = {
+            {0,                 true,  "complete file"},
+            {footer,            true,  "no final-LN footer (older format)"},
+            {footer + stats,    true,  "no BN stats and no footer (legacy format)"},
+            {1,                 false, "final_ln.beta cut inside"},
+            {vec,               false, "final_ln.beta missing while gamma is present"},
+            {vec + 1,           false, "final_ln.gamma cut inside"},
+            {footer + 1,        false, "ln2.running_var cut inside"},
+            {footer + vec,      false, "ln2.running_var missing after earlier stats were read"},
+            {footer + stats - 1, false, "ln1.running_mean cut after its first byte"},
+            {footer + stats + 1, false, "ln2.beta tensor cut inside"},
+        };
+        for (const Cut& c : cuts) {
+            {
+                std::ofstream out(tr_case, std::ios::binary | std::ios::trunc);
+                out.write(blob.data(), static_cast<std::streamsize>(blob.size() - c.removed));
+            }
+            LOGOSModel tr_target(cfg);
+            std::ostringstream quiet;                       // expected warnings/errors stay out of the log
+            std::streambuf* prev_err = std::cerr.rdbuf(quiet.rdbuf());
+            std::streambuf* prev_out = std::cout.rdbuf(quiet.rdbuf());
+            const bool loaded = load_checkpoint(tr_target, tr_case);
+            std::cerr.rdbuf(prev_err);
+            std::cout.rdbuf(prev_out);
+            if (loaded != c.ok) {
+                std::remove(tr_case.c_str());
+                std::cerr << "truncation case '" << c.what << "' (-" << c.removed << " bytes): expected "
+                          << (c.ok ? "load OK" : "reject") << ", got "
+                          << (loaded ? "load OK" : "reject") << "\n";
+                return 1;
+            }
+        }
+        std::remove(tr_case.c_str());
+        std::cout << "truncation inside BN stats / final-LN footer is rejected; legacy boundaries still load\n";
+    }
+
     return 0;
 }

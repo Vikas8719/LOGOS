@@ -12,8 +12,8 @@ extern "C" int LLVMFuzzerInitialize(int*, char***) {
     ModelConfig cfg;
     cfg.vocab_size = 64; cfg.d_model = 16; cfg.num_heads = 2; cfg.num_layers = 1; cfg.max_seq_len = 8;
     LOGOSModel m(cfg);
-    g_path = tc::tmp_file("libfuzz_ckpt.bin");
-    if (!save_checkpoint(m, g_path, 0)) { std::fprintf(stderr, "setup: save_checkpoint failed\n"); std::exit(2); }
+    const std::string base = tc::tmp_file("libfuzz_ckpt"); g_path = base + "_step0.bin";  // save_checkpoint() writes <base>_step<N>.bin
+    if (!save_checkpoint(m, base, 0)) { std::fprintf(stderr, "setup: save_checkpoint failed\n"); std::exit(2); }
     g_good = tc::read_all(g_path);
     if (g_good.empty()) { std::fprintf(stderr, "setup: checkpoint file empty at %s\n", g_path.c_str()); std::exit(2); }
     return 0;

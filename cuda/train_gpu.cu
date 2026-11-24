@@ -2,6 +2,7 @@
 #include "CublasGemm.cuh"
 #include "ModelGPU.cuh"
 #include "MixedPrecision.cuh"
+#include "BackwardGPU.cuh"      // [BACKWARD-EXTRACT] backward kernels + run_backward now live in logos_core
 #include "../include/Tokenizer.hpp"
 #include "../include/StreamingDataLoader.hpp"
 #include "../include/TokenBin.hpp"
@@ -177,6 +178,7 @@ public:
 // attn_dV/dAttnProbs/dQ/dK/dWQKV/dX_from_QKV/dWO/dHeadOut/dWproj/dConcat, bias_grad) hata diye gaye.
 // Sab cuda_gemm_rm() / cuda_colsum_accumulate() (VedicGEMM.cu, cuBLAS) se replace hue.
 
+#if 0  // [BACKWARD-EXTRACT] everything up to the matching #endif moved to cuda/BackwardGPU.cu (delete after first green build)
 __global__ void embedding_bwd_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ dX,
     float* __restrict__ d_emb, float* __restrict__ d_pos,
@@ -666,6 +668,8 @@ static void run_backward(
         
     }
 }
+
+#endif  // [BACKWARD-EXTRACT]
 
 void train_gpu(const std::string& dataset_path) {
     printf("\n╔══════════════════════════════════════════╗\n");

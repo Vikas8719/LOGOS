@@ -355,10 +355,19 @@ jobs:
       - name: Build test_bench
         run: cmake --build build --parallel $(nproc) --target test_bench
 
+      - name: Restore bench baseline (last green run on main; none on the very first run)
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-bench
+          key: bench-baseline-none-${{ github.sha }}
+          restore-keys: bench-baseline-
+
       - name: Run benchmarks (json -> qa/bench_results.json, log -> qa/bench.log)
         working-directory: build
         env:
           LOGOS_BENCH_JSON: ${{ github.workspace }}/qa/bench_results.json
+          LOGOS_BENCH_BASELINE: ${{ github.workspace }}/.ci-bench/baseline.json   # missing on first run => no gate
+          LOGOS_BENCH_TOL: "0.5"          # shared runners: fail only if a metric is 2x worse than the last green main run
         run: |
           set -o pipefail
           ctest --output-on-failure -L BENCH --timeout 1500 -j 1 -V 2>&1 | tee ../qa/bench.log
@@ -389,6 +398,19 @@ jobs:
 
       - name: Record green result for this exact code
         run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save bench baseline (main only: PRs compare against main, they never move the baseline)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p .ci-bench
+          cp qa/bench_results.json .ci-bench/baseline.json
+
+      - name: Cache bench baseline
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-bench
+          key: bench-baseline-${{ github.sha }}
 
       - name: Save Bench marker
         uses: actions/cache/save@v4
@@ -439,18 +461,53 @@ jobs:
           cmake --build build-fuzz --parallel $(nproc) --target \
             fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint
 
-      - name: Run libFuzzer (4 targets in parallel, FUZZ_SECONDS each)
+      - name: Restore fuzz corpus (grows across runs instead of restarting from an empty corpus)
+        uses: actions/cache/restore@v4
+        with:
+          path: qa/fuzz/corpus
+          key: fuzz-corpus-none-${{ github.sha }}
+          restore-keys: fuzz-corpus-
+
+      - name: Replay committed regression inputs (every past crash must stay fixed)
+        env:
+          ASAN_SYMBOLIZER_PATH: "/usr/lib/llvm-14/bin/llvm-symbolizer"
+          ASAN_OPTIONS: "detect_leaks=1:symbolize=1"
+          UBSAN_OPTIONS: "print_stacktrace=1"
+        run: |
+          # tests/fuzz/regression/<target>/ : commit every crashing input found by the 2 h run (artifact qa-fuzz -> crashes/)
+          for T in fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint; do
+            D="tests/fuzz/regression/$T"
+            if [ -d "$D" ] && [ -n "$(ls -A "$D" 2>/dev/null)" ]; then
+              echo "replaying $D"
+              "./build-fuzz/$T" "$D" -runs=0
+            else
+              echo "no regression inputs for $T"
+            fi
+          done
+
+      - name: Run libFuzzer (4 targets in parallel, per-target time budget)
         env:
           ASAN_SYMBOLIZER_PATH: "/usr/lib/llvm-14/bin/llvm-symbolizer"
           ASAN_OPTIONS: "detect_leaks=1:abort_on_error=0:symbolize=1"
           UBSAN_OPTIONS: "print_stacktrace=1"
         run: |
           TARGETS="fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint"
+          # fuzz_tokenbin saturated its coverage within seconds in a 2 h run -> give it less time, keep cores for the rest
+          declare -A SECS=(
+            [fuzz_tokenizer]="$FUZZ_SECONDS"
+            [fuzz_vocab]="$FUZZ_SECONDS"
+            [fuzz_tokenbin]="$((FUZZ_SECONDS / 6))"
+            [fuzz_checkpoint]="$((FUZZ_SECONDS / 2))"
+          )
           for T in $TARGETS; do
             mkdir -p "qa/fuzz/corpus/$T" "qa/fuzz/crashes/$T"
+            # committed seed inputs (never overwrite what the cached corpus already has) + optional dictionary
+            if [ -d "tests/fuzz/seeds/$T" ]; then cp -n "tests/fuzz/seeds/$T"/* "qa/fuzz/corpus/$T/" 2>/dev/null || true; fi
+            DICT=""
+            if [ -f "tests/fuzz/dict/$T.dict" ]; then DICT="-dict=tests/fuzz/dict/$T.dict"; fi
             (
-              "./build-fuzz/$T" "qa/fuzz/corpus/$T" \
-                -max_total_time="$FUZZ_SECONDS" \
+              "./build-fuzz/$T" "qa/fuzz/corpus/$T" $DICT \
+                -max_total_time="${SECS[$T]}" \
                 -max_len=4096 -timeout=60 -rss_limit_mb=3072 \
                 -artifact_prefix="qa/fuzz/crashes/$T/" \
                 -print_final_stats=1 > "qa/fuzz/$T.log" 2>&1
@@ -460,9 +517,13 @@ jobs:
           wait
           FAIL=0
           for T in $TARGETS; do
-            RC=$(cat "qa/fuzz/$T.rc")
+            RC=$(cat "qa/fuzz/$T.rc" 2>/dev/null || echo missing)
             echo "$T exit code: $RC"
             [ "$RC" = "0" ] || FAIL=1
+            # a target that dies in setup must not count as "passed": it has to have executed real inputs
+            N=$(grep -oE 'stat::number_of_executed_units: *[0-9]+' "qa/fuzz/$T.log" 2>/dev/null | grep -oE '[0-9]+$' | tail -1 || true)
+            echo "$T executed units: ${N:-0}"
+            if [ "${N:-0}" -lt 1000 ]; then echo "::error::$T executed fewer than 1000 inputs (setup failure?)"; FAIL=1; fi
           done
           exit $FAIL
 
@@ -489,6 +550,13 @@ jobs:
 
       - name: Record green result for this exact code
         run: mkdir -p .ci-done && echo "${{ github.sha }}" > .ci-done/ok
+
+      - name: Save fuzz corpus (also after a failing run: new coverage-increasing inputs are still valid seeds)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: qa/fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
 
       - name: Save Fuzz marker
         uses: actions/cache/save@v4
