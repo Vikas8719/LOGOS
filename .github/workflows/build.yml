@@ -15,6 +15,10 @@ on:
         description: "Re-run every stage even if it is already green for identical code"
         type: boolean
         default: false
+      force_phase2:
+        description: "Force Phase 2 (bench + fuzz + mull) to run even if cached"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 3 * * *"      # nightly: long randomised fuzz run
 
@@ -43,7 +47,9 @@ jobs:
         id: mode
         run: |
           REUSE=true
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.force }}" = "true" ]; then REUSE=false; fi
+          if [ "${{ github.event_name }}" = "schedule" ] || \
+             [ "${{ github.event.inputs.force }}" = "true" ] || \
+             [ "${{ github.event.inputs.force_phase2 }}" = "true" ]; then REUSE=false; fi
           echo "reuse=$REUSE" >> "$GITHUB_OUTPUT"
           echo "reuse markers: $REUSE"
 
@@ -335,7 +341,7 @@ jobs:
       - cpu-tests-macos
       - gpu-compile-check
     # runs only if nothing before it failed/cancelled (a SKIPPED phase-1 job = already green, fine)
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.bench_hit != 'true' }}
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (needs.plan.outputs.bench_hit != 'true' || github.event.inputs.force_phase2 == 'true') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -431,7 +437,7 @@ jobs:
       - cpu-tests-macos
       - gpu-compile-check
       - bench-linux
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.fuzz_hit != 'true' }}
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (needs.plan.outputs.fuzz_hit != 'true' || github.event.inputs.force_phase2 == 'true') }}
     timeout-minutes: 160
     env:
       LLVM_VERSION: "14"
@@ -640,7 +646,7 @@ jobs:
       - gpu-compile-check
       - bench-linux
       - fuzz-linux
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.mull_hit != 'true' }}
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (needs.plan.outputs.mull_hit != 'true' || github.event.inputs.force_phase2 == 'true') }}
     timeout-minutes: 300
     env:
       LLVM_VERSION: "14"          # clang-NN, mull-NN, mull-runner-NN and the plugin must all match
