@@ -340,8 +340,18 @@ jobs:
       - cpu-tests-windows
       - cpu-tests-macos
       - gpu-compile-check
-    # runs only if nothing before it failed/cancelled (a SKIPPED phase-1 job = already green, fine)
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    # gpu-compile-check failure is non-blocking for Phase 2 (no real GPU on hosted runners)
+    # runs only if no CRITICAL phase-1 job failed/cancelled; gpu-compile-check is allowed to fail
+    if: |
+      ${{
+        !cancelled() &&
+        needs.cpu-tests-linux.result != 'failure' && needs.cpu-tests-linux.result != 'cancelled' &&
+        needs.sanitizer-tests-linux.result != 'failure' && needs.sanitizer-tests-linux.result != 'cancelled' &&
+        needs.tsan-linux.result != 'failure' && needs.tsan-linux.result != 'cancelled' &&
+        needs.rapidcheck-linux.result != 'failure' && needs.rapidcheck-linux.result != 'cancelled' &&
+        needs.cpu-tests-windows.result != 'failure' && needs.cpu-tests-windows.result != 'cancelled' &&
+        needs.cpu-tests-macos.result != 'failure' && needs.cpu-tests-macos.result != 'cancelled'
+      }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -437,7 +447,18 @@ jobs:
       - cpu-tests-macos
       - gpu-compile-check
       - bench-linux
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    # gpu-compile-check failure is non-blocking for Phase 2 (no real GPU on hosted runners)
+    if: |
+      ${{
+        !cancelled() &&
+        needs.cpu-tests-linux.result != 'failure' && needs.cpu-tests-linux.result != 'cancelled' &&
+        needs.sanitizer-tests-linux.result != 'failure' && needs.sanitizer-tests-linux.result != 'cancelled' &&
+        needs.tsan-linux.result != 'failure' && needs.tsan-linux.result != 'cancelled' &&
+        needs.rapidcheck-linux.result != 'failure' && needs.rapidcheck-linux.result != 'cancelled' &&
+        needs.cpu-tests-windows.result != 'failure' && needs.cpu-tests-windows.result != 'cancelled' &&
+        needs.cpu-tests-macos.result != 'failure' && needs.cpu-tests-macos.result != 'cancelled' &&
+        needs.bench-linux.result != 'failure' && needs.bench-linux.result != 'cancelled'
+      }}
     timeout-minutes: 160
     env:
       LLVM_VERSION: "14"
@@ -646,7 +667,19 @@ jobs:
       - gpu-compile-check
       - bench-linux
       - fuzz-linux
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    # gpu-compile-check failure is non-blocking for Phase 2 (no real GPU on hosted runners)
+    if: |
+      ${{
+        !cancelled() &&
+        needs.cpu-tests-linux.result != 'failure' && needs.cpu-tests-linux.result != 'cancelled' &&
+        needs.sanitizer-tests-linux.result != 'failure' && needs.sanitizer-tests-linux.result != 'cancelled' &&
+        needs.tsan-linux.result != 'failure' && needs.tsan-linux.result != 'cancelled' &&
+        needs.rapidcheck-linux.result != 'failure' && needs.rapidcheck-linux.result != 'cancelled' &&
+        needs.cpu-tests-windows.result != 'failure' && needs.cpu-tests-windows.result != 'cancelled' &&
+        needs.cpu-tests-macos.result != 'failure' && needs.cpu-tests-macos.result != 'cancelled' &&
+        needs.bench-linux.result != 'failure' && needs.bench-linux.result != 'cancelled' &&
+        needs.fuzz-linux.result != 'failure' && needs.fuzz-linux.result != 'cancelled'
+      }}
     timeout-minutes: 300
     env:
       LLVM_VERSION: "14"          # clang-NN, mull-NN, mull-runner-NN and the plugin must all match
