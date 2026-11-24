@@ -163,7 +163,7 @@ jobs:
     name: "ASan + UBSan - Linux (ALL CPU tests incl. fuzz + RapidCheck x1000)"
     runs-on: ubuntu-22.04
     needs: [plan]
-    if: ${{ needs.plan.outputs.asan_hit != 'true' }}
+
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -273,7 +273,7 @@ jobs:
     name: "ThreadSanitizer - Linux (T20 T21 T22 T23 T25)"
     runs-on: ubuntu-22.04
     needs: [plan]
-    if: ${{ needs.plan.outputs.tsan_hit != 'true' }}
+
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -574,7 +574,7 @@ jobs:
     name: "RapidCheck (T25, Linux, 1000 examples per property)"
     runs-on: ubuntu-22.04
     needs: [plan]
-    if: ${{ needs.plan.outputs.rc_hit != 'true' }}
+
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
