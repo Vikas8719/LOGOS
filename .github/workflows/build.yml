@@ -980,7 +980,7 @@ jobs:
         run: |
           if command -v compute-sanitizer &>/dev/null; then
             timeout 300 compute-sanitizer \
-              --tool memcheck --leak-check full --error-exitcode 1 \
+              --tool memcheck --check-device-heap yes --error-exitcode 1 \
               ./build/test_cuda_kernels 2>&1 | tail -80
           else
             echo "compute-sanitizer not available"

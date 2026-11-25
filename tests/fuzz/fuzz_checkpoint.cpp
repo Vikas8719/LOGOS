@@ -104,16 +104,18 @@ extern "C" int LLVMFuzzerInitialize(int*, char***) {
     const std::string base = tc::tmp_file("libfuzz_ckpt");
     g_path = base + "_step0.bin";  // save_checkpoint() writes <base>_step<N>.bin
     if (!save_checkpoint(m, base, 0)) {
-        std::fprintf(stderr, "setup: save_checkpoint failed\n"); std::exit(2);
+        // Return -1 (not exit(2)) so libFuzzer reports a proper setup error
+        // instead of treating it as a crash and stopping after a handful of inputs.
+        std::fprintf(stderr, "setup: save_checkpoint failed\n"); return -1;
     }
     g_good = tc::read_all(g_path);
     if (g_good.empty()) {
-        std::fprintf(stderr, "setup: checkpoint file empty at %s\n", g_path.c_str()); std::exit(2);
+        std::fprintf(stderr, "setup: checkpoint file empty at %s\n", g_path.c_str()); return -1;
     }
 
     // Sanity: the good model itself must pass all invariants.
     if (!check_model_invariants(m, cfg, "setup")) {
-        std::fprintf(stderr, "setup: good model failed invariant check\n"); std::exit(2);
+        std::fprintf(stderr, "setup: good model failed invariant check\n"); return -1;
     }
     return 0;
 }

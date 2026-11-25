@@ -409,10 +409,33 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
         if (!rt(block.ln1.beta))   return false;
         if (!rt(block.ln2.gamma))  return false;
         if (!rt(block.ln2.beta))   return false;
+        // Running stats: read (clamped) to keep file offset in sync with save_checkpoint.
+        // Older checkpoints may omit them — read_tensor_clamped handles truncation gracefully.
+        auto rc_vec = [&](std::vector<float>& v) -> bool {
+            auto bytes = static_cast<std::streamsize>(v.size() * sizeof(float));
+            f.read(reinterpret_cast<char*>(v.data()), bytes);
+            if (f.gcount() < bytes) {
+                size_t got = static_cast<size_t>(f.gcount());
+                std::fill(v.begin() + got / sizeof(float), v.end(), 0.0f);
+                f.clear();   // eof is fine in force-load mode
+            }
+            return true;
+        };
+        if (!rc_vec(block.ln1.running_mean)) return false;
+        if (!rc_vec(block.ln1.running_var))  return false;
+        if (!rc_vec(block.ln2.running_mean)) return false;
+        if (!rc_vec(block.ln2.running_var))  return false;
+        block.ln1.initialized = true;
+        block.ln2.initialized = true;
     }
+
+    // Footer: final LayerNorm (optional — purane ckpt me nahi hota; force-load accepts missing)
+    read_optional_tensor(f, model.final_ln.gamma, "final_ln.gamma");
+    read_optional_tensor(f, model.final_ln.beta,  "final_ln.beta");
 
     std::cout << "⚠️  Checkpoint force-loaded: " << path << "\n";
     return true;
+}
 }
 
 
