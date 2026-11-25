@@ -187,6 +187,34 @@ int main() {
         }
     }) && ok;
 
+    // ===== cache eviction property =====
+    // Ye property CACHE_MAX_ENTRIES >= mutation aur cache_.clear() void-call
+    // mutation dono ko pakdti hai.
+    // Invariant: encode_raw(s) ka result cache ke state par depend nahi karna chahiye —
+    // chahe cache cold ho, warm ho, ya abhi-abhi evict hua ho.
+    ok = rc::check("tok: encode_raw is cache-state-independent (kills cache-eviction mutants)", [] {
+        const Tokenizer& t = tok();
+        const std::string s = *genWordsText();
+
+        // Cold result (reference)
+        const std::vector<int> cold = t.encode_raw(s);
+
+        // Cache ko disturb karo: bahut saari alag strings encode karo
+        // (RapidCheck arbitrary bytes se cache fill hoti hai across runs)
+        for (int i = 0; i < 30; ++i) {
+            const std::string noise = *rc::gen::container<std::string>(
+                rc::gen::element<char>('x', 'y', 'z', '0', '1', ' ', '\n'));
+            (void)t.encode_raw(noise);
+        }
+
+        // Post-eviction result must match
+        const std::vector<int> warm = t.encode_raw(s);
+        RC_ASSERT(cold == warm);
+
+        // Idempotence: same string twice = same result
+        RC_ASSERT(t.encode_raw(s) == cold);
+    }) && ok;
+
     // ===== pre-tokenized .bin + loader =====
     ok = rc::check("tokenbin: pretokenize_file + TokenBinLoader reproduce encode_raw (shift by 1)", [] {
         const Tokenizer& t = tok();

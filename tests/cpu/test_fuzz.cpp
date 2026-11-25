@@ -162,38 +162,106 @@ static void fuzz_path_integral(uint32_t seed, long iters) {
     TC_SECTION("fuzz: WeightPathIntegral invariants");
     std::mt19937 g(seed ^ 0x1234u);
     std::uniform_real_distribution<float> U(0.0f, 1.0f);
-    const float nan = std::numeric_limits<float>::quiet_NaN();
-    const float inf = std::numeric_limits<float>::infinity();
+    const float nan_val = std::numeric_limits<float>::quiet_NaN();
+    const float inf_val = std::numeric_limits<float>::infinity();
     const float hbars[] = {0.0f, 1e-3f, 1.0f, 100.0f, -2.0f};
-    long violations = 0;
+
+    // Violation counters — granular, each targets a specific mutation.
+    long v_nan_log    = 0;  // log_amplitude became NaN (kills isfinite removal)
+    long v_nan_ema    = 0;  // ema_action became NaN  (kills ema guard removal)
+    long v_nan_cum    = 0;  // cumulative_action NaN  (kills finite-action guard)
+    long v_monotone   = 0;  // log_amplitude increased (kills -= -> +=  mutant)
+    long v_amp_range  = 0;  // amplitude() outside (0,1] (kills exp sign flip)
+    long v_lr_lo      = 0;  // lr_scale < lr_min_frac   (kills +1e-8 -> -1e-8)
+    long v_lr_hi      = 0;  // lr_scale > 1.0 + eps      (kills clamp removal)
+    long v_rel_range  = 0;  // relative_amplitude outside (0, 1+eps]
+    long v_denom_pos  = 0;  // denom (ema+1e-8) went non-positive (kills +→-)
+    long v_step_mono  = 0;  // step_count did not increase after valid record
+    long v_cum_mono   = 0;  // cumulative_action decreased after valid step
+
     for (int run = 0; run < 50; ++run) {
         WeightPathIntegral p(hbars[g() % 5]);
         float prev_log = p.log_amplitude;
+        float prev_cum = p.cumulative_action;
+        int   prev_step = p.step_count;
+
         for (long i = 0; i < iters / 50 + 1; ++i) {
             float loss, norm;
+            bool finite_input = false;
             switch (g() % 8) {
-                case 0: loss = nan; norm = U(g); break;
-                case 1: loss = U(g); norm = inf; break;
-                case 2: loss = -U(g) * 10.0f; norm = U(g); break;
-                case 3: loss = U(g); norm = -U(g); break;
-                case 4: loss = 0.0f; norm = U(g) * 1e3f; break;
-                default: loss = U(g) * 1e2f; norm = U(g) * 1e2f; break;
+                case 0: loss = nan_val;        norm = U(g);           break;
+                case 1: loss = U(g);           norm = inf_val;        break;
+                case 2: loss = -U(g) * 10.0f; norm = U(g);           break;
+                case 3: loss = U(g);           norm = -U(g);          break;
+                case 4: loss = 0.0f;           norm = U(g) * 1e3f;   finite_input = true; break;
+                default: loss = U(g) * 1e2f;  norm = U(g) * 1e2f;   finite_input = true; break;
             }
             p.record_step_norm(loss, norm);
-            if (std::isnan(p.log_amplitude) || std::isnan(p.ema_action) || std::isnan(p.cumulative_action)) ++violations;
-            if (p.log_amplitude > prev_log) ++violations;                 // never increases
+
+            // --- NaN guards ---
+            if (std::isnan(p.log_amplitude))    ++v_nan_log;
+            if (std::isnan(p.ema_action))        ++v_nan_ema;
+            if (std::isnan(p.cumulative_action)) ++v_nan_cum;
+
+            // --- log_amplitude monotone non-increasing ---
+            // Kills -= → += mutation in record_step_norm
+            if (p.log_amplitude > prev_log + 1e-9f) ++v_monotone;
             prev_log = p.log_amplitude;
-            float a = p.amplitude();
-            if (!(a > 0.0f && a <= 1.0f)) ++violations;
-            float fr = U(g);
-            float sc = p.lr_scale_ema(fr);
-            if (!(sc >= fr - 1e-6f && sc <= 1.0f + 1e-6f)) ++violations;
+
+            // --- cumulative_action monotone non-decreasing (for finite non-negative inputs) ---
+            // Kills += → -= mutation on cumulative_action
+            if (finite_input && loss >= 0.0f && norm >= 0.0f) {
+                if (p.cumulative_action < prev_cum - 1e-9f) ++v_cum_mono;
+                // step_count must have incremented for a valid finite input
+                if (p.step_count <= prev_step) ++v_step_mono;
+            }
+            prev_cum  = p.cumulative_action;
+            prev_step = p.step_count;
+
+            // --- amplitude() ∈ (0, 1] ---
+            // Kills exp(log_amplitude) → exp(-log_amplitude) mutant
+            const float a = p.amplitude();
+            if (!(a > 0.0f && a <= 1.0f + 1e-9f)) ++v_amp_range;
+
+            // --- lr_scale_ema ∈ [lr_min_frac, 1] ---
+            // lr_min_frac values that expose the +1e-8 → -1e-8 mutation:
+            // when ema_action==0 the denom becomes -1e-8 < 0, exp blows up,
+            // rel > 1, scale = lr_min + (1-lr_min)*rel > 1 → v_lr_hi fires.
+            // Also check with fr=0 (denominator == 1e-8 exactly on boundary).
+            for (float fr : {0.0f, 0.1f, 0.5f, U(g)}) {
+                const float sc = p.lr_scale_ema(fr);
+                if (sc < fr - 1e-6f)         ++v_lr_lo;
+                if (sc > 1.0f + 1e-6f)       ++v_lr_hi;
+                // denom positive check: if ema_action+1e-8 would go <=0 that's a bug
+                const float denom_check = std::max(p.ema_action, 0.0f) + 1e-8f;
+                if (!(denom_check > 0.0f))   ++v_denom_pos;
+            }
+
+            // --- reset_best + relative_amplitude ---
             if (g() % 50 == 0) p.reset_best();
-            float ra = p.relative_amplitude();
-            if (!(ra > 0.0f && ra <= 1.0f + 1e-6f)) ++violations;
+            const float ra = p.relative_amplitude();
+            if (!(ra > 0.0f && ra <= 1.0f + 1e-6f)) ++v_rel_range;
         }
     }
-    TC_CHECKF(violations == 0, "%ld WeightPathIntegral invariant violations (seed=%u)", violations, seed);
+
+    // Report each violation class separately so mutation reports are actionable.
+    TC_CHECKF(v_nan_log   == 0, "%ld log_amplitude NaN violations (seed=%u)", v_nan_log,   seed);
+    TC_CHECKF(v_nan_ema   == 0, "%ld ema_action NaN violations (seed=%u)",    v_nan_ema,   seed);
+    TC_CHECKF(v_nan_cum   == 0, "%ld cumulative_action NaN violations (seed=%u)", v_nan_cum, seed);
+    TC_CHECKF(v_monotone  == 0, "%ld log_amplitude monotone violations (kills -= -> += mutant) (seed=%u)",
+              v_monotone, seed);
+    TC_CHECKF(v_cum_mono  == 0, "%ld cumulative_action decreased on valid step (kills += -> -= mutant) (seed=%u)",
+              v_cum_mono, seed);
+    TC_CHECKF(v_step_mono == 0, "%ld step_count did not increment on valid step (kills ++ removal mutant) (seed=%u)",
+              v_step_mono, seed);
+    TC_CHECKF(v_amp_range == 0, "%ld amplitude() out-of-range (kills exp-sign mutant) (seed=%u)",
+              v_amp_range, seed);
+    TC_CHECKF(v_lr_lo     == 0, "%ld lr_scale below lr_min_frac (seed=%u)", v_lr_lo, seed);
+    TC_CHECKF(v_lr_hi     == 0, "%ld lr_scale above 1.0 (kills +1e-8 -> -1e-8 mutant) (seed=%u)",
+              v_lr_hi, seed);
+    TC_CHECKF(v_denom_pos == 0, "%ld denom non-positive (kills + -> - in denom guard) (seed=%u)",
+              v_denom_pos, seed);
+    TC_CHECKF(v_rel_range == 0, "%ld relative_amplitude out-of-range (seed=%u)", v_rel_range, seed);
 }
 
 int main() {

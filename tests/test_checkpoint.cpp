@@ -539,6 +539,55 @@ int main() {
             std::cerr << "mismatch fixture save failed\n";
             return 1;
         }
+
+        // --- mutation gap 1: vocab_size != → == (cfgs_match kills this mutant) ---
+        // If != is mutated to == the check inverts: matching vocab_size would REJECT
+        // and mismatching would ACCEPT. We verify both directions explicitly.
+        {
+            // Exact match must SUCCEED (would fail if != were left as ==)
+            LOGOSModel exact_match_model(cfg);
+            if (!load_checkpoint(exact_match_model, mismatch_file)) {
+                std::remove(mismatch_file.c_str());
+                std::cerr << "cfgs_match gap1: exact vocab_size rejected (killed != -> == mutant)\n";
+                return 1;
+            }
+            // vocab_size+1 must FAIL (would pass under the mutant)
+            ModelConfig vbad = cfg; vbad.vocab_size += 1;
+            LOGOSModel vbad_model(vbad);
+            if (load_checkpoint(vbad_model, mismatch_file)) {
+                std::remove(mismatch_file.c_str());
+                std::cerr << "cfgs_match gap1: mismatched vocab_size accepted\n";
+                return 1;
+            }
+            // vocab_size-1 must also FAIL
+            ModelConfig vbad2 = cfg; vbad2.vocab_size -= 1;
+            LOGOSModel vbad2_model(vbad2);
+            if (load_checkpoint(vbad2_model, mismatch_file)) {
+                std::remove(mismatch_file.c_str());
+                std::cerr << "cfgs_match gap1: vocab_size-1 accepted (kills off-by-one mutant)\n";
+                return 1;
+            }
+        }
+
+        // --- mutation gap 2: pos_embedding block == → != ---
+        // The loaded pos_embedding data must equal what was saved. We verify this by
+        // loading a fresh model and checking that its pos_embedding block matches the source.
+        {
+            LOGOSModel pos_check(cfg);
+            if (!load_checkpoint(pos_check, mismatch_file)) {
+                std::remove(mismatch_file.c_str());
+                std::cerr << "pos_embedding check: load failed\n";
+                return 1;
+            }
+            // After a clean save+load the pos embedding must match source
+            if (pos_check.pos_embedding.data != source.pos_embedding.data) {
+                std::remove(mismatch_file.c_str());
+                std::cerr << "cfgs_match gap2: pos_embedding data mismatch after round-trip (killed == -> != mutant)\n";
+                return 1;
+            }
+        }
+
+        // Full mismatch sweep (all five fields)
         std::vector<ModelConfig> mismatches;
         ModelConfig changed = cfg;
         changed.vocab_size += 1; mismatches.push_back(changed);
@@ -555,6 +604,12 @@ int main() {
             }
         }
         std::remove(mismatch_file.c_str());
+        // Verify file was actually cleaned up (temp-file cleanup test)
+        if (std::filesystem::exists(mismatch_file)) {
+            std::cerr << "mismatch fixture file not removed after test\n";
+            return 1;
+        }
+        std::cout << "cfgs_match mutation gaps (vocab_size !=, pos_embedding ==) + cleanup passed\n";
     }
 
     {
