@@ -169,6 +169,11 @@ inline bool pretokenize_file(const std::string& text_path, const Tokenizer& tok,
 
 // Pre-tokenized .bin se sequential windows (input = [p, p+seq), target = [p+1, p+seq+1)).
 // Range [start_tok, end_tok) tokens me — train/val split token-based.
+//
+// Performance: pehle har batch ke liye seekg() tha — O(batches) random seeks.
+// Ab: ek bada read-buffer (default 4 MB) use karta hai. Data buffer me se serve hota
+// hai bina kisi syscall ke. Sirf jab buffer khatam ho tab ek aur sequential read.
+// Isse tokenbin_batches_per_s baseline ke barabar rehta hai CI runners pe bhi.
 class TokenBinLoader : public IBatchLoader {
 public:
     int     seq_len;
@@ -177,8 +182,10 @@ public:
     int64_t total_steps_done  = 0;
     int     current_epoch     = 0;
 
+    // read_buf_tokens: kitne uint16 tokens ek baar disk se padhe. 0 = auto (2M tokens ~ 4 MB).
     TokenBinLoader(const std::string& bin_path, int seq_len_, int grad_accum_,
-                   int64_t start_tok = 0, int64_t end_tok = 0)
+                   int64_t start_tok = 0, int64_t end_tok = 0,
+                   int64_t read_buf_tokens = 0)
         : seq_len(seq_len_), grad_accum_steps(grad_accum_)
     {
         if (seq_len_ <= 0)    throw std::invalid_argument("seq_len must be > 0");
@@ -199,29 +206,45 @@ public:
             throw std::invalid_argument("TokenBinLoader: token range too small for seq_len");
         start_ = start_tok;
         range_ = end_tok - start_tok;
+
+        // Buffer: kam se kam (seq_len+1)*4 tokens, aur default 2M tak
+        const int64_t min_buf = static_cast<int64_t>(seq_len_) + 2;
+        if (read_buf_tokens <= 0) read_buf_tokens = 2LL * 1024 * 1024; // 4 MB
+        buf_cap_ = std::max(min_buf, read_buf_tokens);
+        buf_.reserve(static_cast<size_t>(buf_cap_));
+
         f_.open(bin_path, std::ios::binary);
         if (!f_) throw std::runtime_error("Cannot open token .bin: " + bin_path);
+
+        // File pointer ko start_ pe position karo
+        f_.seekg(TOKBIN_HEADER_BYTES + 2 * start_, std::ios::beg);
+        fill_buf();   // pehla buffer load
     }
 
     bool next_batch(std::vector<int>& input_ids, std::vector<int>& target_ids) override {
-        if (pos_ + seq_len + 1 > range_) {          // epoch end (StreamingDataLoader jaisa: false + rewind)
+        if (pos_ + seq_len + 1 > range_) {   // epoch end
             ++current_epoch;
             pos_ = 0;
+            // File wapas start_ pe le jao aur buffer reload karo
+            f_.clear();
+            f_.seekg(TOKBIN_HEADER_BYTES + 2 * start_, std::ios::beg);
+            buf_pos_ = 0;
+            buf_.clear();
+            fill_buf();
             return false;
         }
-        tmp_.resize(static_cast<size_t>(seq_len) + 1);
-        f_.clear();
-        f_.seekg(TOKBIN_HEADER_BYTES + 2 * (start_ + pos_), std::ios::beg);
-        const std::streamsize bytes = (std::streamsize)(tmp_.size() * sizeof(uint16_t));
-        f_.read(reinterpret_cast<char*>(tmp_.data()), bytes);
-        if (f_.gcount() != bytes) return false;
+
+        // Ensure buffer mein seq_len+1 tokens hain
+        if (!ensure_buf(seq_len + 1)) return false;
+
         input_ids.resize(static_cast<size_t>(seq_len));
         target_ids.resize(static_cast<size_t>(seq_len));
         for (int i = 0; i < seq_len; ++i) {
-            input_ids[(size_t)i]  = tmp_[(size_t)i];
-            target_ids[(size_t)i] = tmp_[(size_t)i + 1];
+            input_ids[(size_t)i]  = static_cast<int>(buf_[buf_pos_ + (size_t)i]);
+            target_ids[(size_t)i] = static_cast<int>(buf_[buf_pos_ + (size_t)i + 1]);
         }
-        pos_ += seq_len;
+        buf_pos_ += static_cast<size_t>(seq_len);
+        pos_     += seq_len;
         total_tokens_seen += seq_len;
         return true;
     }
@@ -244,6 +267,11 @@ public:
         pos_ = 0;
         total_tokens_seen = 0;
         total_steps_done  = 0;
+        f_.clear();
+        f_.seekg(TOKBIN_HEADER_BYTES + 2 * start_, std::ios::beg);
+        buf_pos_ = 0;
+        buf_.clear();
+        fill_buf();
     }
 
     LoaderState get_state() const override {
@@ -251,16 +279,61 @@ public:
     }
 
     void restore_state(const LoaderState& s) override {
-        pos_ = std::max<int64_t>(0, std::min<int64_t>(s.byte_pos, range_));
+        const int64_t new_pos = std::max<int64_t>(0, std::min<int64_t>(s.byte_pos, range_));
         total_tokens_seen = s.total_tokens_seen;
         total_steps_done  = s.total_steps_done;
         current_epoch     = s.current_epoch;
+        // Buffer invalidate karo aur naye position pe seek karo
+        pos_ = new_pos;
+        f_.clear();
+        f_.seekg(TOKBIN_HEADER_BYTES + 2 * (start_ + new_pos), std::ios::beg);
+        buf_pos_ = 0;
+        buf_.clear();
+        fill_buf();
     }
 
 private:
-    std::ifstream f_;
-    int64_t start_ = 0;
-    int64_t range_ = 0;
-    int64_t pos_   = 0;
-    std::vector<uint16_t> tmp_;
+    std::ifstream          f_;
+    int64_t                start_   = 0;
+    int64_t                range_   = 0;
+    int64_t                pos_     = 0;      // tokens consumed (logical, within range_)
+    int64_t                buf_cap_ = 0;      // max tokens per read
+    std::vector<uint16_t>  buf_;              // read buffer
+    size_t                 buf_pos_ = 0;      // next unread index in buf_
+
+    // buf_ mein remaining tokens ka count
+    size_t buf_avail() const { return buf_.size() - buf_pos_; }
+
+    // Disk se aur tokens padho (sequential), buf_ ke peeche append karo.
+    // Pehle consumed hissa hatao (copy avoid karne ke liye: shift + truncate).
+    void fill_buf() {
+        // Consumed data hatao
+        if (buf_pos_ > 0 && !buf_.empty()) {
+            const size_t rem = buf_avail();
+            if (rem > 0) std::memmove(buf_.data(), buf_.data() + buf_pos_, rem * sizeof(uint16_t));
+            buf_.resize(rem);
+            buf_pos_ = 0;
+        }
+
+        // Kitna padhna hai
+        const int64_t file_tokens_left = range_ - pos_ - static_cast<int64_t>(buf_avail());
+        if (file_tokens_left <= 0) return;
+        const int64_t want = std::min(buf_cap_, file_tokens_left);
+        const size_t  old  = buf_.size();
+        buf_.resize(old + static_cast<size_t>(want));
+        const std::streamsize bytes = static_cast<std::streamsize>(want) * 2;
+        f_.read(reinterpret_cast<char*>(buf_.data() + old), bytes);
+        const std::streamsize got = f_.gcount();
+        buf_.resize(old + static_cast<size_t>(got / 2));
+    }
+
+    // buf_ mein kam se kam `need` tokens ensure karo. False = data khatam.
+    bool ensure_buf(int need) {
+        while (buf_avail() < static_cast<size_t>(need)) {
+            const size_t before = buf_avail();
+            fill_buf();
+            if (buf_avail() == before) return false;  // no progress = EOF
+        }
+        return true;
+    }
 };

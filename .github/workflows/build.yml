@@ -375,8 +375,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .ci-bench
-          key: bench-baseline-none-${{ github.sha }}
-          restore-keys: bench-baseline-
+          key: bench-baseline-v2-none-${{ github.sha }}
+          restore-keys: bench-baseline-v2-
 
       - name: Run benchmarks (json -> qa/bench_results.json, log -> qa/bench.log)
         working-directory: build
@@ -426,7 +426,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .ci-bench
-          key: bench-baseline-${{ github.sha }}
+          key: bench-baseline-v2-${{ github.sha }}
 
       - name: Save Bench marker
         uses: actions/cache/save@v4

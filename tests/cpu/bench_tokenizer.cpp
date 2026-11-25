@@ -248,7 +248,10 @@ int main() {
     // ---- TokenBinLoader batches/s ----
     {
         int64_t n = 0;
-        const double dtl = median_of(io_reps, [&]() {
+        // io_reps+1 warmup: first read on a cold CI disk is artificially slow (page cache miss).
+        // We run one extra rep and discard the first sample so the median reflects warm-disk throughput.
+        const int tbl_reps = io_reps + 1;
+        const double dtl = median_of(tbl_reps, [&]() {
             TokenBinLoader ld(bin, 256, 1);
             std::vector<int> in, tg;
             n = 0;
