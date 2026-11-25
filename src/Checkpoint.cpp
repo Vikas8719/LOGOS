@@ -436,7 +436,6 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     std::cout << "⚠️  Checkpoint force-loaded: " << path << "\n";
     return true;
 }
-}
 
 
 static constexpr uint32_t OPTSTATE_MAGIC   = 0x4F505431u;
