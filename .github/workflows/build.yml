@@ -541,7 +541,7 @@ jobs:
             (
               "./build-fuzz/$T" "qa/fuzz/corpus/$T" $DICT \
                 -max_total_time="${SECS[$T]}" \
-                -max_len=4096 -timeout=60 -rss_limit_mb=2048 \
+                -max_len=4096 -timeout=60 -rss_limit_mb=3072 \
                 -artifact_prefix="qa/fuzz/crashes/$T/" \
                 -print_final_stats=1 > "qa/fuzz/$T.log" 2>&1
               echo $? > "qa/fuzz/$T.rc"

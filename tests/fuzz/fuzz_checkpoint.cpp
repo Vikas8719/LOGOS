@@ -18,6 +18,14 @@
 
 static std::string g_good, g_path;
 
+// Pre-allocated model instances reused across every LLVMFuzzerTestOneInput call.
+// Allocating two LOGOSModel objects per input inside the fuzz loop causes the RSS
+// to spike past the libFuzzer rss_limit on GitHub runners (7 GB shared between
+// ASan shadow + other fuzzers), triggering a SIGKILL that prevents the shell
+// from writing the .rc exit-code file — the "exit code: missing / units: 5" symptom.
+static LOGOSModel* g_model_strict  = nullptr;
+static LOGOSModel* g_model_force   = nullptr;
+
 // Known-good config mirrored from LLVMFuzzerInitialize so assertions can use it.
 static constexpr int G_VOCAB   = 64;
 static constexpr int G_D_MODEL = 16;
@@ -141,6 +149,11 @@ extern "C" int LLVMFuzzerInitialize(int*, char***) {
         return -1;
     }
 
+    // Pre-allocate the two model instances that LLVMFuzzerTestOneInput reuses.
+    // This keeps the process RSS stable across the entire fuzz run.
+    g_model_strict = new LOGOSModel(cfg);
+    g_model_force  = new LOGOSModel(cfg);
+
     // Setup succeeded — silence stdout/stderr for the fuzzing loop so that
     // libFuzzer's own progress output is not drowned in Checkpoint log spam.
     fz::silence_streams();
@@ -150,31 +163,21 @@ extern "C" int LLVMFuzzerInitialize(int*, char***) {
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tc::write_all(g_path, fz::mutate_good(g_good, data, size));
     try {
-        ModelConfig cfg;
-        cfg.vocab_size = G_VOCAB; cfg.d_model = G_D_MODEL; cfg.num_heads = G_HEADS;
-        cfg.num_layers = G_LAYERS; cfg.max_seq_len = G_SEQ;
+        const ModelConfig cfg = g_model_strict->cfg;   // same as G_VOCAB/D_MODEL/etc.
 
-        // --- strict loader ---
-        LOGOSModel a(cfg);
-        const bool strict_ok = load_checkpoint(a, g_path);
+        // --- strict loader: reuse pre-allocated model (load_checkpoint overwrites weights) ---
+        const bool strict_ok = load_checkpoint(*g_model_strict, g_path);
         if (strict_ok) {
             // A successful strict load MUST satisfy all invariants.
-            // Any assertion failure here is a fuzzer-reportable crash (not a benign reject).
-            if (!check_model_invariants(a, cfg, "strict")) {
-                // Treat as a crash so the fuzzer saves the input.
+            if (!check_model_invariants(*g_model_strict, cfg, "strict"))
                 std::abort();
-            }
         }
 
         // --- force loader ---
-        LOGOSModel b(cfg);
-        const bool force_ok = load_checkpoint_force(b, g_path);
+        const bool force_ok = load_checkpoint_force(*g_model_force, g_path);
         if (force_ok) {
-            // force-load may partially fill tensors (zero-fills missing floats),
-            // but config and structure must still be valid.
-            if (!check_model_invariants(b, cfg, "force")) {
+            if (!check_model_invariants(*g_model_force, cfg, "force"))
                 std::abort();
-            }
         }
     } catch (const std::exception&) {
         // Exceptions are acceptable (bad input); UB / abort above is not.
