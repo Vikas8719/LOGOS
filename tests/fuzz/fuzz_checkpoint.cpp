@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <unistd.h>   // STDERR_FILENO / write() — low-level stderr output during setup
 
 static std::string g_good, g_path;
 
@@ -96,27 +97,51 @@ static bool check_model_invariants(const LOGOSModel& m, const ModelConfig& cfg,
 }
 
 extern "C" int LLVMFuzzerInitialize(int*, char***) {
-    fz::silence_streams();
+    // NOTE: stderr is intentionally kept open during setup so that libFuzzer can
+    // report a meaningful error message if initialisation fails.  silence_streams()
+    // is called only after a successful setup so that the fuzzer corpus loop runs
+    // quietly.  Calling silence_streams() before setup was the root cause of the
+    // "executed units: 5 / setup failure" CI failure: libFuzzer received -1 from
+    // LLVMFuzzerInitialize but could not diagnose why because stderr was already
+    // redirected to /dev/null.
     ModelConfig cfg;
     cfg.vocab_size = G_VOCAB; cfg.d_model = G_D_MODEL; cfg.num_heads = G_HEADS;
     cfg.num_layers = G_LAYERS; cfg.max_seq_len = G_SEQ;
     LOGOSModel m(cfg);
+
+    // Use a path that is guaranteed to be writable on every CI runner.
+    // /tmp is always available on Linux; tmp_file() returns /tmp/logos_cpu_tests/<name>.
     const std::string base = tc::tmp_file("libfuzz_ckpt");
     g_path = base + "_step0.bin";  // save_checkpoint() writes <base>_step<N>.bin
+
     if (!save_checkpoint(m, base, 0)) {
-        // Return -1 (not exit(2)) so libFuzzer reports a proper setup error
-        // instead of treating it as a crash and stopping after a handful of inputs.
-        std::fprintf(stderr, "setup: save_checkpoint failed\n"); return -1;
-    }
-    g_good = tc::read_all(g_path);
-    if (g_good.empty()) {
-        std::fprintf(stderr, "setup: checkpoint file empty at %s\n", g_path.c_str()); return -1;
+        // Print directly to fd 2 so the message survives even if cout/cerr were
+        // already redirected by a previous partial initialisation attempt.
+        const char msg[] = "fuzz_checkpoint setup: save_checkpoint() failed — "
+                           "check that /tmp/logos_cpu_tests/ is writable\n";
+        (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        return -1;
     }
 
-    // Sanity: the good model itself must pass all invariants.
-    if (!check_model_invariants(m, cfg, "setup")) {
-        std::fprintf(stderr, "setup: good model failed invariant check\n"); return -1;
+    g_good = tc::read_all(g_path);
+    if (g_good.empty()) {
+        std::fprintf(stderr,
+            "fuzz_checkpoint setup: checkpoint file is empty after save: %s\n",
+            g_path.c_str());
+        return -1;
     }
+
+    // Sanity: the freshly-constructed model must pass all invariants before we
+    // hand the good-file bytes to the mutator.
+    if (!check_model_invariants(m, cfg, "setup")) {
+        std::fprintf(stderr,
+            "fuzz_checkpoint setup: freshly saved model failed invariant check\n");
+        return -1;
+    }
+
+    // Setup succeeded — silence stdout/stderr for the fuzzing loop so that
+    // libFuzzer's own progress output is not drowned in Checkpoint log spam.
+    fz::silence_streams();
     return 0;
 }
 
