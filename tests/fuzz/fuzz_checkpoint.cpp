@@ -14,7 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
-#include <unistd.h>   // STDERR_FILENO / write() — low-level stderr output during setup
+#include <unistd.h>   // STDERR_FILENO / write() / getpid() — low-level output during setup
 
 static std::string g_good, g_path;
 
@@ -109,9 +109,11 @@ extern "C" int LLVMFuzzerInitialize(int*, char***) {
     cfg.num_layers = G_LAYERS; cfg.max_seq_len = G_SEQ;
     LOGOSModel m(cfg);
 
-    // Use a path that is guaranteed to be writable on every CI runner.
-    // /tmp is always available on Linux; tmp_file() returns /tmp/logos_cpu_tests/<name>.
-    const std::string base = tc::tmp_file("libfuzz_ckpt");
+    // Use a PID-scoped path so that parallel libFuzzer instances (e.g. during CI
+    // where fuzz_checkpoint may be retried alongside other fuzz targets) never
+    // collide on the same temp file.  /tmp is always available on Linux.
+    const std::string base =
+        tc::tmp_file("libfuzz_ckpt_" + std::to_string(static_cast<long>(::getpid())));
     g_path = base + "_step0.bin";  // save_checkpoint() writes <base>_step<N>.bin
 
     if (!save_checkpoint(m, base, 0)) {

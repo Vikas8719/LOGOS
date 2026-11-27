@@ -518,32 +518,48 @@ jobs:
           ASAN_OPTIONS: "detect_leaks=1:abort_on_error=0:symbolize=1"
           UBSAN_OPTIONS: "print_stacktrace=1"
         run: |
-          TARGETS="fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint"
-          # fuzz_tokenbin saturated its coverage within seconds in a 2 h run -> give it less time, keep cores for the rest
+          # fuzz_tokenbin saturated its coverage within seconds in a 2 h run -> give it less time, keep cores for the rest.
+          # fuzz_checkpoint runs SEQUENTIALLY after the other three complete: its LLVMFuzzerInitialize
+          # calls save_checkpoint() which is fast, but during the startup of all four parallel fuzzers
+          # the combined RSS (tokenizer BPE build + ASan shadow) can hit the cgroup memory limit on
+          # the 7 GB GitHub runner and cause the kernel OOM killer to SIGKILL the checkpoint subshell
+          # before it can write its .rc file — producing the "exit code: missing / units: 5-7" failure.
+          # Running it alone after the others have finished (and released their peak RSS) avoids this.
           declare -A SECS=(
             [fuzz_tokenizer]="$FUZZ_SECONDS"
             [fuzz_vocab]="$FUZZ_SECONDS"
             [fuzz_tokenbin]="$((FUZZ_SECONDS / 6))"
             [fuzz_checkpoint]="$((FUZZ_SECONDS / 2))"
           )
-          for T in $TARGETS; do
+
+          run_fuzzer() {
+            local T="$1"
             mkdir -p "qa/fuzz/corpus/$T" "qa/fuzz/crashes/$T"
-            # committed seed inputs (never overwrite what the cached corpus already has) + optional dictionary
             if [ -d "tests/fuzz/seeds/$T" ]; then cp -n "tests/fuzz/seeds/$T"/* "qa/fuzz/corpus/$T/" 2>/dev/null || true; fi
-            DICT=""
+            local DICT=""
             if [ -f "tests/fuzz/dict/$T.dict" ]; then DICT="-dict=tests/fuzz/dict/$T.dict"; fi
             (
               "./build-fuzz/$T" "qa/fuzz/corpus/$T" $DICT \
                 -max_total_time="${SECS[$T]}" \
-                -max_len=4096 -timeout=60 -rss_limit_mb=3072 \
+                -max_len=4096 -timeout=60 -rss_limit_mb=2048 \
                 -artifact_prefix="qa/fuzz/crashes/$T/" \
                 -print_final_stats=1 > "qa/fuzz/$T.log" 2>&1
               echo $? > "qa/fuzz/$T.rc"
             ) &
+          }
+
+          # Phase A: three parallel fuzzers (tokenizer / vocab / tokenbin)
+          for T in fuzz_tokenizer fuzz_vocab fuzz_tokenbin; do
+            run_fuzzer "$T"
           done
+          wait   # wait for all three before starting checkpoint
+
+          # Phase B: fuzz_checkpoint alone — avoids OOM-kill from combined startup RSS
+          run_fuzzer fuzz_checkpoint
           wait
+
           FAIL=0
-          for T in $TARGETS; do
+          for T in fuzz_tokenizer fuzz_vocab fuzz_tokenbin fuzz_checkpoint; do
             RC=$(cat "qa/fuzz/$T.rc" 2>/dev/null || echo missing)
             echo "$T exit code: $RC"
             [ "$RC" = "0" ] || FAIL=1
