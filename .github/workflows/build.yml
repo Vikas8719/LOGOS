@@ -459,10 +459,19 @@ jobs:
         needs.cpu-tests-macos.result != 'failure' && needs.cpu-tests-macos.result != 'cancelled' &&
         needs.bench-linux.result != 'failure' && needs.bench-linux.result != 'cancelled'
       }}
-    timeout-minutes: 160
+    timeout-minutes: 185
     env:
       LLVM_VERSION: "14"
-      FUZZ_SECONDS: "7200"        # 2 hours; all 4 fuzzers run in parallel for this long
+      # Wall-time budget (seconds per fuzzer):
+      #   Phase A (parallel): fuzz_tokenizer + fuzz_vocab = FUZZ_SECONDS = 90 min
+      #                       fuzz_tokenbin = FUZZ_SECONDS/6 = 15 min
+      #   Phase B (sequential after A): fuzz_checkpoint = FUZZ_SECONDS/2 = 45 min
+      #   Total fuzzing wall time: 90 + 45 = 135 min
+      #   + ~15 min build/install/corpus → ~150 min < 185 min job timeout (35 min buffer)
+      #
+      # Previous value was 7200 (120 min Phase A + 60 min Phase B = 180 min fuzzing alone),
+      # which exceeded the 160 min job timeout — fuzz_checkpoint was being killed mid-run.
+      FUZZ_SECONDS: "5400"
     steps:
       - uses: actions/checkout@v4
 
@@ -576,10 +585,17 @@ jobs:
           {
             echo "### Fuzz (libFuzzer, ${FUZZ_SECONDS}s per target)"
             for f in qa/fuzz/fuzz_*.log; do
-              echo "**$(basename "$f" .log)** (exit: $(cat "${f%.log}.rc" 2>/dev/null || echo n/a))"
+              T=$(basename "$f" .log)
+              RC=$(cat "${f%.log}.rc" 2>/dev/null || echo missing)
+              echo "**$T** (exit: $RC)"
               grep -E "INFO: Seed|stat::number_of_executed_units|stat::average_exec_per_sec|stat::new_units_added|ERROR|SUMMARY" "$f" | sed 's/^/- /' || true
             done
             echo "- crashing inputs (if any): artifact qa-fuzz -> qa/fuzz/crashes/"
+            echo ""
+            echo "### fuzz_checkpoint full log (diagnostic)"
+            echo '```'
+            cat qa/fuzz/fuzz_checkpoint.log 2>/dev/null || echo "(log missing)"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload fuzz artifacts (logs + corpus + crashing inputs)

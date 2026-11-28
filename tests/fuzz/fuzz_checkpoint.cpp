@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>    // _Exit()
 #include <exception>
 #include <unistd.h>   // STDERR_FILENO / write() / getpid() — low-level output during setup
 
@@ -34,8 +35,8 @@ static constexpr int G_LAYERS  = 1;
 static constexpr int G_SEQ     = 8;
 
 // Returns true iff all invariants for a successfully-loaded model hold.
-// Aborts (via __builtin_trap / assert) on UB-class violations so the fuzzer
-// reports them as crashes rather than silent mis-accepts.
+// Caller uses _Exit(1) on failure so bash can write the .rc file (std::abort
+// raises SIGABRT which kills the subshell before echo $? runs).
 static bool check_model_invariants(const LOGOSModel& m, const ModelConfig& cfg,
                                    const char* tag) {
     // Invariant 1: parameter list non-empty and each tensor has positive total_size.
@@ -168,19 +169,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         // --- strict loader: reuse pre-allocated model (load_checkpoint overwrites weights) ---
         const bool strict_ok = load_checkpoint(*g_model_strict, g_path);
         if (strict_ok) {
-            // A successful strict load MUST satisfy all invariants.
+            // Invariant violation = real bug in load_checkpoint.
+            // Use _Exit(1) not std::abort(): abort() raises SIGABRT which kills the bash
+            // subshell before "echo $?" runs, so .rc is never written and CI reports
+            // "exit code: missing".  _Exit(1) terminates immediately with exit code 1
+            // which bash captures correctly in $? and writes to the .rc file.
             if (!check_model_invariants(*g_model_strict, cfg, "strict"))
-                std::abort();
+                _Exit(1);
         }
 
         // --- force loader ---
         const bool force_ok = load_checkpoint_force(*g_model_force, g_path);
         if (force_ok) {
+            // load_checkpoint_force now sanitizes NaN/Inf in-place (Checkpoint.cpp), so
+            // a force-load that returns true must always pass the invariant check.
             if (!check_model_invariants(*g_model_force, cfg, "force"))
-                std::abort();
+                _Exit(1);
         }
     } catch (const std::exception&) {
-        // Exceptions are acceptable (bad input); UB / abort above is not.
+        // Exceptions are acceptable (bad input); _Exit above is not reachable via exceptions.
     }
     return 0;
 }

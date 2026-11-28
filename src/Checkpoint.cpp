@@ -8,6 +8,7 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <system_error>
 #include <cstdint>
@@ -432,6 +433,39 @@ bool load_checkpoint_force(LOGOSModel& model, const std::string& path) {
     // Footer: final LayerNorm (optional — purane ckpt me nahi hota; force-load accepts missing)
     read_optional_tensor(f, model.final_ln.gamma, "final_ln.gamma");
     read_optional_tensor(f, model.final_ln.beta,  "final_ln.beta");
+
+    // NaN/Inf guard: force-load accepts truncated / mismatched files, but a tensor that
+    // successfully loaded (i.e. read_tensor_clamped returned bytes) must not contain
+    // non-finite values — that would mean the file bytes themselves decode to NaN/Inf,
+    // which is a corrupt file, not merely a truncated one.  Sanitize in-place so the
+    // model is at least numerically safe; log a warning so callers know the file was bad.
+    auto sanitize = [&](Tensor& t, const char* name) {
+        bool had_nan = false;
+        for (float& v : t.data) {
+            if (!std::isfinite(v)) { v = 0.0f; had_nan = true; }
+        }
+        if (had_nan)
+            std::cerr << "⚠️  load_checkpoint_force: NaN/Inf in " << name
+                      << " — zeroed out (" << path << ")\n";
+    };
+
+    sanitize(model.embedding,     "embedding");
+    sanitize(model.pos_embedding, "pos_embedding");
+    sanitize(model.lm_head,       "lm_head");
+    for (int li = 0; li < model.cfg.num_layers; ++li) {
+        auto& blk = model.layers[static_cast<size_t>(li)];
+        for (auto& h : blk.mha.heads) {
+            sanitize(h.W_Q, "W_Q"); sanitize(h.W_K, "W_K");
+            sanitize(h.W_V, "W_V"); sanitize(h.W_O, "W_O");
+        }
+        sanitize(blk.mha.W_proj, "W_proj");
+        sanitize(blk.ffn.W1, "W1"); sanitize(blk.ffn.b1, "b1");
+        sanitize(blk.ffn.W2, "W2"); sanitize(blk.ffn.b2, "b2");
+        sanitize(blk.ln1.gamma, "ln1.gamma"); sanitize(blk.ln1.beta, "ln1.beta");
+        sanitize(blk.ln2.gamma, "ln2.gamma"); sanitize(blk.ln2.beta, "ln2.beta");
+    }
+    sanitize(model.final_ln.gamma, "final_ln.gamma");
+    sanitize(model.final_ln.beta,  "final_ln.beta");
 
     std::cout << "⚠️  Checkpoint force-loaded: " << path << "\n";
     return true;
