@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <cmath>
+#include <limits>
 #include <vector>
 #include <cstdint>
 #include <algorithm>
@@ -148,6 +149,43 @@ int main() {
     for (size_t i = 0; equal && i < expected.size(); ++i) {
         equal = expected[i]->shape == actual[i]->shape &&
                 expected[i]->data == actual[i]->data;
+    }
+
+    // A non-finite value in a non-embedding parameter must be rejected by the
+    // strict loader. This is the corruption class exercised by fuzz_checkpoint.
+    {
+        const std::string nan_base = "logos_checkpoint_non_finite";
+        const std::string nan_file = nan_base + "_step0.bin";
+        std::remove(nan_file.c_str());
+        if (!save_checkpoint(source, nan_base, 0)) {
+            std::remove(file.c_str());
+            std::cerr << "non-finite fixture save failed\n";
+            return 1;
+        }
+        {
+            std::fstream corrupt(nan_file, std::ios::binary | std::ios::in | std::ios::out);
+            const auto first_head_offset = static_cast<std::streamoff>(sizeof(ModelConfig)) +
+                static_cast<std::streamoff>(source.embedding.total_size * sizeof(float)) +
+                static_cast<std::streamoff>(source.pos_embedding.total_size * sizeof(float)) +
+                static_cast<std::streamoff>(source.lm_head.total_size * sizeof(float));
+            corrupt.seekp(first_head_offset);
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            corrupt.write(reinterpret_cast<const char*>(&nan), sizeof(nan));
+            if (!corrupt) {
+                std::remove(file.c_str());
+                std::remove(nan_file.c_str());
+                std::cerr << "could not corrupt non-embedding checkpoint parameter\n";
+                return 1;
+            }
+        }
+        LOGOSModel nan_target(cfg);
+        if (load_checkpoint(nan_target, nan_file)) {
+            std::remove(file.c_str());
+            std::remove(nan_file.c_str());
+            std::cerr << "strict loader accepted NaN in a non-embedding parameter\n";
+            return 1;
+        }
+        std::remove(nan_file.c_str());
     }
     std::remove(file.c_str());
     if (!equal) {

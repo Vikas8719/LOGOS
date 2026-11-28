@@ -141,6 +141,38 @@ static bool read_tensor_safe(std::ifstream& f, Tensor& t, const std::string& pat
     return true;
 }
 
+// A strict load promises a numerically usable model. A complete read is not
+// sufficient: arbitrary checkpoint bytes can encode NaN or Inf in any tensor.
+static bool strict_model_is_finite(const LOGOSModel& model) {
+    const auto parameters = const_cast<LOGOSModel&>(model).parameters();
+    const auto tensor_is_finite = [](const Tensor& tensor) {
+        return std::all_of(tensor.data.begin(), tensor.data.end(),
+                           [](float value) { return std::isfinite(value); });
+    };
+    const auto values_are_finite = [](const std::vector<float>& values) {
+        return std::all_of(values.begin(), values.end(),
+                           [](float value) { return std::isfinite(value); });
+    };
+
+    for (const Tensor* parameter : parameters) {
+        if (!tensor_is_finite(*parameter)) return false;
+    }
+    if (!tensor_is_finite(model.pos_embedding) ||
+        !tensor_is_finite(model.final_ln.gamma) ||
+        !tensor_is_finite(model.final_ln.beta)) {
+        return false;
+    }
+    for (const auto& block : model.layers) {
+        if (!values_are_finite(block.ln1.running_mean) ||
+            !values_are_finite(block.ln1.running_var) ||
+            !values_are_finite(block.ln2.running_mean) ||
+            !values_are_finite(block.ln2.running_var)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool read_tensor_clamped(std::ifstream& f, Tensor& t, const std::string& path) {
     auto bytes = static_cast<std::streamsize>(t.total_size * sizeof(float));
     f.read(reinterpret_cast<char*>(t.data.data()), bytes);
@@ -342,8 +374,8 @@ bool load_checkpoint(LOGOSModel& model, const std::string& path) {
         return false;
     }
 
-    if (model.embedding.has_nan()) {
-        std::cerr << "❌ Checkpoint corrupt — NaN in embeddings: " << path << "\n";
+    if (!strict_model_is_finite(model)) {
+        std::cerr << "❌ Checkpoint corrupt — non-finite value in model state: " << path << "\n";
         return false;
     }
 
