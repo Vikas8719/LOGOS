@@ -250,15 +250,16 @@ int main() {
         int64_t n = 0;
         // io_reps+1 warmup: first read on a cold CI disk is artificially slow (page cache miss).
         // We run one extra rep and discard the first sample so the median reflects warm-disk throughput.
-        const int tbl_reps = io_reps + 1;
-        const double dtl = median_of(tbl_reps, [&]() {
+        auto one_pass = [&]() {
             TokenBinLoader ld(bin, 256, 1);
             std::vector<int> in, tg;
             n = 0;
             const auto t0 = Clock::now();
             while (ld.next_batch(in, tg)) ++n;
             return since(t0);
-        });
+        };
+        (void)one_pass();   // real untimed warmup: primes page cache, discarded
+        const double dtl = median_of(std::max(io_reps, 5), one_pass);
         record("tokenbin_batches_per_s", static_cast<double>(n) / std::max(dtl, 1e-9), "batch/s");
         TC_CHECK(n > 100, "tokenbin loader produced batches");
     }
